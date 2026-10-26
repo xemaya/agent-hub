@@ -152,7 +152,13 @@ export class ConnectorStore {
   async updateCommand(commandId, patch) {
     const command = this.state.commands.find((item) => item.command_id === commandId);
     if (!command) return null;
-    Object.assign(command, structuredClone(patch), { updated_at: timestamp() });
+    const now = timestamp();
+    const changes = structuredClone(patch);
+    if (changes.status === 'running' && !command.started_at) changes.started_at = now;
+    if (['succeeded', 'failed'].includes(changes.status) && !command.finished_at) {
+      changes.finished_at = now;
+    }
+    Object.assign(command, changes, { updated_at: now });
     await this.save();
     return this.getCommand(commandId);
   }
@@ -167,6 +173,7 @@ export class ConnectorStore {
         code: 'connector_interrupted',
       };
       command.updated_at = timestamp();
+      command.finished_at = command.updated_at;
     }
     if (interrupted.length) await this.save();
     return structuredClone(interrupted);

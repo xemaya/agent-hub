@@ -284,6 +284,9 @@ connector.hello { token }
 Connector → Hub:
   worker.register
   worker.status
+  task.create
+  task.update
+  command.create
   command.ack
   command.started
   command.output
@@ -292,9 +295,14 @@ Connector → Hub:
 
 Hub → Connector:
   worker.registered
+  task.created
+  task.updated
+  command.created
   command.dispatch
   error
 ```
+
+Connector 的 `task.create` / `command.create` 只能使用属于该 Connector 的 Worker；`task.update` 只能修改分配给该 Connector 的任务状态，且只接受状态字段。Hub 在服务端再次校验归属，不能仅靠本地 API 限制防止越权。
 
 ### 7.2 Dashboard 通道
 
@@ -462,14 +470,19 @@ GET    /api/v1/events
 ### Connector Local REST
 
 ```text
-GET  /local/v1/health
-GET  /local/v1/workers
-POST /local/v1/workers/register
-POST /local/v1/workers/:id/status
+GET   /local/v1/health
+GET   /local/v1/workers
+POST  /local/v1/workers/register
+POST  /local/v1/workers/:id/status
+POST  /local/v1/tasks
+PATCH /local/v1/tasks/:id
+POST  /local/v1/commands
 Authorization: Bearer <local-token>
 ```
 
-Local REST 只绑定回环地址，并校验 Host/Origin，不开放给 Tailscale 或局域网。
+Local REST 只绑定回环地址，并校验 Host/Origin，不开放给 Tailscale 或局域网。Local Token 只允许创建任务、向当前 Connector 的 Worker 派发命令、更新分配给当前 Connector 的任务状态；Hub 在 WebSocket 请求中再次校验归属。
+
+`POST /local/v1/commands` 接受 `wait: true`。Connector 注册一次性等待器，由命令完成事件直接返回最终 Command，不轮询；external 的 `waiting_manual` 立即返回。默认最长等待 10 分钟，超时返回当前 Command 和 `wait_timed_out: true`，不取消执行，也不把超时伪装成成功或失败。Connector 关闭时清理所有等待器。
 
 ## 12. CLI 与页面
 
@@ -507,16 +520,30 @@ agent-hub send \
   --task-id task_... \
   --prompt "请开始 review 并汇报结果"
 
+# Agent 通过本机 Connector 创建任务，不需要 Admin Token
+agent-hub task create --local \
+  --title "完成接口 review" \
+  --goal "确认实现满足任务标准" \
+  --acceptance "测试通过\n结果可见" \
+  --worker-id worker_...
+
+agent-hub send --local --wait \
+  --worker-id worker_... \
+  --task-id task_... \
+  --prompt "请开始 review 并汇报结果"
+
+agent-hub task update --local task_... --status done
+
 agent-hub list workers
 agent-hub list tasks
 agent-hub list commands
 ```
 
-Admin CLI 从 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 获取 Hub 地址与凭证；Worker CLI 从本地 Connector 数据目录获取 Local Token。Kimi 的默认模型也可在启动 Connector 前通过 `AGENT_HUB_KIMI_MODEL` 设置，Worker 的 `metadata.kimi_model` 优先于该全局默认值。
+Admin CLI 从 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 获取 Hub 地址与凭证；Worker CLI 和 `--local` 任务/命令操作从本地 Connector 数据目录获取 Local Token。`--wait` 只能与 `--local` 一起使用，由完成事件唤醒，默认最长等待 10 分钟；`waiting_manual` 和 `wait_timed_out` 都不是成功。`task update --local` 只允许修改状态，且任务必须分配给当前 Connector。Kimi 的默认模型也可在启动 Connector 前通过 `AGENT_HUB_KIMI_MODEL` 设置，Worker 的 `metadata.kimi_model` 优先于该全局默认值。
 
 ### Agent Skill（本机配套）
 
-`skills/agent-hub/SKILL.md` 为 Agent 提供按需加载的注册、自描述和状态回报流程。Kimi 与 Codex 共享 `~/.agents/skills`，Claude 使用 `~/.claude/skills`。本机安装器只创建链接，不复制凭证，也不覆盖已有文件：
+`skills/agent-hub/SKILL.md` 为 Agent 提供按需加载的注册、自描述、状态回报和任务处理流程。Kimi 与 Codex 共享 `~/.agents/skills`，Claude 使用 `~/.claude/skills`。本机安装器只创建链接，不复制凭证，也不覆盖已有文件：
 
 ```bash
 node scripts/install-local.js --connector-data-dir .runtime/connector
@@ -527,6 +554,8 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
 Skill 明确区分两种注册：新建 managed Worker 可接收推送，但不代表发起注册的当前交互窗口；登记当前交互 Session 使用 external，必须提供真实原生 Session ID，命令为 `waiting_manual`。无法确认 ID 时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
+
+用户可以直接说“添加任务”或“添加并执行”。Agent 从自然语言整理任务字段，按本机 Worker 的自描述与状态选择负责人；只说添加时默认不执行，明确要求执行后才使用 `send --local --wait`。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页表单只是可选的手动后备。这里的 Worker 选择由调用 Skill 的 Agent 完成，不等于 Hub 已有独立智能调度模型，也不允许跨 Connector 任意操作。
 
 ### Dashboard
 
@@ -596,7 +625,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：17 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配和本机 Skill 安装器（含真实 Connector 目录兼容）。
+- `pnpm test`：21 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限和 CLI 布尔参数。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -604,5 +633,6 @@ MVP 完成必须满足：
 - Claude 协议测试：验证首轮 `--session-id`、后续 `--resume`、`stream-json` 输出和结果解析通过。
 - Claude 真实 smoke：原 Anthropic 账户不可用，已改用百炼 Token Plan；`ANTHROPIC_BASE_URL` 为 `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`，主模型及 Sonnet/Opus/Haiku/Subagent 映射均为 `deepseek-v4.1-flash`。通过 `bl config agent` 使用本机 `BAILIAN_TOKEN_PLAN_KEY` 完成鉴权，未读取或输出密钥内容。2026-10-26 使用真实 `ClaudeDriver` 和全新隔离 Session 验证：首轮返回 `AGENT_HUB_OK`，同一 Worker 第二次通过 `--resume` 返回 `AGENT_HUB_RESUME_OK`，两次 Session ID 一致。此前 `bl text chat` 也已验证该模型可返回 `AGENT_HUB_BAILIAN_OK`；未以模拟进程结果替代真实调用。
 - 本机三 Runtime 真实闭环：2026-10-26 使用独立 Hub/Connector 数据目录和随机回环端口，通过真实 Local REST、Admin REST、Connector WebSocket 与 Dashboard WebSocket 注册并触发 Claude、Kimi、Codex 三个 managed Worker。三者分别返回 `AGENT_HUB_CLAUDE_OK`、`AGENT_HUB_KIMI_OK`、`AGENT_HUB_CODEX_OK`；同 Worker 第二次命令分别返回对应的 `_RESUME_OK` 标记，原生 Session ID 均保持不变。六个 Command 全部 `succeeded`，三个 Task 均标记为 `done`，Dashboard 收到全部六个成功事件；重新打开 Hub 数据库后任务和命令结果仍可读取。Codex 使用本机已登录的 `codex-cli 0.164.0`、全新线程和只读沙箱，其稳定注册 ID 与原生线程 ID 按第 10.3 节分别保存。报告位于 `.runtime/local-triad-smoke/result.json`，不含访问令牌；测试后隔离服务已关闭。
-- Agent Skill 与首批注册：2026-10-26 新增 `skills/agent-hub/SKILL.md` 和安全本机安装器，两项安装器测试覆盖软链接、幂等和冲突不覆盖。实际安装到 Kimi/Codex 共享的 `~/.agents/skills` 与 Claude 的 `~/.claude/skills`，当前 Kimi 会话已识别并加载 Skill；`agent-hub` CLI 可从项目外目录使用。通过真实 CLI 在常驻 Connector 注册 `claude-agent-hub-01`、`kimi-agent-hub-01`、`codex-agent-hub-01` 三个新 managed Worker，均在线、空闲且 `push_capable=true`，能力标签和自描述已保存；本次仅注册，未额外调用模型。网页与 Connector 健康检查通过，未修改现有 hooks 或接管交互 Session。
+- Agent Skill 与首批注册：2026-10-26 新增 `skills/agent-hub/SKILL.md` 和安全本机安装器，安装器测试覆盖软链接、真实目录、幂等和冲突不覆盖。实际安装到 Kimi/Codex 共享的 `~/.agents/skills` 与 Claude 的 `~/.claude/skills`，当前 Kimi 会话已识别并加载 Skill；`agent-hub` CLI 可从项目外目录使用。通过真实 CLI 在常驻 Connector 注册 `claude-agent-hub-01`、`kimi-agent-hub-01`、`codex-agent-hub-01` 三个新 managed Worker，均在线、空闲且 `push_capable=true`，能力标签和自描述已保存；本次仅注册，未额外调用模型。网页与 Connector 健康检查通过，未修改现有 hooks 或接管交互 Session。
+- Agent 自然语言任务流：新增 Local Token 任务创建、命令派发与事件等待、验收后状态更新；Hub 对 Worker 和 Task 的 Connector 归属做服务端校验。自动化测试覆盖完整任务、超时后继续执行、external 立即返回人工状态、跨 Connector 拒绝、完成时间戳和 CLI 布尔参数。2026-10-26 通过当前 Kimi 按新版 Skill 流程选择 `claude-agent-hub-01`，不使用 Admin Token 或网页表单创建并执行任务，真实回执为 `AGENT_HUB_TASK_OK`，验收后任务更新为 `done`，Worker 恢复空闲。已打开的 Skill 调用如果缓存旧版，需要刷新或重新打开 Session。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

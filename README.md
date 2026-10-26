@@ -145,7 +145,46 @@ agent-hub worker list --data-dir "$HOME/.agent-hub/connector"
 
 已有会话如果未发现新 Skill，重新打开 Session。Skill 是按需加载的说明，不是常驻进程；启动即自动注册需要另配启动指令或 hook。
 
-打开 `http://<中控TailscaleIPv4>:8787/`，输入中控的 Admin Token。可以创建任务、分配 Worker、发送命令并查看实时回执和事件。
+#### 让 Agent 添加任务，不用填写网页表单
+
+直接对 Agent 说自然语言即可，例如：
+
+```text
+/agent-hub 添加任务：审查 Connector 的断线恢复，整理目标和验收标准，先不要执行。
+```
+
+Kimi 使用 `/skill:agent-hub`，Codex 使用 `$agent-hub`，后面同样接自然语言。
+
+只说“添加”时，Agent 会整理标题、目标、上下文和验收标准，根据本机 Worker 的能力与状态选择负责人，然后创建任务，不自动执行。明确要求“添加并执行”时，Agent 才会继续派发并等待结果：
+
+```text
+/agent-hub 添加并执行：让 Claude 返回 AGENT_HUB_TASK_OK。不要读文件或调用工具；结果符合后关闭任务。
+```
+
+Agent 使用本机 Connector 的 Local Token，不读取 Admin Token。等待结果由命令完成事件唤醒，不轮询；默认最长等待 10 分钟，超时只标记 `wait_timed_out`，不会取消执行或伪装失败。即使命令成功，Agent 也必须核对验收标准后才能将任务更新为 `done`。
+
+也可以直接使用 CLI（Skill 会替你完成这些调用）：
+
+```bash
+agent-hub task create --local \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --title "任务标题" --goal "目标" --context "已核实的上下文" \
+  --acceptance "第一条验收\n第二条验收" --worker-id WORKER_ID
+
+agent-hub send --local --wait \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --task-id TASK_ID --worker-id WORKER_ID --prompt "明确指令"
+
+agent-hub task update --local TASK_ID --status done \
+  --data-dir "$HOME/.agent-hub/connector"
+```
+
+打开 `http://<中控TailscaleIPv4>:8787/`，输入中控的 Admin Token：
+
+- **任务看板**：任务的目标、上下文、负责人、验收标准和状态。
+- **命令回执**：每一次派发的输入、执行状态、输出、结果和错误。
+
+右侧表单只是手动的可选后备，不是必须使用。Local Token 只允许操作当前 Connector 的 Worker 和分配给他的任务，不能跨 Connector 任意派发或改状态。
 
 **登记当前交互 Session 是另一种操作：** 使用 `--mode external` 和真实原生 `--session-id`。external 不会被伪装成可推送 Worker；无法确认 Session ID 时不要随机生成，也不要使用 Codex `--last`。新建 managed Worker 不代表发起注册的当前窗口。
 
@@ -187,6 +226,6 @@ pnpm check
 
 - 不接管任意已打开的 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。
 - external Worker 只提供人工协作登记，命令为 `waiting_manual`。
-- 不包含自动匹配 Worker、自动拆任务、自由群聊或 Worker 自主互派。
+- Hub 不包含独立的智能调度模型、自动拆任务、自由群聊或 Worker 自主跨机互派；调用 Skill 的 Agent 可以为当前任务选择本机 Worker。
 - Hub 的 HTTP 传输位于 Tailscale 加密私网内，但仍必须使用 Admin/Connector/Local Token，并建议通过 Headscale Grants 限制可访问节点和端口。
 - 不启用 Funnel，不默认放开模型工具权限，不把 Runtime 数据目录或凭证作为网页静态资源公开。

@@ -15,9 +15,10 @@ Usage:
   agent-hub worker list
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
-                        [--acceptance LINE1\\nLINE2] [--worker-id ID]
-  agent-hub task update TASK_ID [--status STATUS] [--worker-id ID]
+                        [--acceptance LINE1\\nLINE2] [--worker-id ID] [--local]
+  agent-hub task update TASK_ID [--status STATUS] [--worker-id ID] [--local]
   agent-hub send --prompt TEXT [--worker-id ID] [--task-id ID] [--kind KIND]
+                 [--local] [--wait]
   agent-hub list workers|connectors|tasks|commands|events
 
 Environment:
@@ -30,6 +31,8 @@ Environment:
   AGENT_HUB_CODEX_MODEL         Default model for managed Codex Workers
 `;
 
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver']);
+
 function parseArgs(argv) {
   const positionals = [];
   const flags = {};
@@ -41,10 +44,16 @@ function parseArgs(argv) {
     }
     const equal = item.indexOf('=');
     if (equal !== -1) {
-      flags[item.slice(2, equal)] = item.slice(equal + 1);
+      const key = item.slice(2, equal);
+      const value = item.slice(equal + 1);
+      flags[key] = BOOLEAN_FLAGS.has(key) ? value !== 'false' : value;
       continue;
     }
     const key = item.slice(2);
+    if (BOOLEAN_FLAGS.has(key)) {
+      flags[key] = true;
+      continue;
+    }
     const next = argv[index + 1];
     if (next === undefined || next.startsWith('--')) flags[key] = true;
     else {
@@ -210,8 +219,11 @@ async function workerCommand(positionals, flags) {
 
 async function taskCommand(positionals, flags) {
   const action = positionals[0];
+  const local = Boolean(flags.local);
+  const request = local ? localRequest : adminRequest;
+  const basePath = local ? '/local/v1/tasks' : '/api/v1/tasks';
   if (action === 'create') {
-    print(await adminRequest(flags, '/api/v1/tasks', {
+    print(await request(flags, basePath, {
       method: 'POST',
       body: {
         title: flags.title,
@@ -224,12 +236,12 @@ async function taskCommand(positionals, flags) {
     return;
   }
   if (action === 'update' && positionals[1]) {
-    print(await adminRequest(flags, `/api/v1/tasks/${encodeURIComponent(positionals[1])}`, {
+    if (local && flags['worker-id']) throw new Error('Local task updates only support --status');
+    print(await request(flags, `${basePath}/${encodeURIComponent(positionals[1])}`, {
       method: 'PATCH',
-      body: {
-        status: flags.status,
-        assignee_worker_id: flags['worker-id'],
-      },
+      body: local
+        ? { status: flags.status }
+        : { status: flags.status, assignee_worker_id: flags['worker-id'] },
     }));
     return;
   }
@@ -261,15 +273,21 @@ export async function run(argv) {
   }
   if (command === 'send') {
     if (!flags.prompt) throw new Error('--prompt is required');
-    print(await adminRequest(flags, '/api/v1/commands', {
+    if (flags.wait && !flags.local) throw new Error('--wait requires --local');
+    const local = Boolean(flags.local);
+    const request = local ? localRequest : adminRequest;
+    const payload = await request(flags, local ? '/local/v1/commands' : '/api/v1/commands', {
       method: 'POST',
       body: {
         worker_id: flags['worker-id'],
         task_id: flags['task-id'],
         kind: flags.kind ?? 'prompt',
         input: flags.prompt,
+        ...(local ? { wait: flags.wait === true } : {}),
       },
-    }));
+    });
+    print(payload);
+    if (local && payload.command?.status === 'failed') process.exitCode = 1;
     return;
   }
   if (command === 'list' && positionals[1]) {

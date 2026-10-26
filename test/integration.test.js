@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { Connector } from '../src/connector.js';
+import { TestDriver } from '../src/drivers/test.js';
 import { createTestContext, waitFor } from './helpers.js';
 
 test('public health and private Admin API', async (t) => {
@@ -116,6 +119,13 @@ test('external Worker remains waiting_manual instead of fake push', async (t) =>
     body: { worker_id: worker.worker_id, input: 'manual handoff' },
   });
   assert.equal(payload.command.status, 'waiting_manual');
+  const local = await context.local('/local/v1/commands', {
+    method: 'POST',
+    body: { worker_id: worker.worker_id, input: 'manual local handoff', wait: true },
+  });
+  assert.equal(local.response.status, 200);
+  assert.equal(local.payload.command.status, 'waiting_manual');
+  assert.equal(local.payload.command.wait_timed_out, undefined);
   assert.equal(context.driver.executions.length, 0);
 });
 
@@ -181,4 +191,124 @@ test('Connector restart marks interrupted execution outcome unknown', async (t) 
   assert.equal(recovered.status, 'failed');
   assert.equal(recovered.outcome_unknown, true);
   assert.equal(recovered.error.code, 'connector_interrupted');
+});
+
+test('local Agent creates, waits for and completes a task without Admin Token', async (t) => {
+  const context = await createTestContext(t);
+  const worker = await context.registerWorker();
+  const dashboard = await context.openDashboard();
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST',
+    body: {
+      title: 'Agent task intake',
+      goal: 'Verify the local Agent workflow',
+      context: 'No Admin Token is used',
+      acceptance: ['Command succeeds', 'Task can be closed'],
+      assignee_worker_id: worker.worker_id,
+    },
+  });
+  assert.equal(created.response.status, 201);
+  assert.equal(created.payload.task.created_by, `connector:${context.connector.connectorId}`);
+  const task = created.payload.task;
+  const dispatched = await context.local('/local/v1/commands', {
+    method: 'POST',
+    body: {
+      task_id: task.task_id,
+      worker_id: worker.worker_id,
+      input: 'finish local task',
+      wait: true,
+    },
+  });
+  assert.equal(dispatched.response.status, 200);
+  const command = dispatched.payload.command;
+  assert.equal(command.status, 'succeeded');
+  assert.equal(command.result.text, 'test-worker: finish local task');
+  assert.ok(command.finished_at);
+  assert.deepEqual(context.driver.executions, [command.command_id]);
+  assert.equal(context.connector.store.getCommand(command.command_id).task_snapshot.title, task.title);
+  assert.equal(context.connector.commandWaiters.size, 0);
+  const updated = await context.local(`/local/v1/tasks/${task.task_id}`, {
+    method: 'PATCH',
+    body: { status: 'done' },
+  });
+  assert.equal(updated.response.status, 200);
+  assert.equal(updated.payload.task.status, 'done');
+  const currentWorker = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+  assert.equal(currentWorker.payload.worker.current_task_id, null);
+  assert.equal(currentWorker.payload.worker.work_state, 'idle');
+  await waitFor(() => [
+    'task.created',
+    'command.succeeded',
+    'task.updated',
+  ].every((eventType) => dashboard.messages.some((message) => (
+    message.type === 'event' && message.payload.event.event_type === eventType
+  ))));
+});
+
+test('local command wait timeout does not cancel or fake the execution result', async (t) => {
+  const context = await createTestContext(t);
+  context.connector.commandWaitTimeoutMs = 25;
+  const worker = await context.registerWorker({ metadata: { delay_ms: 70 } });
+  const dispatched = await context.local('/local/v1/commands', {
+    method: 'POST',
+    body: { worker_id: worker.worker_id, input: 'slow local command', wait: true },
+  });
+  assert.equal(dispatched.response.status, 200);
+  const pending = dispatched.payload.command;
+  assert.equal(pending.wait_timed_out, true);
+  assert.ok(['queued', 'accepted', 'running'].includes(pending.status));
+  const finished = await waitFor(async () => {
+    const command = context.connector.store.getCommand(pending.command_id);
+    return command.status === 'succeeded' ? command : null;
+  });
+  assert.equal(finished.result.text, 'test-worker: slow local command');
+  assert.equal(context.connector.commandWaiters.size, 0);
+});
+
+test('Connector cannot create commands or update tasks for another Connector', async (t) => {
+  const context = await createTestContext(t);
+  const worker = await context.registerWorker();
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST',
+    body: { title: 'Owned task', assignee_worker_id: worker.worker_id },
+  });
+  const task = created.payload.task;
+  const other = await Connector.create({
+    hubUrl: context.hub.url,
+    name: 'other-mac',
+    dataDir: path.join(context.root, 'other-connector'),
+    localPort: 0,
+    enrollToken: 'test-enroll',
+    drivers: { test: new TestDriver() },
+    logger: { error() {} },
+  });
+  await other.start();
+  await other.whenReady();
+  try {
+    await assert.rejects(
+      other.request('task.create', { title: 'Not your task', assignee_worker_id: worker.worker_id }),
+      (error) => error.statusCode === 403 && error.code === 'worker_forbidden',
+    );
+    await assert.rejects(
+      other.request('command.create', { worker_id: worker.worker_id, input: 'must not run' }),
+      (error) => error.statusCode === 403 && error.code === 'worker_forbidden',
+    );
+    await assert.rejects(
+      other.request('task.update', { task_id: task.task_id, status: 'done' }),
+      (error) => error.statusCode === 403 && error.code === 'task_forbidden',
+    );
+    const response = await fetch(`${other.localUrl}/local/v1/commands`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${other.store.credentials.localToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ worker_id: worker.worker_id, input: 'must not run' }),
+    });
+    assert.equal(response.status, 403);
+    await response.json();
+    assert.deepEqual(context.driver.executions, []);
+  } finally {
+    await other.close();
+  }
 });

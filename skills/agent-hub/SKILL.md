@@ -1,11 +1,11 @@
 ---
 name: agent-hub
-description: 注册和管理 Agent Hub 数字员工。当用户要求把当前 Claude、Kimi、Codex Session 登记到中控、创建可调度的 managed Worker、查看 Worker 或回报工作状态时使用；不要用于普通编码或未经要求的自动注册。
+description: 注册和管理 Agent Hub 数字员工，并通过自然语言添加任务、选择本机 Worker、派发命令、等待回执和更新任务状态。当用户要求登记 Claude、Kimi、Codex Session、创建 managed Worker、添加或执行任务、查看 Worker 时使用；与 Agent Hub 无关的普通编码不要使用，不要未经要求自动注册或执行。
 ---
 
 # Agent Hub 数字员工协作
 
-通过本机 Connector 注册 Worker、查询登记信息和回报状态。一个 Worker 对应一个明确的 Agent Session，不代表整台机器，也不代表某个 Agent 产品下的全部会话。
+通过本机 Connector 注册 Worker、创建和跟进任务、查询登记信息和回报状态。一个 Worker 对应一个明确的 Agent Session，不代表整台机器，也不代表某个 Agent 产品下的全部会话。
 
 ## 先检查本机连接
 
@@ -99,8 +99,73 @@ agent-hub worker status WORKER_ID idle \
   --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
 ```
 
-也可以使用 `waiting` 或 `blocked`，但必须反映真实状态。不要为了看起来完成而伪造状态，不要自动把 Task 标记为 `done`。managed Worker 的运行状态主要由 Connector 回报。
+也可以使用 `waiting` 或 `blocked`，但必须反映真实状态。未核对验收标准时，不得把 Task 标记为 `done`。managed Worker 的运行状态主要由 Connector 回报。
+
+## 添加任务：用户不需要填写网页表单
+
+当用户通过此 Skill 要求“添加任务”“创建任务”或“添加并执行”时，由你整理字段并调用 CLI，不要求用户补填网页表单。
+
+### 1. 查看本机 Worker 并选择负责人
+
+```bash
+agent-hub worker list \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+根据真实的 `capabilities`、`metadata.description`、Runtime、`presence` 和 `work_state` 选择适合当前任务的本机 Worker。需要主动执行时选择 managed；external 只能人工处理。不要编造 Worker ID，不要选择其他 Connector 的 Worker。当前没有合适 Worker 时，说明情况，不要假装已经派发。
+
+### 2. 从用户原话整理任务
+
+- `title`：简短、可区分，最多 300 字符。
+- `goal`：要完成的结果，不添加用户没有要求的范围。
+- `context`：只写用户提供的或已核实的事实、路径、约束；不要编造 commit、结论或凭证。
+- `acceptance`：可检查、能判断通过与否的标准，每条一行。
+- `assignee_worker_id`：上一步选择的 Worker；用户只要求记录且没有合适负责人时可以不分配。
+
+创建任务：
+
+```bash
+agent-hub task create --local \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --title "<任务标题>" \
+  --goal "<要达成的结果>" \
+  --context "<已核实的上下文>" \
+  --acceptance "<第一条验收>\n<第二条验收>" \
+  --worker-id WORKER_ID
+```
+
+如果用户只说“添加”或“创建”，到此为止：返回 `task_id`、负责人和任务摘要，不自动执行。
+
+### 3. 用户明确要求执行时才派发并等待
+
+```bash
+agent-hub send --local --wait \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --task-id TASK_ID \
+  --worker-id WORKER_ID \
+  --prompt "<结合任务目标、上下文和验收标准形成的明确指令>"
+```
+
+`--wait` 通过一次性完成事件等待，不需要也不允许循环查询。默认最长等待 10 分钟：
+
+- `succeeded`：读取实际 `result`，逐条核对验收标准；进程成功本身不等于业务验收通过。
+- `failed`：报告真实错误，不标记 `done`。
+- `waiting_manual`：external 需要人工处理，不声称已主动执行。
+- `wait_timed_out: true`：命令仍在执行，报告当前状态；不要把它当成成功或失败，不要重复派发同一任务。
+
+### 4. 根据实际结果更新任务
+
+只有结果满足验收标准时才关闭任务：
+
+```bash
+agent-hub task update --local TASK_ID --status done \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+未满足时保持真实状态并说明缺口；只有确实存在阻塞时才使用 `blocked`。本机任务更新只允许修改分配给当前 Connector 的任务状态，不能操作其他机器的任务。
+
+最终向用户简要返回：`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。任务看板与命令回执会自动更新，不要求用户在网页上补录。
 
 只在需要时查询，不要启动循环轮询。Skill 不是常驻进程，也不负责启动即自动注册；如需自动启动注册，应另行配置明确的启动指令或 hook，不得覆盖已有 hooks。
 
-当前版本不包含自动匹配 Worker 或 Worker 自主互派。不要通过读取 Admin Token 绕过权限边界；需要这些能力时应明确说明并实现相应 Hub 功能。
+Agent 可以按上述规则为当前任务选择本机 Worker，但这不等于 Hub 内置智能调度模型，也不支持 Worker 自主跨机互派。不要通过读取 Admin Token 绕过权限边界；需要这些能力时应明确说明并实现相应 Hub 功能。

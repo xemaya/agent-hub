@@ -19,6 +19,13 @@ const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'don
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
 const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request']);
 
+function protocolError(message, statusCode = 400, code = 'connector_request_failed') {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
 function requiredString(value, field, { max = 10000 } = {}) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) {
     const error = new Error(`${field} must be a non-empty string of at most ${max} characters`);
@@ -413,7 +420,11 @@ export class Hub {
       }
       if (kind === 'connector') {
         this.handleConnectorMessage(socket, connectorId, message).catch((error) => {
-          this.send(socket, 'error', { error: error.message }, message.id);
+          this.send(socket, 'error', {
+            error: error.message,
+            code: error.code ?? 'connector_request_failed',
+            status_code: error.statusCode ?? 400,
+          }, message.id);
         });
       }
     });
@@ -438,6 +449,70 @@ export class Hub {
 
   async handleConnectorMessage(socket, connectorId, message) {
     const payload = message.payload ?? {};
+    if (message.type === 'task.create') {
+      const assignee = payload.assignee_worker_id ?? null;
+      if (assignee && !this.store.getWorkerForConnector(assignee, connectorId)) {
+        throw protocolError('Assignee worker does not belong to this connector', 403, 'worker_forbidden');
+      }
+      const task = this.store.createTask({
+        title: requiredString(payload.title, 'title', { max: 300 }),
+        goal: optionalString(payload.goal),
+        context: optionalString(payload.context),
+        acceptance: stringArray(payload.acceptance),
+        assignee_worker_id: assignee,
+        created_by: `connector:${connectorId}`,
+      });
+      this.emit('task.created', { type: 'connector', id: connectorId }, {
+        task_id: task.task_id,
+        worker_id: task.assignee_worker_id,
+        payload: { title: task.title },
+      });
+      this.send(socket, 'task.created', { task }, message.id);
+      return;
+    }
+    if (message.type === 'task.update') {
+      const task = this.store.getTask(payload.task_id);
+      if (!task) throw protocolError('Task not found', 404, 'task_not_found');
+      if (!task.assignee_worker_id || !this.store.getWorkerForConnector(task.assignee_worker_id, connectorId)) {
+        throw protocolError('Task is not assigned to this connector', 403, 'task_forbidden');
+      }
+      if (!TASK_STATUSES.has(payload.status)) throw protocolError('Invalid task status', 400, 'invalid_task_status');
+      const updated = this.store.updateTask(task.task_id, { status: payload.status });
+      this.emit('task.updated', { type: 'connector', id: connectorId }, {
+        task_id: updated.task_id,
+        worker_id: updated.assignee_worker_id,
+        payload: { status: updated.status, assignee_worker_id: updated.assignee_worker_id },
+      });
+      this.send(socket, 'task.updated', { task: updated }, message.id);
+      return;
+    }
+    if (message.type === 'command.create') {
+      const taskId = payload.task_id ?? null;
+      const task = taskId ? this.store.getTask(taskId) : null;
+      if (taskId && !task) throw protocolError('Task does not exist', 400, 'task_not_found');
+      const workerId = payload.worker_id ?? task?.assignee_worker_id;
+      const worker = workerId ? this.store.getWorkerForConnector(workerId, connectorId) : null;
+      if (!worker) throw protocolError('Worker is unavailable to this connector', 403, 'worker_forbidden');
+      const kind = payload.kind ?? 'prompt';
+      if (!COMMAND_KINDS.has(kind)) throw protocolError('Unsupported command kind', 400, 'unsupported_command_kind');
+      const command = this.store.createCommand({
+        task_id: taskId,
+        worker_id: worker.worker_id,
+        kind,
+        input: requiredString(payload.input, 'input', { max: 200000 }),
+        push_capable: worker.push_capable,
+      });
+      this.emit('command.created', { type: 'connector', id: connectorId }, {
+        connector_id: connectorId,
+        worker_id: worker.worker_id,
+        task_id: command.task_id,
+        command_id: command.command_id,
+        payload: { kind: command.kind, status: command.status },
+      });
+      if (command.status === 'queued') this.dispatch(command);
+      this.send(socket, 'command.created', { command }, message.id);
+      return;
+    }
     if (message.type === 'worker.register') {
       const worker = this.store.registerWorker(connectorId, workerInput(payload));
       this.emit('worker.registered', { type: 'worker', id: worker.worker_id }, {

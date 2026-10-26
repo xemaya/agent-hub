@@ -47,6 +47,8 @@ export class Connector {
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
     this.pendingRequests = new Map();
+    this.commandWaiters = new Map();
+    this.commandWaitTimeoutMs = options.commandWaitTimeoutMs ?? 600000;
     this.activeWorkers = new Set();
     this.localServer = createServer((request, response) => {
       this.handleLocalRequest(request, response).catch((error) => {
@@ -197,6 +199,7 @@ export class Connector {
   }
 
   send(type, payload = {}, replyTo, id = createId('msg')) {
+    if (type === 'command.finished') this.settleCommandWaiters(payload);
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
     const message = { type, id, ts: new Date().toISOString(), payload };
     if (replyTo) message.reply_to = replyTo;
@@ -224,8 +227,12 @@ export class Connector {
       const pending = this.pendingRequests.get(message.reply_to);
       this.pendingRequests.delete(message.reply_to);
       clearTimeout(pending.timer);
-      if (message.type === 'error') pending.reject(new Error(message.payload?.error ?? 'Hub request failed'));
-      else pending.resolve(message.payload);
+      if (message.type === 'error') {
+        const error = new Error(message.payload?.error ?? 'Hub request failed');
+        error.code = message.payload?.code ?? 'connector_request_failed';
+        error.statusCode = message.payload?.status_code ?? 502;
+        pending.reject(error);
+      } else pending.resolve(message.payload);
       return;
     }
     if (message.type === 'connector.ready') {
@@ -341,6 +348,48 @@ export class Connector {
     }
   }
 
+  isCommandComplete(command) {
+    return command && ['succeeded', 'failed', 'waiting_manual'].includes(command.status);
+  }
+
+  settleCommandWaiters(command) {
+    if (!command?.command_id || !this.isCommandComplete(command)) return;
+    const waiters = this.commandWaiters.get(command.command_id);
+    if (!waiters) return;
+    this.commandWaiters.delete(command.command_id);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(command);
+    }
+  }
+
+  async waitForCommand(commandId) {
+    const current = this.store.getCommand(commandId);
+    if (this.isCommandComplete(current)) return current;
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        const waiters = this.commandWaiters.get(commandId);
+        if (waiters) {
+          waiters.delete(waiter);
+          if (waiters.size === 0) this.commandWaiters.delete(commandId);
+        }
+        const latest = this.store.getCommand(commandId);
+        if (!latest) {
+          reject(localError('Command not found while waiting', 404));
+          return;
+        }
+        resolve(this.isCommandComplete(latest) ? latest : { ...latest, wait_timed_out: true });
+      }, this.commandWaitTimeoutMs);
+      waiter.timer.unref();
+      const waiters = this.commandWaiters.get(commandId) ?? new Set();
+      waiters.add(waiter);
+      this.commandWaiters.set(commandId, waiters);
+      const latest = this.store.getCommand(commandId);
+      if (this.isCommandComplete(latest)) this.settleCommandWaiters(latest);
+    });
+  }
+
   async registerWorker(input) {
     await this.whenReady();
     const runtime = typeof input.runtime === 'string' ? input.runtime.trim() : '';
@@ -414,6 +463,51 @@ export class Connector {
       return;
     }
     this.requireLocalAuth(request);
+    if (request.method === 'POST' && url.pathname === '/local/v1/tasks') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      if (body.assignee_worker_id && !this.store.getWorker(body.assignee_worker_id)) {
+        throw localError('Assignee worker does not belong to this Connector', 403);
+      }
+      const { task } = await this.request('task.create', body);
+      sendJson(response, 201, { task });
+      return;
+    }
+    const taskMatch = /^\/local\/v1\/tasks\/([^/]+)$/.exec(url.pathname);
+    if (request.method === 'PATCH' && taskMatch) {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      if (Object.keys(body).some((key) => key !== 'status')) {
+        throw localError('Local task updates only support status', 400);
+      }
+      const { task } = await this.request('task.update', {
+        task_id: taskMatch[1],
+        status: body.status,
+      });
+      sendJson(response, 200, { task });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/local/v1/commands') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      if (body.wait !== undefined && typeof body.wait !== 'boolean') {
+        throw localError('wait must be a boolean', 400);
+      }
+      if (body.worker_id && !this.store.getWorker(body.worker_id)) {
+        throw localError('Worker does not belong to this Connector', 403);
+      }
+      const { command } = await this.request('command.create', {
+        task_id: body.task_id,
+        worker_id: body.worker_id,
+        kind: body.kind,
+        input: body.input,
+      });
+      const result = body.wait && !this.isCommandComplete(command)
+        ? await this.waitForCommand(command.command_id)
+        : command;
+      sendJson(response, body.wait ? 200 : 202, { command: result });
+      return;
+    }
     if (request.method === 'GET' && url.pathname === '/local/v1/workers') {
       sendJson(response, 200, { workers: this.store.listWorkers() });
       return;
@@ -456,6 +550,13 @@ export class Connector {
       reject(new Error('Connector shutting down'));
     }
     this.pendingRequests.clear();
+    for (const waiters of this.commandWaiters.values()) {
+      for (const { reject, timer } of waiters) {
+        clearTimeout(timer);
+        reject(new Error('Connector shutting down'));
+      }
+    }
+    this.commandWaiters.clear();
     for (const driver of Object.values(this.drivers)) await driver.close?.();
     if (this.localServer.listening) {
       await new Promise((resolve) => this.localServer.close(resolve));

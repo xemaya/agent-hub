@@ -1,15 +1,15 @@
 const state = {
   token: null,
   connected: false,
-  view: 'workers',
+  view: 'orchestrations',
   workers: [],
   tasks: [],
   orchestrations: [],
   coordinator: null,
-  commands: [],
-  events: [],
-  connectors: [],
-  selectedCommand: null,
+  messages: [],
+  selectedTaskId: null,
+  taskFilter: 'active',
+  sending: false,
   socket: null,
   reconnectTimer: null,
   refreshTimer: null,
@@ -20,11 +20,32 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 })[character]);
-const shortId = (value) => value ? `${String(value).slice(0, 20)}${String(value).length > 20 ? '…' : ''}` : '—';
-const time = (value) => value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value)) : '—';
-const dateTime = (value) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(value)) : '—';
-const badge = (value) => `<span class="status status-${String(value).replace(/[^a-z_]/g, '')}">${escapeHtml(value)}</span>`;
-const empty = (message) => `<p class="empty-state">${escapeHtml(message)}</p>`;
+const time = (value) => value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '';
+const dateTime = (value) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '';
+const clip = (value, length = 240) => {
+  const text = String(value ?? '');
+  return text.length > length ? `${text.slice(0, length)}…` : text;
+};
+const labels = {
+  ready: '等待开始',
+  planning: '正在规划',
+  in_progress: '正在执行',
+  review: '等待评审',
+  blocked: '需要处理',
+  done: '已完成',
+  cancelled: '已取消',
+  online: '在线',
+  offline: '离线',
+  idle: '空闲',
+  working: '工作中',
+  queued: '等待执行',
+  waiting: '等待处理',
+  waiting_manual: '人工处理',
+  chatting: '正在回复',
+  reviewing: '正在终审',
+};
+const badge = (status) => `<span class="status status-${String(status).replace(/[^a-z_]/g, '')}">${escapeHtml(labels[status] ?? status)}</span>`;
+const empty = (message) => `<div class="empty-state"><p>${escapeHtml(message)}</p></div>`;
 
 function toast(message, error = false) {
   const element = $('#toast');
@@ -56,217 +77,329 @@ function renderConnection() {
   element.innerHTML = `<i></i>${state.connected ? '实时连接' : connecting ? '等待连接' : '未连接'}`;
 }
 
-function workerOptions(includeEmpty = true) {
-  return `${includeEmpty ? '<option value="">暂不分配</option>' : ''}${state.workers.map((worker) => (
-    `<option value="${escapeHtml(worker.worker_id)}">${escapeHtml(worker.name)} · ${escapeHtml(worker.runtime)} · ${escapeHtml(worker.presence)}</option>`
-  )).join('')}`;
+function taskStatus(entry) {
+  return entry.orchestration?.status ?? entry.task.status;
 }
 
-function taskOptions() {
-  return `<option value="">不关联任务</option>${state.tasks.map((task) => (
-    `<option value="${escapeHtml(task.task_id)}">${escapeHtml(task.title)} · ${escapeHtml(task.status)}</option>`
-  )).join('')}`;
+function taskGroup(entry) {
+  const status = taskStatus(entry);
+  if (status === 'blocked' || status === 'cancelled' || (status === 'review' && entry.orchestration?.error)) return 'attention';
+  if (status === 'done') return 'done';
+  if (status === 'ready') return 'ready';
+  return 'active';
 }
 
-function renderSelects() {
-  const assignee = $('#task-assignee');
-  const worker = $('#command-worker');
-  const task = $('#command-task');
-  const values = [assignee.value, worker.value, task.value];
-  assignee.innerHTML = workerOptions();
-  worker.innerHTML = `<option value="">跟随任务负责人</option>${workerOptions(false)}`;
-  task.innerHTML = taskOptions();
-  [assignee.value, worker.value, task.value] = values;
+function taskEntries() {
+  const childIds = new Set(state.orchestrations.flatMap((orchestration) => (
+    orchestration.steps.map((step) => step.task_id).filter(Boolean)
+  )));
+  const orchestrations = new Map(state.orchestrations.map((orchestration) => [orchestration.parent_task_id, orchestration]));
+  return state.tasks.filter((task) => !childIds.has(task.task_id)).map((task) => ({
+    task,
+    orchestration: orchestrations.get(task.task_id) ?? null,
+  }));
 }
 
-function renderWorkers() {
-  $('#workers-list').innerHTML = state.workers.length ? state.workers.map((worker) => `
-    <article class="record-card ${escapeHtml(worker.presence)}">
-      <div>
-        <p class="record-kicker">${escapeHtml(worker.runtime)} / ${escapeHtml(worker.mode)}</p>
-        <h3>${escapeHtml(worker.name)}</h3>
-        <code>${escapeHtml(worker.worker_id)}</code>
-        <div class="capabilities">${worker.capabilities.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>
+function taskStage(entry) {
+  const { task, orchestration } = entry;
+  if (!orchestration) {
+    const stages = {
+      ready: task.assignee_name ? `等待 ${task.assignee_name} 开始` : '尚未分配负责人',
+      in_progress: `${task.assignee_name ?? '负责人'} 正在处理`,
+      review: '结果已返回，等待核对验收',
+      blocked: '任务已暂停，需要处理阻塞',
+      done: '任务已完成',
+      cancelled: '任务已取消',
+    };
+    return stages[task.status] ?? task.status;
+  }
+  const status = orchestration.status;
+  if (status === 'planning') return '中央大脑正在理解目标，安排合适的员工。';
+  if (status === 'ready') return orchestration.steps.length
+    ? '计划已就绪，尚未执行。你可以在中央大脑里说“开始执行”。'
+    : '已经记录，等待制定计划。';
+  if (status === 'in_progress') {
+    const running = orchestration.steps.find((step) => step.status === 'running');
+    if (running) return `${running.worker_name ?? '数字员工'} 正在执行「${running.title}」`;
+    if (orchestration.steps.some((step) => step.status === 'ready')) return '正在等待前置步骤完成，或合适的员工空闲。';
+    return '执行结果正在汇集，准备核对验收。';
+  }
+  if (status === 'review') return orchestration.error
+    ? `需要复核：${orchestration.error.message}`
+    : '执行结果已返回，中央大脑正在核对每一步与整体验收。';
+  if (status === 'blocked') return `任务已停止：${orchestration.error?.message ?? '存在未解决的问题'}。不会自动重试。`;
+  if (status === 'done') return orchestration.review_reason || '所有步骤和整体验收均已通过。';
+  return task.status;
+}
+
+function renderTaskDetail(entry) {
+  const { task, orchestration } = entry;
+  const steps = orchestration?.steps ?? [];
+  const stepTitles = new Map(steps.map((step) => [step.key, step.title]));
+  return `
+    <div class="task-detail-grid">
+      <section><h4>要达成什么</h4><p>${escapeHtml(task.goal || '未补充目标')}</p></section>
+      ${task.context ? `<section><h4>已知上下文</h4><p>${escapeHtml(task.context)}</p></section>` : ''}
+      <section><h4>怎样算完成</h4>${task.acceptance.length
+        ? `<ul class="acceptance-list">${task.acceptance.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join('')}</ul>`
+        : '<p class="muted">尚未设置整体验收标准</p>'}</section>
+    </div>
+    ${orchestration?.summary ? `<div class="plan-note"><strong>中央大脑的安排</strong><p>${escapeHtml(orchestration.summary)}</p></div>` : ''}
+    ${steps.length ? `<ol class="step-list">${steps.map((step, index) => `
+      <li class="step-${escapeHtml(step.status)}">
+        <span class="step-index">${String(index + 1).padStart(2, '0')}</span>
+        <div class="step-body">
+          <div class="step-title"><h4>${escapeHtml(step.title)}</h4>${badge(step.status)}</div>
+          <p class="step-owner">${escapeHtml(step.worker_name ?? '等待匹配员工')}${step.depends_on.length
+            ? ` · 需先完成 ${escapeHtml(step.depends_on.map((key) => stepTitles.get(key) ?? key).join('、'))}`
+            : ''}</p>
+          <p>${escapeHtml(step.goal)}</p>
+          ${step.rationale ? `<p class="step-rationale">为什么交给 TA：${escapeHtml(step.rationale)}</p>` : ''}
+          ${step.error?.message ? `<p class="inline-error">${escapeHtml(step.error.message)}</p>` : ''}
+          ${step.review?.reason ? `<p class="review-note">${step.review.pass ? '终审通过' : '需要复核'}：${escapeHtml(step.review.reason)}</p>` : ''}
+          ${step.result?.text ? `<details class="evidence"><summary>查看实际返回</summary><pre>${escapeHtml(clip(step.result.text, 6000))}</pre></details>` : ''}
+        </div>
+      </li>`).join('')}</ol>` : ''}
+    ${orchestration?.review_reason ? `<div class="review-note final-review"><strong>中央大脑的终审</strong><p>${escapeHtml(orchestration.review_reason)}</p></div>` : ''}`;
+}
+
+function renderTaskCard(entry, expanded = false) {
+  const { task, orchestration } = entry;
+  const steps = orchestration?.steps ?? [];
+  const completed = steps.filter((step) => step.status === 'done').length;
+  const status = taskStatus(entry);
+  const group = taskGroup(entry);
+  return `
+    <article class="task-card task-${group}" data-task-card="${escapeHtml(task.task_id)}">
+      <div class="task-heading">
+        <div><p class="section-index">${orchestration ? orchestration.auto_start ? '中央编排' : '对话计划' : '独立任务'}</p><h3>${escapeHtml(task.title)}</h3></div>
+        ${badge(status)}
       </div>
-      <div class="status-row">${badge(worker.presence)}${badge(worker.work_state)}${badge(worker.mode)}</div>
-      <dl class="record-meta">
-        <dt>节点</dt><dd>${escapeHtml(worker.connector_name ?? worker.connector_id)}</dd>
-        <dt>Session</dt><dd>${escapeHtml(shortId(worker.runtime_session_id))}</dd>
-        <dt>当前任务</dt><dd>${escapeHtml(shortId(worker.current_task_id))}</dd>
-        <dt>目录</dt><dd>${escapeHtml(worker.cwd)}</dd>
-        <dt>最后活跃</dt><dd>${escapeHtml(dateTime(worker.last_seen_at))}</dd>
-      </dl>
-    </article>`).join('') : empty('还没有 Worker。通过本机 Connector CLI 自注册第一个数字员工。');
+      ${task.goal ? `<p class="task-goal">${escapeHtml(clip(task.goal))}</p>` : ''}
+      <div class="task-stage"><span>当前进展</span><p>${escapeHtml(taskStage(entry))}</p></div>
+      ${steps.length ? `
+        <div class="step-progress">
+          <div class="progress-track" role="progressbar" aria-label="通过终审的步骤" aria-valuemin="0" aria-valuemax="${steps.length}" aria-valuenow="${completed}"><i style="width:${completed / steps.length * 100}%"></i></div>
+          <span>${completed} / ${steps.length} 步通过终审</span>
+        </div>` : `<p class="direct-owner">负责人：${escapeHtml(task.assignee_name ?? '尚未分配')}</p>`}
+      <div class="task-meta-line"><span>${orchestration ? `${steps.length} 个步骤` : task.created_by === 'coordinator' ? '中央大脑创建' : '任务记录'}</span><time datetime="${escapeHtml(task.updated_at)}">更新于 ${escapeHtml(dateTime(task.updated_at))}</time></div>
+      ${expanded ? renderTaskDetail(entry) : `<details class="task-details"><summary>目标、步骤与验收</summary>${renderTaskDetail(entry)}</details>`}
+    </article>`;
 }
 
-function renderTasks() {
-  const statuses = ['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled'];
-  $('#tasks-list').innerHTML = state.tasks.length ? state.tasks.map((task) => `
-    <article class="record-card">
-      <div class="task-title">
-        <p class="record-kicker">${escapeHtml(task.task_id)}</p>
-        <h3>${escapeHtml(task.title)}</h3>
-        <div class="status-row">${badge(task.status)}</div>
-      </div>
-      <dl class="record-meta">
-        <dt>负责人</dt><dd>${escapeHtml(task.assignee_name ?? '未分配')}</dd>
-        <dt>创建者</dt><dd>${escapeHtml(task.created_by)}</dd>
-        <dt>更新时间</dt><dd>${escapeHtml(dateTime(task.updated_at))}</dd>
-      </dl>
-      <div class="task-controls">
-        <label>状态<select data-task-status="${escapeHtml(task.task_id)}">${statuses.map((status) => `<option value="${status}" ${status === task.status ? 'selected' : ''}>${status}</option>`).join('')}</select></label>
-        <label>负责人<select data-task-assignee="${escapeHtml(task.task_id)}"><option value="">未分配</option>${state.workers.map((worker) => `<option value="${escapeHtml(worker.worker_id)}" ${worker.worker_id === task.assignee_worker_id ? 'selected' : ''}>${escapeHtml(worker.name)}</option>`).join('')}</select></label>
-      </div>
-      <div class="task-context">
-        <div><strong>目标</strong><p>${escapeHtml(task.goal || '—')}</p></div>
-        <div><strong>上下文</strong><p>${escapeHtml(task.context || '—')}</p></div>
-        <div><strong>完成标准</strong><p>${escapeHtml(task.acceptance.join('\n') || '—')}</p></div>
-      </div>
-    </article>`).join('') : empty('任务黑板为空。从右侧创建第一项任务。');
-}
-
-function renderCommands() {
-  $('#commands-list').innerHTML = state.commands.length ? state.commands.map((command) => `
-    <button class="command-row ${command.command_id === state.selectedCommand ? 'selected' : ''}" data-command="${escapeHtml(command.command_id)}">
-      <div><strong>${escapeHtml(command.input)}</strong><code>${escapeHtml(command.worker_name ?? command.worker_id)} · ${escapeHtml(command.kind)}</code></div>
-      <div>${badge(command.status)}<time>${escapeHtml(time(command.created_at))}</time></div>
-    </button>`).join('') : empty('还没有命令。');
-  const command = state.commands.find((item) => item.command_id === state.selectedCommand);
-  const detail = $('#command-detail');
-  if (!command) {
-    detail.innerHTML = '<p class="empty-state">选择一条命令查看输出。</p>';
+function renderFocus() {
+  const entries = taskEntries();
+  let entry = entries.find((item) => item.task.task_id === state.selectedTaskId);
+  const label = $('.focus-heading span');
+  if (!entry && state.selectedTaskId) {
+    label.textContent = 'REGISTERING / 正在登记';
+    $('#focus-task').innerHTML = '<div class="focus-empty"><h3>正在登记这项工作</h3><p class="muted">任务和计划返回后，这里会自动显示进展。</p></div>';
     return;
   }
-  detail.innerHTML = `
-    <h3>${escapeHtml(command.input)}</h3>
-    <span class="detail-id">${escapeHtml(command.command_id)}</span>
-    <div class="status-row" style="margin-top:14px">${badge(command.status)}${command.output_truncated ? badge('truncated') : ''}</div>
-    <dl class="record-meta" style="margin-top:18px;color:#cbd0c7">
-      <dt>Worker</dt><dd>${escapeHtml(command.worker_name ?? command.worker_id)}</dd>
-      <dt>Task</dt><dd>${escapeHtml(shortId(command.task_id))}</dd>
-      <dt>Created</dt><dd>${escapeHtml(dateTime(command.created_at))}</dd>
-      <dt>Finished</dt><dd>${escapeHtml(dateTime(command.finished_at))}</dd>
-    </dl>
-    <pre id="command-output"></pre>
-    ${command.result ? `<pre class="result-json">${escapeHtml(JSON.stringify(command.result, null, 2))}</pre>` : ''}
-    ${command.error ? `<pre class="result-json">${escapeHtml(JSON.stringify(command.error, null, 2))}</pre>` : ''}`;
-  $('#command-output').textContent = command.output_text || '暂无输出';
+  if (!entry) {
+    entry = entries.find((item) => taskGroup(item) === 'active')
+      ?? entries.find((item) => taskGroup(item) === 'ready')
+      ?? entries[0];
+    state.selectedTaskId = entry?.task.task_id ?? null;
+  }
+  if (!entry) {
+    label.textContent = 'HOW IT WORKS / 这里显示什么';
+    $('#focus-task').innerHTML = `
+      <div class="focus-empty">
+        <div class="focus-lines" aria-hidden="true"><i></i><i></i><i></i></div>
+        <h3>看见中央大脑怎样工作</h3>
+        <p>你在左侧说出目标后，这里会用中文解释：</p>
+        <ul><li>它准备怎样拆任务</li><li>每一步交给谁，为什么</li><li>现在进行到哪里，结果是否通过</li></ul>
+        <p class="muted">不需要理解命令、回执或事件记录。</p>
+      </div>`;
+    return;
+  }
+  const group = taskGroup(entry);
+  label.textContent = group === 'active' ? 'NOW / 当前工作' : group === 'ready' ? 'WAITING / 等待启动' : group === 'done' ? 'RESULT / 最近结果' : 'ATTENTION / 需要关注';
+  $('#focus-task').innerHTML = renderTaskCard(entry, true);
 }
 
-function renderEvents() {
-  $('#events-list').innerHTML = state.events.length ? state.events.map((event) => `
-    <div class="event-row">
-      <time title="${escapeHtml(dateTime(event.created_at))}">${escapeHtml(time(event.created_at))}</time>
-      <strong>${escapeHtml(event.event_type)}</strong>
-      <span>${escapeHtml(event.actor_type)}:${escapeHtml(shortId(event.actor_id))} · ${escapeHtml(shortId(event.worker_id ?? event.connector_id))}</span>
-    </div>`).join('') : empty('还没有事件。');
-}
-
-function renderConnectors() {
-  $('#connectors-list').innerHTML = state.connectors.length ? state.connectors.map((connector) => `
-    <article class="record-card ${connector.online ? 'online' : 'offline'}">
-      <div><p class="record-kicker">CONNECTOR</p><h3>${escapeHtml(connector.name)}</h3><code>${escapeHtml(connector.connector_id)}</code></div>
-      <div class="status-row">${badge(connector.online ? 'online' : 'offline')}</div>
-      <dl class="record-meta">
-        <dt>主机</dt><dd>${escapeHtml(connector.hostname ?? '—')}</dd>
-        <dt>连接时间</dt><dd>${escapeHtml(dateTime(connector.connected_at))}</dd>
-        <dt>最后活跃</dt><dd>${escapeHtml(dateTime(connector.last_seen_at))}</dd>
-      </dl>
-    </article>`).join('') : empty('还没有 Connector。');
+function syncComposer() {
+  const available = Boolean(state.coordinator?.enabled && state.coordinator.worker?.push_capable);
+  const input = $('#chat-input');
+  input.disabled = !available;
+  input.readOnly = state.sending;
+  $('#send-chat').disabled = !available || state.sending || !input.value.trim();
+  $('#send-chat').textContent = state.sending ? '发送中' : '发送';
 }
 
 function renderCoordinator() {
-  const coordinator = state.coordinator ?? { enabled: false, worker: null, active_orchestrations: 0 };
+  const coordinator = state.coordinator;
+  const worker = coordinator?.worker;
+  const available = Boolean(coordinator?.enabled && worker?.push_capable);
+  const online = worker?.presence === 'online';
+  const live = state.workers.find((item) => item.worker_id === worker?.worker_id);
+  const activePhase = live?.activity && !['idle', 'offline'].includes(live.activity.phase);
+  const description = !available
+    ? '尚未启用。需要管理员指定一个可调度的协调者。'
+    : !online
+      ? '当前离线；消息会等待连接恢复后再处理。'
+      : activePhase
+        ? live.activity.detail
+        : '在线，可以回答问题、规划并安排工作。';
   $('#coordinator-status').innerHTML = `
-    <article class="coordinator-console">
-      <div>
-        <p class="record-kicker">COORDINATOR</p>
-        <h3>${escapeHtml(coordinator.worker?.name ?? '尚未启用中央大脑')}</h3>
-        <p>${coordinator.worker
-          ? `${escapeHtml(coordinator.worker.runtime)} · ${escapeHtml(coordinator.worker.presence)} · 每个计划最多 ${escapeHtml(coordinator.max_steps)} 步`
-          : '由管理员指定一个 managed Worker 后，才能开始全局编排。'}</p>
-      </div>
-      <div class="status-row">
-        ${badge(coordinator.enabled ? 'enabled' : 'disabled')}
-        ${badge(`${coordinator.active_orchestrations} active`)}
-      </div>
-    </article>`;
-  $('#orchestrations-list').innerHTML = state.orchestrations.length ? state.orchestrations.map((orchestration) => `
-    <article class="record-card orchestration-card">
-      <div class="orchestration-head">
-        <div>
-          <p class="record-kicker">${escapeHtml(orchestration.orchestration_id)}</p>
-          <h3>${escapeHtml(orchestration.parent_task?.title ?? '未命名编排')}</h3>
-          <p class="orchestration-summary">${escapeHtml(orchestration.summary || '等待中央大脑生成计划。')}</p>
+    <div class="coordinator-presence">
+      <span class="brain-symbol" aria-hidden="true"></span>
+      <div><h3>${escapeHtml(worker?.name ?? '中央大脑')}</h3><p>${escapeHtml(description)}</p></div>
+      ${badge(available ? online ? 'online' : 'offline' : 'blocked')}
+    </div>`;
+  syncComposer();
+}
+
+function renderChat() {
+  const container = $('#chat-messages');
+  const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+  if (!state.messages.length) {
+    container.innerHTML = `
+      <div class="conversation-intro">
+        <p class="section-index">可以这样开始</p>
+        <h3>像交代一位同事一样，直接说。</h3>
+        <p>“现在大家分别在做什么？”</p>
+        <p>“先只规划一次代码审查，不要执行。”</p>
+        <p>“安排合适的员工完成这个小任务，并核对结果。”</p>
+      </div>`;
+    return;
+  }
+  container.innerHTML = state.messages.map((message) => {
+    if (message.role === 'activity') {
+      return `
+        <article class="chat-activity">
+          <div><p class="message-meta">任务进展 · ${escapeHtml(time(message.created_at))}</p><p class="message-content">${escapeHtml(message.content)}</p>
+          ${message.task_id ? `<button class="text-button" type="button" data-focus-task="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}</div>
+        </article>`;
+    }
+    const own = message.role === 'user';
+    const pending = message.status === 'pending';
+    const failed = message.status === 'failed';
+    return `
+      <article class="chat-message ${own ? 'own' : 'assistant'} ${pending ? 'pending' : ''} ${failed ? 'failed' : ''}">
+        <p class="message-meta">${own ? '你' : '中央大脑'} · ${escapeHtml(time(message.created_at))}</p>
+        ${pending
+          ? `<div class="thinking"><i></i><i></i><i></i><span>${state.coordinator?.worker?.presence === 'offline' ? '等待中央大脑上线' : '正在理解你的消息'}</span></div>`
+          : `<p class="message-content">${escapeHtml(message.content)}</p>`}
+        ${message.task_id ? `<button class="text-button" type="button" data-focus-task="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}
+      </article>`;
+  }).join('');
+  if (nearBottom) container.scrollTop = container.scrollHeight;
+}
+
+function renderTasks() {
+  const entries = taskEntries();
+  const counts = { active: 0, ready: 0, attention: 0, done: 0, all: entries.length };
+  for (const entry of entries) counts[taskGroup(entry)] += 1;
+  for (const button of $$('[data-task-filter]')) {
+    const selected = button.dataset.taskFilter === state.taskFilter;
+    button.classList.toggle('active', selected);
+    button.setAttribute('aria-pressed', String(selected));
+    button.querySelector('b').textContent = counts[button.dataset.taskFilter];
+  }
+  const filtered = state.taskFilter === 'all' ? entries : entries.filter((entry) => taskGroup(entry) === state.taskFilter);
+  const emptyMessages = {
+    active: '现在没有正在推进的任务。告诉中央大脑下一件要做的事。',
+    ready: '没有等待启动的计划。你可以说“先只规划……”。',
+    attention: '没有需要关注的任务。',
+    done: '还没有已完成的任务。',
+    all: '还没有任务。从中央大脑的对话框开始。',
+  };
+  $('#tasks-list').innerHTML = filtered.length
+    ? filtered.map((entry) => renderTaskCard(entry)).join('')
+    : empty(emptyMessages[state.taskFilter]);
+}
+
+function renderWorkers() {
+  const online = state.workers.filter((worker) => worker.presence === 'online').length;
+  const working = state.workers.filter((worker) => worker.activity?.phase && !['idle', 'offline', 'queued', 'waiting_manual'].includes(worker.activity.phase)).length;
+  $('#workforce-summary').innerHTML = `<strong>${online} / ${state.workers.length}</strong> 位在线 <span></span> <strong>${working}</strong> 位正在工作`;
+  $('#workers-list').innerHTML = state.workers.length ? state.workers.map((worker) => {
+    const activity = worker.activity ?? { phase: worker.work_state, detail: worker.work_state };
+    const coordinator = state.coordinator?.worker_id === worker.worker_id;
+    const active = !['idle', 'offline'].includes(activity.phase);
+    const result = activity.recent_result && !activity.output_text
+      ? `<details class="worker-output"><summary>最近一次返回</summary><pre>${escapeHtml(activity.recent_result)}</pre></details>`
+      : '';
+    return `
+      <article class="worker-card ${escapeHtml(activity.phase)}">
+        <div class="worker-heading">
+          <div class="worker-monogram" aria-hidden="true">${escapeHtml(worker.runtime.slice(0, 2).toUpperCase())}</div>
+          <div><p class="section-index">${coordinator ? '中央协调者' : '数字员工'}</p><h3>${escapeHtml(worker.name)}</h3></div>
+          <div class="status-row">${badge(worker.presence)}${badge(activity.phase)}</div>
         </div>
-        <div class="status-row">${badge(orchestration.status)}</div>
-      </div>
-      <dl class="record-meta">
-        <dt>协调者</dt><dd>${escapeHtml(orchestration.coordinator_worker?.name ?? '—')}</dd>
-        <dt>父任务</dt><dd><code>${escapeHtml(orchestration.parent_task_id)}</code></dd>
-        <dt>更新时间</dt><dd>${escapeHtml(dateTime(orchestration.updated_at))}</dd>
-      </dl>
-      ${orchestration.error ? `<p class="orchestration-error">${escapeHtml(orchestration.error.message)}</p>` : ''}
-      <ol class="orchestration-steps">
-        ${orchestration.steps.map((step) => `
-          <li>
-            <div class="step-heading">
-              <strong>${escapeHtml(step.key)} · ${escapeHtml(step.title)}</strong>
-              ${badge(step.status)}
-            </div>
-            <p>${escapeHtml(step.goal)}</p>
-            <dl class="record-meta">
-              <dt>负责人</dt><dd>${escapeHtml(step.worker_name ?? step.worker_id)}</dd>
-              <dt>依赖</dt><dd>${escapeHtml(step.depends_on.length ? step.depends_on.join(', ') : '无')}</dd>
-              <dt>Task</dt><dd><code>${escapeHtml(step.task_id ?? '待生成')}</code></dd>
-              <dt>Command</dt><dd><code>${escapeHtml(step.command_id ?? '待派发')}</code></dd>
-            </dl>
-            ${step.review?.reason ? `<p class="step-review">评审：${escapeHtml(step.review.reason)}</p>` : ''}
-            ${step.error?.message ? `<p class="orchestration-error">${escapeHtml(step.error.message)}</p>` : ''}
-            ${step.result?.text ? `<details class="step-evidence"><summary>执行证据</summary><p>${escapeHtml(step.result.text)}</p></details>` : ''}
-          </li>`).join('')}
-      </ol>
-    </article>`).join('') : empty('还没有编排任务。通过 --orchestrate 把总目标交给中央大脑。');
+        <p class="worker-description">${escapeHtml(worker.metadata?.description || '尚未填写职责说明')}</p>
+        <div class="capabilities">${worker.capabilities.map((capability) => `<span>${escapeHtml(capability)}</span>`).join('')}</div>
+        <div class="worker-current">
+          <span>${active ? '当前工作' : '当前状态'}</span>
+          <strong>${escapeHtml(activity.task_title ?? activity.detail)}</strong>
+          <p>${escapeHtml(activity.parent_task_title && activity.parent_task_title !== activity.task_title ? `所属：${activity.parent_task_title}` : activity.detail)}</p>
+        </div>
+        ${activity.output_text ? `<details class="worker-output" open><summary>实时返回${activity.output_truncated ? '（仅显示最近部分）' : ''}</summary><pre>${escapeHtml(activity.output_text)}</pre></details>` : ''}
+        ${result}
+        <div class="worker-footer"><span>${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${worker.mode === 'external' ? '原会话人工协作' : '可主动调度'}</span>${activity.updated_at ? `<time datetime="${escapeHtml(activity.updated_at)}" title="连接心跳：${escapeHtml(dateTime(worker.last_seen_at))}">${active ? activity.command_status === 'running' ? '开始' : '更新' : '最近返回'} ${escapeHtml(dateTime(activity.updated_at))}</time>` : ''}</div>
+      </article>`;
+  }).join('') : empty('还没有数字员工。让本机 Agent 通过 Agent Hub Skill 注册。');
+  for (const output of $$('.worker-output[open] pre')) output.scrollTop = output.scrollHeight;
 }
 
 function render() {
-  for (const resource of ['workers', 'tasks', 'orchestrations', 'commands', 'events', 'connectors']) {
-    $(`[data-count="${resource}"]`).textContent = state[resource].length;
-  }
-  renderSelects();
-  renderWorkers();
-  renderTasks();
+  const entries = taskEntries();
+  $('[data-count="workers"]').textContent = state.workers.length;
+  $('[data-count="tasks"]').textContent = entries.length;
+  $('[data-count="orchestrations"]').textContent = entries.filter((entry) => taskGroup(entry) === 'active').length;
   renderCoordinator();
-  renderCommands();
-  renderEvents();
-  renderConnectors();
+  renderChat();
+  renderFocus();
+  renderTasks();
+  renderWorkers();
   renderConnection();
 }
 
 async function refresh() {
-  const [workers, tasks, commands, events, connectors, coordinator, orchestrations] = await Promise.all([
+  const [workers, tasks, orchestrations, coordinator, chat] = await Promise.all([
     api('/api/v1/workers'),
     api('/api/v1/tasks'),
-    api('/api/v1/commands'),
-    api('/api/v1/events'),
-    api('/api/v1/connectors'),
-    api('/api/v1/coordinator'),
     api('/api/v1/orchestrations'),
+    api('/api/v1/coordinator'),
+    api('/api/v1/coordinator/chat'),
   ]);
   state.workers = workers.workers;
   state.tasks = tasks.tasks;
-  state.commands = commands.commands;
-  state.events = events.events;
-  state.connectors = connectors.connectors;
-  state.coordinator = coordinator.coordinator;
   state.orchestrations = orchestrations.orchestrations;
-  if (!state.selectedCommand && state.commands.length) state.selectedCommand = state.commands[0].command_id;
+  state.coordinator = coordinator.coordinator;
+  state.messages = chat.messages;
   render();
 }
 
 function scheduleRefresh() {
+  if (!state.token) return;
   clearTimeout(state.refreshTimer);
   state.refreshTimer = setTimeout(() => refresh().catch((error) => toast(error.message, true)), 120);
+}
+
+function upsertMessage(message) {
+  const index = state.messages.findIndex((item) => item.message_id === message.message_id);
+  if (index === -1) state.messages.push(message);
+  else state.messages[index] = message;
+  if (message.task_id) state.selectedTaskId = message.task_id;
+  renderChat();
+  renderFocus();
+}
+
+function setView(view) {
+  state.view = view;
+  $$('.nav-item').forEach((item) => {
+    const active = item.dataset.view === view;
+    item.classList.toggle('active', active);
+    item.setAttribute('aria-pressed', String(active));
+  });
+  $$('.view').forEach((section) => { section.hidden = section.id !== `view-${view}`; });
+  if (view === 'orchestrations') {
+    const messages = $('#chat-messages');
+    messages.scrollTop = messages.scrollHeight;
+  }
 }
 
 function connectSocket() {
@@ -286,31 +419,28 @@ function connectSocket() {
       refresh().catch((error) => toast(error.message, true));
       return;
     }
-    if (message.type === 'command.updated') {
-      const command = message.payload.command;
-      const index = state.commands.findIndex((item) => item.command_id === command.command_id);
-      if (index === -1) state.commands.unshift(command);
-      else state.commands[index] = command;
-      renderCommands();
-      return;
-    }
-    if (message.type === 'command.output') {
-      const command = state.commands.find((item) => item.command_id === message.payload.command_id);
-      if (command) {
-        command.output_text = `${command.output_text ?? ''}${message.payload.chunk}`;
-        command.output_truncated = message.payload.output_truncated;
-        if (command.command_id === state.selectedCommand) renderCommands();
-      }
+    if (message.type === 'chat.updated') {
+      upsertMessage(message.payload.message);
+      scheduleRefresh();
       return;
     }
     if (message.type === 'worker.updated') {
       const worker = message.payload.worker;
       const index = state.workers.findIndex((item) => item.worker_id === worker.worker_id);
-      if (index !== -1) state.workers[index] = worker;
+      if (index === -1) state.workers.push(worker);
+      else state.workers[index] = worker;
       renderWorkers();
+      renderCoordinator();
       return;
     }
-    if (message.type === 'event') scheduleRefresh();
+    if (message.type === 'command.updated') {
+      scheduleRefresh();
+      return;
+    }
+    if (message.type === 'event') {
+      if (message.payload.event.event_type === 'coordinator.started') state.selectedTaskId = message.payload.event.task_id;
+      scheduleRefresh();
+    }
   });
   socket.addEventListener('close', () => {
     if (state.socket !== socket) return;
@@ -333,6 +463,7 @@ async function connect(token) {
     sessionStorage.setItem('agent-hub-admin-token', token);
     $('#auth-view').hidden = true;
     $('#app').hidden = false;
+    setView('orchestrations');
     connectSocket();
   } catch (error) {
     state.token = null;
@@ -345,6 +476,7 @@ function logout() {
   state.token = null;
   state.connected = false;
   clearTimeout(state.reconnectTimer);
+  clearTimeout(state.refreshTimer);
   state.socket?.close();
   state.socket = null;
   sessionStorage.removeItem('agent-hub-admin-token');
@@ -360,96 +492,57 @@ $('#auth-form').addEventListener('submit', (event) => {
   connect($('#admin-token').value.trim()).finally(() => { button.disabled = false; });
 });
 $('#logout').addEventListener('click', logout);
-$('#refresh').addEventListener('click', () => refresh().then(() => toast('数据已刷新')).catch((error) => toast(error.message, true)));
-
+$('#refresh').addEventListener('click', () => refresh().then(() => toast('已更新为最新状态')).catch((error) => toast(error.message, true)));
 $('.dispatch-nav').addEventListener('click', (event) => {
   const button = event.target.closest('[data-view]');
+  if (button) setView(button.dataset.view);
+});
+$('#task-filters').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-task-filter]');
   if (!button) return;
-  state.view = button.dataset.view;
-  $$('.nav-item').forEach((item) => item.classList.toggle('active', item === button));
-  $$('.view').forEach((view) => { view.hidden = view.id !== `view-${state.view}`; });
+  state.taskFilter = button.dataset.taskFilter;
+  renderTasks();
 });
-
-$('#task-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const data = new FormData(form);
-  const button = form.querySelector('button');
-  button.disabled = true;
-  try {
-    await api('/api/v1/tasks', {
-      method: 'POST',
-      body: {
-        title: data.get('title'),
-        goal: data.get('goal'),
-        context: data.get('context'),
-        acceptance: String(data.get('acceptance')).split('\n').map((item) => item.trim()).filter(Boolean),
-        assignee_worker_id: data.get('assignee') || null,
-      },
-    });
-    form.reset();
-    await refresh();
-    toast('任务已写入黑板');
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    button.disabled = false;
-  }
-});
-
-$('#command-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const data = new FormData(form);
-  const button = form.querySelector('button');
-  button.disabled = true;
-  try {
-    const response = await api('/api/v1/commands', {
-      method: 'POST',
-      body: {
-        task_id: data.get('task') || null,
-        worker_id: data.get('worker') || null,
-        kind: data.get('kind'),
-        input: data.get('input'),
-      },
-    });
-    state.selectedCommand = response.command.command_id;
-    form.reset();
-    await refresh();
-    toast(response.command.status === 'waiting_manual' ? '已登记为人工待处理' : '命令已持久化并进入推送队列');
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    button.disabled = false;
-  }
-});
-
-$('#command-task').addEventListener('change', (event) => {
-  const task = state.tasks.find((item) => item.task_id === event.target.value);
-  if (task?.assignee_worker_id) $('#command-worker').value = task.assignee_worker_id;
-});
-
 $('#main').addEventListener('click', (event) => {
-  const row = event.target.closest('[data-command]');
-  if (!row) return;
-  state.selectedCommand = row.dataset.command;
-  renderCommands();
+  const button = event.target.closest('[data-focus-task]');
+  if (!button) return;
+  state.selectedTaskId = button.dataset.focusTask;
+  renderFocus();
+  if (window.matchMedia('(max-width: 1080px)').matches) {
+    const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+    $('.focus-panel').scrollIntoView({ behavior, block: 'start' });
+  }
 });
-
-$('#main').addEventListener('change', async (event) => {
-  const status = event.target.dataset.taskStatus;
-  const assignee = event.target.dataset.taskAssignee;
-  if (!status && !assignee) return;
+$('#chat-input').addEventListener('input', syncComposer);
+$('#chat-input').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    if (!$('#send-chat').disabled) $('#chat-form').requestSubmit();
+  }
+});
+$('#chat-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = $('#chat-input');
+  const message = input.value.trim();
+  if (!message || state.sending) return;
+  state.sending = true;
+  syncComposer();
+  const requestId = globalThis.crypto?.randomUUID?.() ?? `request-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
-    await api(`/api/v1/tasks/${encodeURIComponent(status ?? assignee)}`, {
-      method: 'PATCH',
-      body: status ? { status: event.target.value } : { assignee_worker_id: event.target.value || null },
+    const response = await api('/api/v1/coordinator/chat', {
+      method: 'POST',
+      body: { message, request_id: requestId },
     });
-    await refresh();
-    toast('任务已更新');
+    upsertMessage(response.user);
+    upsertMessage(response.message);
+    input.value = '';
+    scheduleRefresh();
   } catch (error) {
     toast(error.message, true);
-    await refresh();
+  } finally {
+    state.sending = false;
+    syncComposer();
+    if (!$('#chat-input').disabled) $('#chat-input').focus();
   }
 });
 

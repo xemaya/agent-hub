@@ -12,20 +12,27 @@ function scriptedDriver() {
     executions: [],
     plan: null,
     review: null,
+    chat: null,
+    chatGate: null,
+    workGate: null,
     failWork: false,
     async prepareWorker(input) {
       sequence += 1;
       return { runtime_session_id: input.runtime_session_id ?? `session-${sequence}`, driver_state: {} };
     },
     async execute({ worker, command, onOutput, onState }) {
-      driver.executions.push({ worker: worker.name, kind: command.kind, input: command.input });
+      driver.executions.push({ worker: worker.name, kind: command.kind, input: command.input, command_id: command.command_id });
       await onState({ started: true });
+      if (command.kind === 'coordinator_chat' && driver.chatGate) await driver.chatGate;
+      if (command.kind === 'prompt' && driver.workGate) await driver.workGate;
       if (driver.failWork && command.kind === 'prompt') throw new Error('work failed');
       const text = command.kind === 'coordinator_plan'
         ? driver.plan
         : command.kind === 'coordinator_review'
           ? driver.review
-          : `completed:${worker.name}`;
+          : command.kind === 'coordinator_chat'
+            ? typeof driver.chat === 'function' ? await driver.chat(command) : driver.chat
+            : `completed:${worker.name}`;
       onOutput(`${text}\n`);
       return { text, session_id: worker.runtime_session_id };
     },
@@ -239,4 +246,215 @@ test('Coordinator configuration requires Admin and a managed Worker', async (t) 
   const status = await context.admin('/api/v1/coordinator');
   assert.equal(status.payload.coordinator.enabled, false);
   assert.equal(status.payload.coordinator.worker, null);
+});
+
+async function chatReply(context, commandId) {
+  return waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/coordinator/chat');
+    const message = payload.messages.find((item) => item.command_id === commandId);
+    return message && message.status !== 'pending' ? message : null;
+  });
+}
+
+test('Central chat answers questions without creating tasks or exposing chat to Connectors', async (t) => {
+  const { context, driver, coordinator } = await setup(t);
+  let releaseChat;
+  driver.chatGate = new Promise((resolve) => { releaseChat = resolve; });
+  driver.chat = JSON.stringify({ reply: '目前只有测试 Worker，尚未分配工作。', action: { type: 'chat' } });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: { message: '现在谁能工作？', request_id: 'question-only' },
+  });
+  assert.equal(sent.response.status, 202);
+  await waitFor(() => driver.executions.some((execution) => execution.kind === 'coordinator_chat'));
+  const live = await context.admin(`/api/v1/workers/${coordinator.worker_id}`);
+  assert.equal(live.payload.worker.activity.phase, 'chatting');
+  assert.equal(live.payload.worker.activity.task_title, '中央对话');
+  assert.equal(live.payload.worker.activity.output_text, '');
+  assert.equal((await context.local('/local/v1/coordinator/chat')).response.status, 404);
+  const unauthorized = await fetch(`${context.hub.url}/api/v1/coordinator/chat`);
+  assert.equal(unauthorized.status, 401);
+  releaseChat();
+  const reply = await chatReply(context, sent.payload.message.command_id);
+  assert.equal(reply.status, 'done');
+  assert.equal(reply.content, '目前只有测试 Worker，尚未分配工作。');
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 0);
+  assert.equal(driver.executions.filter((execution) => execution.kind !== 'coordinator_chat').length, 0);
+
+  const repeated = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '同一请求重试', request_id: 'question-only' },
+  });
+  assert.equal(repeated.payload.user.message_id, sent.payload.user.message_id);
+  assert.equal(repeated.payload.message.message_id, reply.message_id);
+  assert.equal(driver.executions.length, 1);
+  const idle = await context.admin(`/api/v1/workers/${coordinator.worker_id}`);
+  assert.equal(idle.payload.worker.activity.phase, 'idle');
+  assert.equal(idle.payload.worker.activity.recent_result, '');
+});
+
+test('Chat planning stays ready, then starts the same plan and reports real completion', async (t) => {
+  const { context, driver } = await setup(t);
+  const dashboard = await context.openDashboard();
+  driver.chat = JSON.stringify({
+    reply: '我会先规划。',
+    action: {
+      type: 'plan',
+      task: {
+        title: 'Plan before execution',
+        goal: 'Verify explicit start',
+        context: 'No work before approval',
+        acceptance: ['No prompt runs before approval', 'The same plan finishes after approval'],
+      },
+    },
+  });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '先只规划，不要执行', request_id: 'plan-once' },
+  });
+  const plannedReply = await chatReply(context, sent.payload.message.command_id);
+  assert.match(plannedReply.content, /尚未执行/);
+  const planned = await waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/orchestrations');
+    return payload.orchestrations.find((item) => item.source_message_id === plannedReply.message_id && item.status === 'ready');
+  });
+  assert.equal(planned.auto_start, false);
+  assert.equal(planned.parent_task.status, 'ready');
+  assert.equal(planned.steps.length, 2);
+  assert.equal(plannedReply.task_id, planned.parent_task_id);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 0);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_plan').length, 1);
+
+  const repeated = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '先只规划，不要执行', request_id: 'plan-once' },
+  });
+  assert.equal(repeated.payload.message.message_id, plannedReply.message_id);
+  assert.equal((await context.admin('/api/v1/orchestrations')).payload.orchestrations.length, 1);
+
+  driver.chat = JSON.stringify({
+    reply: '按原计划开始。',
+    action: { type: 'start', orchestration_id: planned.orchestration_id },
+  });
+  const started = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '开始执行刚才的计划', request_id: 'start-once' },
+  });
+  const completed = await waitForOrchestration(context, planned.orchestration_id, 'done');
+  assert.equal(completed.parent_task.status, 'done');
+  assert.equal(completed.review_reason, 'All evidence passes');
+  const startedReply = await chatReply(context, started.payload.message.command_id);
+  assert.equal(startedReply.task_id, planned.parent_task_id);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_plan').length, 1);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 2);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_review').length, 1);
+  const messages = (await context.admin('/api/v1/coordinator/chat')).payload.messages;
+  const activities = messages.filter((message) => message.role === 'activity' && message.task_id === planned.parent_task_id);
+  assert.ok(activities.some((message) => message.content.includes('尚未执行')));
+  assert.ok(activities.some((message) => message.content.includes('已按现有计划启动')));
+  assert.ok(activities.some((message) => message.content.includes('终审结论：All evidence passes')));
+  assert.ok(activities.every((message) => !message.content.includes('"worker_id"')));
+  await waitFor(() => dashboard.messages.some((message) => (
+    message.type === 'chat.updated' && message.payload.message.message_id === startedReply.message_id
+  )));
+
+  const again = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '再启动一次', request_id: 'start-again' },
+  });
+  const againReply = await chatReply(context, again.payload.message.command_id);
+  assert.match(againReply.content, /已完成/);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_plan').length, 1);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 2);
+});
+
+test('Invalid chat actions and model failures never create or start work', async (t) => {
+  const { context, driver } = await setup(t);
+  for (const [requestId, response] of [
+    ['invalid-json', 'not-json'],
+    ['unsupported-action', JSON.stringify({ reply: '删除全部任务', action: { type: 'delete_all' } })],
+    ['invalid-start', JSON.stringify({ reply: '启动不存在的计划', action: { type: 'start', orchestration_id: 'orch_missing' } })],
+  ]) {
+    driver.chat = response;
+    const sent = await context.admin('/api/v1/coordinator/chat', {
+      method: 'POST', body: { message: '测试无效动作', request_id: requestId },
+    });
+    const reply = await chatReply(context, sent.payload.message.command_id);
+    assert.equal(reply.status, 'failed');
+    assert.equal(reply.task_id, null);
+  }
+  driver.chat = () => { throw new Error('model unavailable'); };
+  const failed = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '模型失败', request_id: 'model-failure' },
+  });
+  const reply = await chatReply(context, failed.payload.message.command_id);
+  assert.equal(reply.status, 'failed');
+  assert.match(reply.content, /model unavailable/);
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 0);
+  assert.equal((await context.admin('/api/v1/orchestrations')).payload.orchestrations.length, 0);
+  assert.equal(driver.executions.filter((execution) => execution.kind !== 'coordinator_chat').length, 0);
+});
+
+test('An unknown work outcome blocks the parent and never reaches a successful review', async (t) => {
+  const { context, driver } = await setup(t);
+  let releaseWork;
+  driver.workGate = new Promise((resolve) => { releaseWork = resolve; });
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST', body: { title: 'Unknown outcome must stop', orchestrate: true },
+  });
+  const id = created.payload.orchestration.orchestration_id;
+  await waitFor(() => driver.executions.some((execution) => execution.kind === 'prompt'));
+  const execution = driver.executions.find((item) => item.kind === 'prompt');
+  context.connector.send('command.sync', {
+    command_id: execution.command_id,
+    status: 'failed',
+    result: null,
+    error: { code: 'connector_interrupted', message: 'Execution outcome is unknown' },
+    outcome_unknown: true,
+  });
+  const blocked = await waitForOrchestration(context, id, 'blocked');
+  assert.equal(blocked.parent_task.status, 'blocked');
+  assert.equal(blocked.steps[0].status, 'blocked');
+  assert.equal(blocked.steps[0].error.code, 'connector_interrupted');
+  releaseWork();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(driver.executions.filter((item) => item.kind === 'prompt').length, 1);
+  assert.equal(driver.executions.filter((item) => item.kind === 'coordinator_review').length, 0);
+  assert.equal(context.hub.store.getOrchestration(id).status, 'blocked');
+});
+
+test('Persisted chat resumes once after Hub restart and orphaned pending replies fail clearly', async (t) => {
+  const { context, driver, coordinator } = await setup(t);
+  const orphan = context.hub.store.createChatMessage({ role: 'coordinator', status: 'pending' });
+  context.hub.coordinator.resumeChat();
+  assert.equal(context.hub.store.getChatMessage(orphan.message_id).status, 'failed');
+
+  driver.chat = JSON.stringify({
+    reply: '恢复规划',
+    action: {
+      type: 'plan',
+      task: { title: 'Recovered chat', goal: 'Recover exactly once', context: '', acceptance: ['One parent task', 'No work runs'] },
+    },
+  });
+  const command = context.hub.store.createCommand({
+    task_id: null,
+    worker_id: coordinator.worker_id,
+    kind: 'coordinator_chat',
+    input: 'Stored chat request',
+    push_capable: true,
+  });
+  const pending = context.hub.store.createChatMessage({
+    role: 'coordinator', status: 'pending', commandId: command.command_id,
+  });
+  context.hub.store.finishCommand(command.command_id, context.connector.connectorId, {
+    status: 'succeeded', result: { text: driver.chat },
+  });
+  await context.restartHub();
+  const orchestration = await waitFor(async () => {
+    const recovered = context.hub.store.getOrchestrationBySourceMessage(pending.message_id);
+    return recovered?.status === 'ready' ? recovered : null;
+  });
+  assert.equal(orchestration.auto_start, false);
+  assert.equal(context.hub.store.getChatMessage(pending.message_id).status, 'done');
+  assert.equal(context.hub.store.listOrchestrations().length, 1);
+  assert.equal(context.hub.store.listTasks().length, 3);
+  await context.hub.coordinator.resume();
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_chat').length, 0);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_plan').length, 1);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 0);
 });

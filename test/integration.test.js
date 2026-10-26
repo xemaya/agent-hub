@@ -312,3 +312,92 @@ test('Connector cannot create commands or update tasks for another Connector', a
     await other.close();
   }
 });
+
+test('Worker activity shows live task output and clears to a recent result when finished', async (t) => {
+  const context = await createTestContext(t);
+  let releaseWork;
+  let announceOutput;
+  const outputStarted = new Promise((resolve) => { announceOutput = resolve; });
+  context.connector.drivers.test = {
+    async prepareWorker() {
+      return { runtime_session_id: 'activity-session', driver_state: {} };
+    },
+    async execute({ command, onOutput }) {
+      onOutput('正在分析任务上下文\n');
+      announceOutput();
+      await new Promise((resolve) => { releaseWork = resolve; });
+      const text = '实际结果 AGENT_HUB_ACTIVITY_OK';
+      onOutput(`${text}\n`);
+      return { text };
+    },
+    async close() {},
+  };
+  const worker = await context.registerWorker({ name: 'activity-worker' });
+  const dashboard = await context.openDashboard();
+  const created = await context.admin('/api/v1/tasks', {
+    method: 'POST',
+    body: { title: '可见的员工工作', goal: '显示当前进度', assignee_worker_id: worker.worker_id },
+  });
+  const dispatched = await context.admin('/api/v1/commands', {
+    method: 'POST',
+    body: { task_id: created.payload.task.task_id, input: '显示真实输出' },
+  });
+  await outputStarted;
+  const working = await waitFor(async () => {
+    const { payload } = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+    return payload.worker.activity.phase === 'working' && payload.worker.activity.output_text
+      ? payload.worker
+      : null;
+  });
+  assert.equal(working.activity.task_id, created.payload.task.task_id);
+  assert.equal(working.activity.task_title, '可见的员工工作');
+  assert.equal(working.activity.command_status, 'running');
+  assert.match(working.activity.output_text, /正在分析任务上下文/);
+  await waitFor(() => dashboard.messages.some((message) => (
+    message.type === 'worker.updated'
+    && message.payload.worker.activity?.output_text.includes('正在分析任务上下文')
+  )));
+  releaseWork();
+  await waitFor(async () => (
+    await context.admin(`/api/v1/commands/${dispatched.payload.command.command_id}`)
+  ).payload.command.status === 'succeeded');
+  const idle = await waitFor(async () => {
+    const { payload } = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+    return payload.worker.activity.phase === 'idle' ? payload.worker : null;
+  });
+  assert.equal(idle.activity.task_id, null);
+  assert.equal(idle.activity.output_text, '');
+  assert.equal(idle.activity.recent_result, '实际结果 AGENT_HUB_ACTIVITY_OK');
+  assert.ok(idle.activity.updated_at);
+});
+
+test('Another Connector cannot read Admin chat through local or WebSocket APIs', async (t) => {
+  const context = await createTestContext(t);
+  const other = await Connector.create({
+    hubUrl: context.hub.url,
+    name: 'other-mac',
+    dataDir: path.join(context.root, 'other-connector'),
+    localPort: 0,
+    enrollToken: 'test-enroll',
+    drivers: { test: new TestDriver() },
+    logger: { error() {} },
+  });
+  await other.start();
+  await other.whenReady();
+  try {
+    const local = await fetch(`${other.localUrl}/local/v1/coordinator/chat`, {
+      headers: { authorization: `Bearer ${other.store.credentials.localToken}` },
+    });
+    assert.equal(local.status, 404);
+    await assert.rejects(
+      other.request('coordinator.chat', {}),
+      (error) => /Unsupported connector message/.test(error.message),
+    );
+    const direct = await fetch(`${context.hub.url}/api/v1/coordinator/chat`, {
+      headers: { authorization: `Bearer ${other.store.credentials.localToken}` },
+    });
+    assert.equal(direct.status, 401);
+  } finally {
+    await other.close();
+  }
+});

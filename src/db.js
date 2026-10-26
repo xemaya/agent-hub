@@ -117,8 +117,26 @@ function orchestrationView(row) {
     summary: row.summary,
     steps: parseJson(row.steps_json, []),
     error: parseJson(row.error_json, null),
+    auto_start: row.auto_start === undefined ? true : Boolean(row.auto_start),
+    source_message_id: row.source_message_id ?? null,
+    review_reason: row.review_reason ?? '',
     created_at: row.created_at,
     updated_at: row.updated_at,
+  };
+}
+
+function chatMessageView(row) {
+  if (!row) return null;
+  return {
+    message_id: row.message_id,
+    role: row.role,
+    content: row.content,
+    status: row.status,
+    request_id: row.request_id,
+    command_id: row.command_id,
+    task_id: row.task_id,
+    source_key: row.source_key,
+    created_at: row.created_at,
   };
 }
 
@@ -225,8 +243,22 @@ export class HubStore {
         summary TEXT NOT NULL DEFAULT '',
         steps_json TEXT NOT NULL DEFAULT '[]',
         error_json TEXT,
+        auto_start INTEGER NOT NULL DEFAULT 1,
+        source_message_id TEXT UNIQUE,
+        review_reason TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS coordinator_chat_messages (
+        message_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK(role IN ('user', 'coordinator', 'activity')),
+        content TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK(status IN ('pending', 'done', 'failed')),
+        request_id TEXT UNIQUE,
+        command_id TEXT UNIQUE REFERENCES commands(command_id),
+        task_id TEXT REFERENCES tasks(task_id),
+        source_key TEXT UNIQUE,
+        created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_workers_connector ON workers(connector_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_worker_id);
@@ -234,7 +266,25 @@ export class HubStore {
       CREATE INDEX IF NOT EXISTS idx_commands_task ON commands(task_id);
       CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
       CREATE INDEX IF NOT EXISTS idx_coordinator_orchestrations_status ON coordinator_orchestrations(status);
-      PRAGMA user_version = 2;
+      CREATE INDEX IF NOT EXISTS idx_coordinator_chat_created ON coordinator_chat_messages(created_at);
+    `);
+    this.migrate();
+  }
+
+  migrate() {
+    const columns = new Set(this.db.prepare('PRAGMA table_info(coordinator_orchestrations)').all().map((column) => column.name));
+    const additions = {
+      auto_start: 'INTEGER NOT NULL DEFAULT 1',
+      source_message_id: 'TEXT',
+      review_reason: "TEXT NOT NULL DEFAULT ''",
+    };
+    for (const [name, definition] of Object.entries(additions)) {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE coordinator_orchestrations ADD COLUMN ${name} ${definition}`);
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
+        ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
+      PRAGMA user_version = 3;
     `);
   }
 
@@ -358,31 +408,32 @@ export class HubStore {
     return this.getWorker(workerId);
   }
 
+  insertTask(data, taskId, timestamp) {
+    this.db.prepare(`
+      INSERT INTO tasks (
+        task_id, title, goal, context, acceptance_json, assignee_worker_id,
+        status, created_by, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+    `).run(
+      taskId,
+      data.title,
+      data.goal ?? '',
+      data.context ?? '',
+      stringifyJson(data.acceptance ?? []),
+      data.assignee_worker_id ?? null,
+      data.created_by ?? 'admin',
+      timestamp,
+      timestamp,
+    );
+    if (data.assignee_worker_id) {
+      this.db.prepare('UPDATE workers SET current_task_id = ?, updated_at = ? WHERE worker_id = ?')
+        .run(taskId, timestamp, data.assignee_worker_id);
+    }
+  }
+
   createTask(data) {
-    const timestamp = now();
     const taskId = createId('task');
-    this.transaction(() => {
-      this.db.prepare(`
-        INSERT INTO tasks (
-          task_id, title, goal, context, acceptance_json, assignee_worker_id,
-          status, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
-      `).run(
-        taskId,
-        data.title,
-        data.goal ?? '',
-        data.context ?? '',
-        stringifyJson(data.acceptance ?? []),
-        data.assignee_worker_id ?? null,
-        data.created_by ?? 'admin',
-        timestamp,
-        timestamp,
-      );
-      if (data.assignee_worker_id) {
-        this.db.prepare('UPDATE workers SET current_task_id = ?, updated_at = ? WHERE worker_id = ?')
-          .run(taskId, timestamp, data.assignee_worker_id);
-      }
-    });
+    this.transaction(() => this.insertTask(data, taskId, now()));
     return this.getTask(taskId);
   }
 
@@ -544,16 +595,31 @@ export class HubStore {
     return this.getCoordinatorConfig();
   }
 
-  createOrchestration({ parentTaskId, coordinatorWorkerId }) {
+  createOrchestratedTask({ title, goal, context, acceptance, createdBy, coordinatorWorkerId, sourceMessageId = null, autoStart = true }) {
+    if (sourceMessageId) {
+      const existing = this.getOrchestrationBySourceMessage(sourceMessageId);
+      if (existing) return { task: this.getTask(existing.parent_task_id), orchestration: existing };
+    }
+    const parentTaskId = createId('task');
     const orchestrationId = createId('orch');
     const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO coordinator_orchestrations (
-        orchestration_id, parent_task_id, coordinator_worker_id,
-        status, created_at, updated_at
-      ) VALUES (?, ?, ?, 'planning', ?, ?)
-    `).run(orchestrationId, parentTaskId, coordinatorWorkerId, timestamp, timestamp);
-    return this.getOrchestration(orchestrationId);
+    this.transaction(() => {
+      this.insertTask({
+        title,
+        goal,
+        context,
+        acceptance,
+        assignee_worker_id: null,
+        created_by: createdBy,
+      }, parentTaskId, timestamp);
+      this.db.prepare(`
+        INSERT INTO coordinator_orchestrations (
+          orchestration_id, parent_task_id, coordinator_worker_id,
+          status, auto_start, source_message_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'planning', ?, ?, ?, ?)
+      `).run(orchestrationId, parentTaskId, coordinatorWorkerId, autoStart ? 1 : 0, sourceMessageId, timestamp, timestamp);
+    });
+    return { task: this.getTask(parentTaskId), orchestration: this.getOrchestration(orchestrationId) };
   }
 
   getOrchestration(orchestrationId) {
@@ -566,6 +632,12 @@ export class HubStore {
     return orchestrationView(this.db.prepare(`
       SELECT * FROM coordinator_orchestrations WHERE parent_task_id = ?
     `).get(parentTaskId));
+  }
+
+  getOrchestrationBySourceMessage(messageId) {
+    return orchestrationView(this.db.prepare(`
+      SELECT * FROM coordinator_orchestrations WHERE source_message_id = ?
+    `).get(messageId));
   }
 
   listOrchestrations({ active = false } = {}) {
@@ -583,12 +655,90 @@ export class HubStore {
     const summary = data.summary ?? current.summary;
     const steps = data.steps === undefined ? current.steps : data.steps;
     const error = data.error === undefined ? current.error : data.error;
+    const reviewReason = data.reviewReason ?? current.review_reason;
     this.db.prepare(`
       UPDATE coordinator_orchestrations
-      SET status = ?, summary = ?, steps_json = ?, error_json = ?, updated_at = ?
+      SET status = ?, summary = ?, steps_json = ?, error_json = ?, review_reason = ?, updated_at = ?
       WHERE orchestration_id = ?
-    `).run(status, summary, stringifyJson(steps), stringifyJson(error), now(), orchestrationId);
+    `).run(status, summary, stringifyJson(steps), stringifyJson(error), reviewReason, now(), orchestrationId);
     return this.getOrchestration(orchestrationId);
+  }
+
+  createChatMessage({ role, content = '', status = 'done', requestId = null, commandId = null, taskId = null, sourceKey = null }) {
+    const existing = requestId
+      ? this.getChatMessageByRequestId(requestId)
+      : sourceKey
+        ? this.getChatMessageBySourceKey(sourceKey)
+        : null;
+    if (existing) return existing;
+    const messageId = createId('chat');
+    this.db.prepare(`
+      INSERT INTO coordinator_chat_messages (
+        message_id, role, content, status, request_id, command_id, task_id, source_key, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, role, content, status, requestId, commandId, taskId, sourceKey, now());
+    return this.getChatMessage(messageId);
+  }
+
+  getChatMessage(messageId) {
+    return chatMessageView(this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages WHERE message_id = ?
+    `).get(messageId));
+  }
+
+  getChatMessageByRequestId(requestId) {
+    return chatMessageView(this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages WHERE request_id = ?
+    `).get(requestId));
+  }
+
+  getChatMessageBySourceKey(sourceKey) {
+    return chatMessageView(this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages WHERE source_key = ?
+    `).get(sourceKey));
+  }
+
+  getChatMessageByCommand(commandId) {
+    return chatMessageView(this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages WHERE command_id = ?
+    `).get(commandId));
+  }
+
+  listChatMessages({ limit = 200 } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages
+      ORDER BY created_at DESC, rowid DESC LIMIT ?
+    `).all(limit).map(chatMessageView).reverse();
+  }
+
+  listPendingChatMessages() {
+    return this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages
+      WHERE role = 'coordinator' AND status = 'pending'
+      ORDER BY created_at ASC, rowid ASC
+    `).all().map(chatMessageView);
+  }
+
+  updateChatMessage(messageId, data) {
+    const current = this.getChatMessage(messageId);
+    if (!current) return null;
+    const content = data.content ?? current.content;
+    const status = data.status ?? current.status;
+    const commandId = data.commandId === undefined ? current.command_id : data.commandId;
+    const taskId = data.taskId === undefined ? current.task_id : data.taskId;
+    this.db.prepare(`
+      UPDATE coordinator_chat_messages
+      SET content = ?, status = ?, command_id = ?, task_id = ?
+      WHERE message_id = ?
+    `).run(content, status, commandId, taskId, messageId);
+    return this.getChatMessage(messageId);
+  }
+
+  latestTaskEvent(taskId, eventType) {
+    return eventView(this.db.prepare(`
+      SELECT * FROM events WHERE task_id = ? AND event_type = ?
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(taskId, eventType));
   }
 
   recordEvent({ event_type: eventType, actor_type: actorType, actor_id: actorId, ...refs }) {

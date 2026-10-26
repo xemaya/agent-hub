@@ -1,0 +1,100 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
+import path from 'node:path';
+import { HubStore } from '../src/db.js';
+
+async function databaseRoot(t) {
+  const parent = path.resolve('.test-tmp');
+  await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(path.join(parent, 'db-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+test('v2 orchestration schema migrates without losing old records', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  const legacy = new DatabaseSync(filename);
+  legacy.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE coordinator_orchestrations (
+      orchestration_id TEXT PRIMARY KEY,
+      parent_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+      coordinator_worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+      status TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '',
+      steps_json TEXT NOT NULL DEFAULT '[]',
+      error_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO coordinator_orchestrations (
+      orchestration_id, parent_task_id, coordinator_worker_id,
+      status, summary, steps_json, created_at, updated_at
+    ) VALUES (
+      'orch_legacy', 'task_legacy', 'worker_legacy',
+      'done', 'Legacy plan', '[]', '2026-10-26T00:00:00.000Z', '2026-10-26T00:00:00.000Z'
+    );
+    PRAGMA user_version = 2;
+  `);
+  legacy.close();
+  const store = new HubStore(filename);
+  t.after(() => store.close());
+  const columns = store.db.prepare('PRAGMA table_info(coordinator_orchestrations)').all().map((column) => column.name);
+  assert.ok(columns.includes('auto_start'));
+  assert.ok(columns.includes('source_message_id'));
+  assert.ok(columns.includes('review_reason'));
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3);
+  const migrated = store.getOrchestration('orch_legacy');
+  assert.equal(migrated.summary, 'Legacy plan');
+  assert.equal(migrated.auto_start, true);
+  assert.equal(migrated.source_message_id, null);
+  assert.equal(migrated.review_reason, '');
+  const chatTable = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'coordinator_chat_messages'").get();
+  assert.equal(chatTable.name, 'coordinator_chat_messages');
+});
+
+test('Chat and orchestration idempotency survive reopening the database', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  let store = new HubStore(filename);
+  t.after(() => {
+    if (store) store.close();
+  });
+  const connector = store.createConnector({ name: 'db-test', tokenHash: 'test-hash' });
+  const worker = store.registerWorker(connector.connector_id, {
+    name: 'db-worker', runtime: 'test', mode: 'managed', runtime_session_id: 'db-session',
+    capabilities: ['testing'], cwd: root, metadata: {},
+  });
+  const user = store.createChatMessage({ role: 'user', content: '只规划', requestId: 'same-request' });
+  assert.equal(store.createChatMessage({ role: 'user', content: '重复请求', requestId: 'same-request' }).message_id, user.message_id);
+  const reply = store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey: `chat-reply:${user.message_id}` });
+  assert.equal(store.createChatMessage({ role: 'coordinator', sourceKey: `chat-reply:${user.message_id}` }).message_id, reply.message_id);
+  const created = store.createOrchestratedTask({
+    title: 'Persistent plan', goal: 'Only one parent', context: '', acceptance: ['One plan'],
+    createdBy: 'admin', coordinatorWorkerId: worker.worker_id, sourceMessageId: reply.message_id, autoStart: false,
+  });
+  const repeated = store.createOrchestratedTask({
+    title: 'Persistent plan', goal: 'Only one parent', context: '', acceptance: ['One plan'],
+    createdBy: 'admin', coordinatorWorkerId: worker.worker_id, sourceMessageId: reply.message_id, autoStart: false,
+  });
+  assert.equal(repeated.orchestration.orchestration_id, created.orchestration.orchestration_id);
+  assert.equal(store.listOrchestrations().length, 1);
+  assert.equal(store.listTasks().length, 1);
+  store.updateChatMessage(reply.message_id, {
+    status: 'done', content: '计划已保存', taskId: created.task.task_id,
+  });
+  store.close();
+  store = new HubStore(filename);
+  const restored = store.getOrchestration(created.orchestration.orchestration_id);
+  assert.equal(restored.status, 'planning');
+  assert.equal(restored.auto_start, false);
+  assert.equal(restored.source_message_id, reply.message_id);
+  const messages = store.listChatMessages();
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1].content, '计划已保存');
+  assert.equal(messages[1].task_id, created.task.task_id);
+  assert.equal(store.createChatMessage({ role: 'user', content: '再试一次', requestId: 'same-request' }).message_id, user.message_id);
+});

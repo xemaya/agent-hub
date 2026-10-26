@@ -18,7 +18,67 @@ const STATIC_FILES = new Map([
 ]);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
-const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review']);
+const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat']);
+const COORDINATOR_COMMAND_KINDS = new Set(['coordinator_plan', 'coordinator_review', 'coordinator_chat']);
+
+function workerActivity(store, worker) {
+  const commands = store.listCommands({ workerId: worker.worker_id });
+  const current = commands.find((command) => ['queued', 'accepted', 'running'].includes(command.status))
+    ?? commands.find((command) => command.status === 'waiting_manual')
+    ?? null;
+  const recent = commands.find((command) => ['succeeded', 'failed'].includes(command.status)) ?? null;
+  const orchestrations = store.listOrchestrations();
+  const orchestration = current
+    ? orchestrations.find((item) => item.parent_task_id === current.task_id
+      || item.steps.some((step) => step.command_id === current.command_id || step.task_id === current.task_id))
+    : null;
+  const step = current && orchestration
+    ? orchestration.steps.find((item) => item.command_id === current.command_id || item.task_id === current.task_id)
+    : null;
+  const taskId = current?.task_id ?? (worker.work_state === 'working' ? worker.current_task_id : null);
+  const task = taskId ? store.getTask(taskId) : null;
+  let phase = 'idle';
+  if (worker.presence === 'offline') phase = 'offline';
+  else if (current?.status === 'waiting_manual') phase = 'waiting_manual';
+  else if (current && ['queued', 'accepted'].includes(current.status)) phase = 'queued';
+  else if (current?.kind === 'coordinator_plan') phase = 'planning';
+  else if (current?.kind === 'coordinator_review') phase = 'reviewing';
+  else if (current?.kind === 'coordinator_chat') phase = 'chatting';
+  else if (current || worker.work_state === 'working') phase = 'working';
+  else if (['waiting', 'blocked'].includes(worker.work_state)) phase = worker.work_state;
+  const details = {
+    idle: '空闲，可以接新任务',
+    queued: '已收到安排，等待开始',
+    planning: '正在制定任务计划',
+    reviewing: '正在核对执行证据',
+    chatting: '正在理解你的消息',
+    working: '正在执行任务',
+    waiting: '等待进一步处理',
+    blocked: 'Worker 报告了阻塞',
+    waiting_manual: '需要在原会话中人工处理',
+    offline: '机器连接已断开，展示最后已知状态',
+  };
+  const internal = current ? COORDINATOR_COMMAND_KINDS.has(current.kind) : false;
+  const output = current && !internal ? current.output_text.slice(-2000) : '';
+  const recentText = recent && !COORDINATOR_COMMAND_KINDS.has(recent.kind)
+    ? typeof recent.result?.text === 'string' ? recent.result.text : recent.output_text
+    : '';
+  return {
+    phase,
+    detail: details[phase],
+    command_id: current?.command_id ?? null,
+    command_status: current?.status ?? null,
+    task_id: orchestration?.parent_task_id ?? taskId,
+    task_title: step?.title ?? task?.title ?? (current?.kind === 'coordinator_chat' ? '中央对话' : null),
+    parent_task_title: orchestration ? store.getTask(orchestration.parent_task_id)?.title ?? null : null,
+    output_text: output,
+    output_truncated: Boolean(current?.output_truncated || (current && current.output_text.length > output.length)),
+    recent_result: recentText.slice(-2000),
+    recent_result_truncated: recentText.length > 2000,
+    updated_at: current?.started_at ?? current?.accepted_at ?? current?.created_at
+      ?? recent?.finished_at ?? recent?.created_at ?? null,
+  };
+}
 
 function protocolError(message, statusCode = 400, code = 'connector_request_failed') {
   const error = new Error(message);
@@ -82,6 +142,7 @@ export class Hub {
       store: this.store,
       emit: (...args) => this.emit(...args),
       dispatch: (command) => this.dispatch(command),
+      notify: (message) => this.broadcast('chat.updated', { message }),
       logger: this.logger,
     });
     this.server = createServer((request, response) => {
@@ -195,6 +256,10 @@ export class Hub {
     }
   }
 
+  presentWorker(worker) {
+    return worker ? { ...worker, activity: workerActivity(this.store, worker) } : null;
+  }
+
   async handleRequest(request, response) {
     const url = new URL(request.url, 'http://localhost');
     const pathname = url.pathname;
@@ -257,6 +322,16 @@ export class Hub {
       sendJson(response, 200, { coordinator });
       return;
     }
+    if (request.method === 'GET' && pathname === '/api/v1/coordinator/chat') {
+      sendJson(response, 200, { messages: this.coordinator.chat() });
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/coordinator/chat') {
+      const body = await readJsonBody(request);
+      const result = this.coordinator.sendChat({ message: body.message, requestId: body.request_id });
+      sendJson(response, result.message.status === 'pending' ? 202 : 200, result);
+      return;
+    }
     if (request.method === 'GET' && pathname === '/api/v1/orchestrations') {
       sendJson(response, 200, { orchestrations: this.coordinator.list() });
       return;
@@ -273,7 +348,7 @@ export class Hub {
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/workers') {
-      sendJson(response, 200, { workers: this.store.listWorkers() });
+      sendJson(response, 200, { workers: this.store.listWorkers().map((worker) => this.presentWorker(worker)) });
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/tasks') {
@@ -419,7 +494,7 @@ export class Hub {
 
     const workerMatch = /^\/api\/v1\/workers\/([^/]+)$/.exec(pathname);
     if (request.method === 'GET' && workerMatch) {
-      const worker = this.store.getWorker(workerMatch[1]);
+      const worker = this.presentWorker(this.store.getWorker(workerMatch[1]));
       sendJson(response, worker ? 200 : 404, worker ? { worker } : { error: 'Worker not found' });
       return;
     }
@@ -622,6 +697,7 @@ export class Hub {
         task_id: worker.current_task_id,
         payload: { work_state: worker.work_state },
       });
+      this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       return;
     }
     if (message.type === 'command.ack') {
@@ -634,6 +710,7 @@ export class Hub {
         command_id: command.command_id,
       });
       this.broadcast('command.updated', { command });
+      this.broadcast('worker.updated', { worker: this.presentWorker(this.store.getWorker(command.worker_id)) });
       return;
     }
     if (message.type === 'command.started') {
@@ -654,7 +731,7 @@ export class Hub {
         command_id: command.command_id,
       });
       this.broadcast('command.updated', { command });
-      this.broadcast('worker.updated', { worker });
+      this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       return;
     }
     if (message.type === 'command.output') {
@@ -665,6 +742,7 @@ export class Hub {
         chunk: String(payload.chunk ?? ''),
         output_truncated: command.output_truncated,
       });
+      this.broadcast('worker.updated', { worker: this.presentWorker(this.store.getWorker(command.worker_id)) });
       return;
     }
     if (message.type === 'command.finished') {
@@ -685,7 +763,7 @@ export class Hub {
         payload: { error: command.error, outcome_unknown: command.outcome_unknown },
       });
       this.broadcast('command.updated', { command });
-      this.broadcast('worker.updated', { worker });
+      this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       await this.coordinator.onCommandFinished(command);
       return;
     }

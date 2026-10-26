@@ -21,7 +21,7 @@ export async function waitFor(predicate, { timeout = 6000, interval = 15 } = {})
 export async function createTestContext(t) {
   await mkdir(TEST_ROOT, { recursive: true });
   const root = await mkdtemp(path.join(TEST_ROOT, 'case-'));
-  const hub = await Hub.create({
+  let hub = await Hub.create({
     host: '127.0.0.1',
     port: 0,
     dataDir: path.join(root, 'hub'),
@@ -37,7 +37,7 @@ export async function createTestContext(t) {
   const driver = new TestDriver();
   let connector;
 
-  const startConnector = async () => {
+  const startConnector = async (drivers = connector?.drivers ?? { test: driver }) => {
     connector = await Connector.create({
       hubUrl: hub.url,
       name: 'test-mac',
@@ -46,7 +46,7 @@ export async function createTestContext(t) {
       localPort: 0,
       enrollToken: 'test-enroll',
       allowTestDriver: true,
-      drivers: { test: driver },
+      drivers,
       logger: silentLogger,
     });
     await connector.start();
@@ -83,7 +83,9 @@ export async function createTestContext(t) {
 
   const context = {
     root,
-    hub,
+    get hub() {
+      return hub;
+    },
     driver,
     admin,
     local,
@@ -94,6 +96,22 @@ export async function createTestContext(t) {
       await connector.close();
       await waitFor(() => !hub.store.getConnector(connector.connectorId).online);
       return startConnector();
+    },
+    async restartHub() {
+      await connector.close();
+      await waitFor(() => !hub.store.getConnector(connector.connectorId).online);
+      const credentials = hub.credentials;
+      await hub.close();
+      hub = await Hub.create({
+        host: '127.0.0.1',
+        port: 0,
+        dataDir: path.join(root, 'hub'),
+        credentials,
+        logger: silentLogger,
+      });
+      await hub.listen();
+      await startConnector();
+      return hub;
     },
     async registerWorker(overrides = {}) {
       const { response, payload } = await local('/local/v1/workers/register', {

@@ -1,0 +1,12 @@
+node_modules/
+.runtime/
+.test-tmp/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+connector.json

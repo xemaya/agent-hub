@@ -1,0 +1,560 @@
+import { createServer } from 'node:http';
+import { mkdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import { HubStore } from './db.js';
+import { bearerToken, hashToken, tokensEqual } from './auth.js';
+import { loadHubCredentials } from './credentials.js';
+import { createId, createToken } from './ids.js';
+import { readJsonBody, sendJson, sendText } from './json.js';
+
+const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
+const STATIC_FILES = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/style.css', ['style.css', 'text/css; charset=utf-8']],
+]);
+const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
+const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
+const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request']);
+
+function requiredString(value, field, { max = 10000 } = {}) {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) {
+    const error = new Error(`${field} must be a non-empty string of at most ${max} characters`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return value.trim();
+}
+
+function optionalString(value, fallback = '') {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function stringArray(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    const error = new Error('Expected an array of strings');
+    error.statusCode = 400;
+    throw error;
+  }
+  return value;
+}
+
+function workerInput(payload) {
+  if (!['managed', 'external'].includes(payload.mode)) {
+    const error = new Error('mode must be managed or external');
+    error.statusCode = 400;
+    throw error;
+  }
+  return {
+    name: requiredString(payload.name, 'name', { max: 120 }),
+    runtime: requiredString(payload.runtime, 'runtime', { max: 40 }),
+    mode: payload.mode,
+    runtime_session_id: requiredString(payload.runtime_session_id, 'runtime_session_id', { max: 300 }),
+    capabilities: stringArray(payload.capabilities),
+    cwd: requiredString(payload.cwd, 'cwd', { max: 4096 }),
+    metadata: payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)
+      ? payload.metadata
+      : {},
+  };
+}
+
+export class Hub {
+  constructor({ host, port, dataDir, credentials, logger = console }) {
+    this.host = host;
+    this.requestedPort = port;
+    this.logger = logger;
+    this.store = new HubStore(path.join(dataDir, 'hub.db'));
+    this.credentials = credentials;
+    this.connectors = new Map();
+    this.dashboards = new Set();
+    this.server = createServer((request, response) => {
+      this.handleRequest(request, response).catch((error) => {
+        this.logger.error?.(error);
+        if (!response.headersSent) {
+          sendJson(response, error.statusCode ?? 500, { error: error.message ?? 'Internal server error' });
+        } else {
+          response.end();
+        }
+      });
+    });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+    this.heartbeat = setInterval(() => {
+      for (const socket of this.connectors.values()) {
+        if (socket.readyState === WebSocket.OPEN) socket.ping();
+      }
+    }, 30000);
+    this.heartbeat.unref();
+    this.server.on('upgrade', (request, socket, head) => {
+      const url = new URL(request.url, 'http://localhost');
+      const kind = url.pathname === '/ws/connector'
+        ? 'connector'
+        : url.pathname === '/ws/dashboard'
+          ? 'dashboard'
+          : null;
+      if (!kind) {
+        socket.destroy();
+        return;
+      }
+      this.wss.handleUpgrade(request, socket, head, (webSocket) => {
+        this.handleWebSocket(webSocket, kind);
+      });
+    });
+  }
+
+  static async create(options) {
+    const dataDir = path.resolve(options.dataDir ?? '.runtime/hub');
+    await mkdir(dataDir, { recursive: true, mode: 0o700 });
+    const credentials = options.credentials ?? await loadHubCredentials(dataDir, options.env);
+    return new Hub({
+      ...options,
+      host: options.host ?? '127.0.0.1',
+      port: options.port ?? 8787,
+      dataDir,
+      credentials,
+    });
+  }
+
+  async listen() {
+    if (this.server.listening) return;
+    await new Promise((resolve, reject) => {
+      this.server.once('error', reject);
+      this.server.listen(this.requestedPort, this.host, () => {
+        this.server.off('error', reject);
+        resolve();
+      });
+    });
+  }
+
+  get port() {
+    const address = this.server.address();
+    return typeof address === 'object' && address ? address.port : this.requestedPort;
+  }
+
+  get url() {
+    return `http://${this.host}:${this.port}`;
+  }
+
+  async close() {
+    clearInterval(this.heartbeat);
+    for (const socket of this.wss.clients) socket.close(1001, 'Hub shutting down');
+    this.connectors.clear();
+    this.dashboards.clear();
+    if (this.server.listening) {
+      await new Promise((resolve) => this.server.close(resolve));
+    }
+    this.wss.close();
+    this.store.close();
+  }
+
+  emit(eventType, actor, refs = {}) {
+    const event = this.store.recordEvent({
+      event_type: eventType,
+      actor_type: actor.type,
+      actor_id: actor.id,
+      ...refs,
+    });
+    this.broadcast('event', { event });
+    return event;
+  }
+
+  send(socket, type, payload = {}, replyTo) {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    const message = { type, id: createId('msg'), ts: new Date().toISOString(), payload };
+    if (replyTo) message.reply_to = replyTo;
+    socket.send(JSON.stringify(message));
+    return true;
+  }
+
+  broadcast(type, payload) {
+    for (const socket of this.dashboards) this.send(socket, type, payload);
+  }
+
+  requireAdmin(request) {
+    const token = bearerToken(request);
+    if (!tokensEqual(token, this.credentials.adminToken)) {
+      const error = new Error('Admin authentication required');
+      error.statusCode = 401;
+      throw error;
+    }
+  }
+
+  async handleRequest(request, response) {
+    const url = new URL(request.url, 'http://localhost');
+    const pathname = url.pathname;
+    if (request.method === 'GET' && pathname === '/healthz') {
+      sendJson(response, 200, { ok: true, service: 'agent-hub' });
+      return;
+    }
+    if (request.method === 'GET' && STATIC_FILES.has(pathname)) {
+      const [filename, contentType] = STATIC_FILES.get(pathname);
+      try {
+        const body = await readFile(path.join(PUBLIC_DIR, filename));
+        response.writeHead(200, { 'content-type': contentType, 'content-length': body.length });
+        response.end(body);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        sendText(response, 404, 'Not found');
+      }
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/connectors/enroll') {
+      if (!tokensEqual(bearerToken(request), this.credentials.enrollmentToken)) {
+        sendJson(response, 401, { error: 'Valid enrollment token required' });
+        return;
+      }
+      const body = await readJsonBody(request);
+      const token = createToken('ah_connector');
+      const connector = this.store.createConnector({
+        name: requiredString(body.name, 'name', { max: 120 }),
+        hostname: optionalString(body.hostname) || null,
+        tokenHash: hashToken(token),
+      });
+      this.emit('connector.enrolled', { type: 'connector', id: connector.connector_id }, {
+        connector_id: connector.connector_id,
+        payload: { name: connector.name },
+      });
+      sendJson(response, 201, { connector, token });
+      return;
+    }
+    if (!pathname.startsWith('/api/v1/')) {
+      sendJson(response, 404, { error: 'Not found' });
+      return;
+    }
+    this.requireAdmin(request);
+
+    if (request.method === 'GET' && pathname === '/api/v1/connectors') {
+      sendJson(response, 200, { connectors: this.store.listConnectors() });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/workers') {
+      sendJson(response, 200, { workers: this.store.listWorkers() });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/tasks') {
+      sendJson(response, 200, { tasks: this.store.listTasks() });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/events') {
+      sendJson(response, 200, { events: this.store.listEvents() });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/commands') {
+      sendJson(response, 200, {
+        commands: this.store.listCommands({
+          workerId: url.searchParams.get('worker_id'),
+          taskId: url.searchParams.get('task_id'),
+        }),
+      });
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/tasks') {
+      const body = await readJsonBody(request);
+      const assignee = body.assignee_worker_id ?? null;
+      if (assignee && !this.store.getWorker(assignee)) {
+        sendJson(response, 400, { error: 'Assignee worker does not exist' });
+        return;
+      }
+      const task = this.store.createTask({
+        title: requiredString(body.title, 'title', { max: 300 }),
+        goal: optionalString(body.goal),
+        context: optionalString(body.context),
+        acceptance: stringArray(body.acceptance),
+        assignee_worker_id: assignee,
+        created_by: 'admin',
+      });
+      this.emit('task.created', { type: 'admin', id: 'admin' }, {
+        task_id: task.task_id,
+        worker_id: task.assignee_worker_id,
+        payload: { title: task.title },
+      });
+      sendJson(response, 201, { task });
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/commands') {
+      const body = await readJsonBody(request);
+      const taskId = body.task_id ?? null;
+      const task = taskId ? this.store.getTask(taskId) : null;
+      if (taskId && !task) {
+        sendJson(response, 400, { error: 'Task does not exist' });
+        return;
+      }
+      const workerId = body.worker_id ?? task?.assignee_worker_id;
+      const worker = workerId ? this.store.getWorker(workerId) : null;
+      if (!worker) {
+        sendJson(response, 400, { error: 'Worker does not exist or task is unassigned' });
+        return;
+      }
+      const kind = body.kind ?? 'prompt';
+      if (!COMMAND_KINDS.has(kind)) {
+        sendJson(response, 400, { error: 'Unsupported command kind' });
+        return;
+      }
+      const command = this.store.createCommand({
+        task_id: taskId,
+        worker_id: worker.worker_id,
+        kind,
+        input: requiredString(body.input, 'input', { max: 200000 }),
+        push_capable: worker.push_capable,
+      });
+      this.emit('command.created', { type: 'admin', id: 'admin' }, {
+        connector_id: worker.connector_id,
+        worker_id: worker.worker_id,
+        task_id: command.task_id,
+        command_id: command.command_id,
+        payload: { kind: command.kind, status: command.status },
+      });
+      if (command.status === 'queued') this.dispatch(command);
+      sendJson(response, 202, { command });
+      return;
+    }
+
+    const taskMatch = /^\/api\/v1\/tasks\/([^/]+)$/.exec(pathname);
+    if (taskMatch) {
+      const task = this.store.getTask(taskMatch[1]);
+      if (!task) {
+        sendJson(response, 404, { error: 'Task not found' });
+        return;
+      }
+      if (request.method === 'GET') {
+        sendJson(response, 200, { task });
+        return;
+      }
+      if (request.method === 'PATCH') {
+        const body = await readJsonBody(request);
+        if (body.status !== undefined && !TASK_STATUSES.has(body.status)) {
+          sendJson(response, 400, { error: 'Invalid task status' });
+          return;
+        }
+        if (body.assignee_worker_id && !this.store.getWorker(body.assignee_worker_id)) {
+          sendJson(response, 400, { error: 'Assignee worker does not exist' });
+          return;
+        }
+        const updated = this.store.updateTask(task.task_id, {
+          title: body.title === undefined ? undefined : requiredString(body.title, 'title', { max: 300 }),
+          goal: body.goal,
+          context: body.context,
+          acceptance: body.acceptance === undefined ? undefined : stringArray(body.acceptance),
+          status: body.status,
+          assignee_worker_id: body.assignee_worker_id,
+        });
+        this.emit('task.updated', { type: 'admin', id: 'admin' }, {
+          task_id: updated.task_id,
+          worker_id: updated.assignee_worker_id,
+          payload: { status: updated.status, assignee_worker_id: updated.assignee_worker_id },
+        });
+        sendJson(response, 200, { task: updated });
+        return;
+      }
+    }
+
+    const workerMatch = /^\/api\/v1\/workers\/([^/]+)$/.exec(pathname);
+    if (request.method === 'GET' && workerMatch) {
+      const worker = this.store.getWorker(workerMatch[1]);
+      sendJson(response, worker ? 200 : 404, worker ? { worker } : { error: 'Worker not found' });
+      return;
+    }
+    const commandMatch = /^\/api\/v1\/commands\/([^/]+)$/.exec(pathname);
+    if (request.method === 'GET' && commandMatch) {
+      const command = this.store.getCommand(commandMatch[1]);
+      sendJson(response, command ? 200 : 404, command ? { command } : { error: 'Command not found' });
+      return;
+    }
+    sendJson(response, 404, { error: 'Not found' });
+  }
+
+  handleWebSocket(socket, kind) {
+    let authenticated = false;
+    let connectorId = null;
+    socket.on('pong', () => {
+      if (connectorId) this.store.touchConnector(connectorId);
+    });
+    socket.on('message', (raw) => {
+      let message;
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        this.send(socket, 'error', { error: 'Invalid JSON message' });
+        return;
+      }
+      if (!authenticated) {
+        const expectedType = kind === 'connector' ? 'connector.hello' : 'dashboard.hello';
+        if (message.type !== expectedType || typeof message.payload?.token !== 'string') {
+          socket.close(1008, 'Authentication required');
+          return;
+        }
+        if (kind === 'dashboard') {
+          if (!tokensEqual(message.payload.token, this.credentials.adminToken)) {
+            socket.close(1008, 'Invalid token');
+            return;
+          }
+          authenticated = true;
+          this.dashboards.add(socket);
+          this.send(socket, 'dashboard.ready', {});
+        } else {
+          const connector = this.store.getConnectorByTokenHash(hashToken(message.payload.token));
+          if (!connector || connector.revoked_at) {
+            socket.close(1008, 'Invalid token');
+            return;
+          }
+          authenticated = true;
+          connectorId = connector.connector_id;
+          const previous = this.connectors.get(connectorId);
+          if (previous && previous !== socket) previous.close(1008, 'Replaced by newer connection');
+          this.connectors.set(connectorId, socket);
+          this.store.setConnectorOnline(connectorId, true);
+          this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
+          this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId) });
+          this.replay(connectorId);
+        }
+        return;
+      }
+      if (kind === 'connector') {
+        this.handleConnectorMessage(socket, connectorId, message).catch((error) => {
+          this.send(socket, 'error', { error: error.message }, message.id);
+        });
+      }
+    });
+    socket.on('close', () => {
+      if (kind === 'dashboard') {
+        this.dashboards.delete(socket);
+      } else if (connectorId && this.connectors.get(connectorId) === socket) {
+        this.connectors.delete(connectorId);
+        this.store.setConnectorOnline(connectorId, false);
+        this.emit('connector.offline', { type: 'connector', id: connectorId }, { connector_id: connectorId });
+      }
+    });
+    socket.on('error', (error) => this.logger.error?.(error));
+  }
+
+  authorizedCommand(commandId, connectorId) {
+    const command = this.store.getCommand(commandId);
+    if (!command) return null;
+    const worker = this.store.getWorkerForConnector(command.worker_id, connectorId);
+    return worker ? command : null;
+  }
+
+  async handleConnectorMessage(socket, connectorId, message) {
+    const payload = message.payload ?? {};
+    if (message.type === 'worker.register') {
+      const worker = this.store.registerWorker(connectorId, workerInput(payload));
+      this.emit('worker.registered', { type: 'worker', id: worker.worker_id }, {
+        connector_id: connectorId,
+        worker_id: worker.worker_id,
+        payload: { name: worker.name, runtime: worker.runtime, mode: worker.mode },
+      });
+      this.send(socket, 'worker.registered', { worker }, message.id);
+      return;
+    }
+    if (message.type === 'worker.status') {
+      if (payload.work_state !== undefined && !WORK_STATES.has(payload.work_state)) {
+        throw new Error('Invalid worker work_state');
+      }
+      const worker = this.store.updateWorkerStatus(connectorId, payload.worker_id, payload);
+      if (!worker) throw new Error('Worker not found for this connector');
+      this.emit('worker.status', { type: 'worker', id: worker.worker_id }, {
+        connector_id: connectorId,
+        worker_id: worker.worker_id,
+        task_id: worker.current_task_id,
+        payload: { work_state: worker.work_state },
+      });
+      return;
+    }
+    if (message.type === 'command.ack') {
+      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const command = this.store.acceptCommand(payload.command_id, connectorId);
+      this.emit('command.accepted', { type: 'connector', id: connectorId }, {
+        connector_id: connectorId,
+        worker_id: command.worker_id,
+        task_id: command.task_id,
+        command_id: command.command_id,
+      });
+      this.broadcast('command.updated', { command });
+      return;
+    }
+    if (message.type === 'command.started') {
+      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const command = this.store.startCommand(payload.command_id, connectorId);
+      const worker = this.store.updateWorkerStatus(connectorId, command.worker_id, {
+        work_state: 'working',
+        ...(command.task_id ? { current_task_id: command.task_id } : {}),
+      });
+      if (command.task_id) {
+        const task = this.store.getTask(command.task_id);
+        if (task && !['done', 'cancelled'].includes(task.status)) this.store.updateTask(task.task_id, { status: 'in_progress' });
+      }
+      this.emit('command.started', { type: 'worker', id: command.worker_id }, {
+        connector_id: connectorId,
+        worker_id: command.worker_id,
+        task_id: command.task_id,
+        command_id: command.command_id,
+      });
+      this.broadcast('command.updated', { command });
+      this.broadcast('worker.updated', { worker });
+      return;
+    }
+    if (message.type === 'command.output') {
+      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const command = this.store.appendCommandOutput(payload.command_id, connectorId, payload.chunk);
+      this.broadcast('command.output', {
+        command_id: command.command_id,
+        chunk: String(payload.chunk ?? ''),
+        output_truncated: command.output_truncated,
+      });
+      return;
+    }
+    if (message.type === 'command.finished') {
+      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      if (!['succeeded', 'failed'].includes(payload.status)) throw new Error('Invalid final command status');
+      const command = this.store.finishCommand(payload.command_id, connectorId, {
+        status: payload.status,
+        result: payload.result,
+        error: payload.error,
+        outcomeUnknown: Boolean(payload.outcome_unknown),
+      });
+      const worker = this.store.updateWorkerStatus(connectorId, command.worker_id, { work_state: 'idle' });
+      this.emit(`command.${payload.status}`, { type: 'worker', id: command.worker_id }, {
+        connector_id: connectorId,
+        worker_id: command.worker_id,
+        task_id: command.task_id,
+        command_id: command.command_id,
+        payload: { error: command.error, outcome_unknown: command.outcome_unknown },
+      });
+      this.broadcast('command.updated', { command });
+      this.broadcast('worker.updated', { worker });
+      return;
+    }
+    if (message.type === 'command.sync') {
+      const command = this.authorizedCommand(payload.command_id, connectorId);
+      if (!command) return;
+      let updated = command;
+      if (payload.status === 'accepted') updated = this.store.acceptCommand(command.command_id, connectorId);
+      if (payload.status === 'running') updated = this.store.startCommand(command.command_id, connectorId);
+      if (['succeeded', 'failed'].includes(payload.status)) {
+        updated = this.store.finishCommand(command.command_id, connectorId, {
+          status: payload.status,
+          result: payload.result,
+          error: payload.error,
+          outcomeUnknown: Boolean(payload.outcome_unknown),
+        });
+      }
+      this.broadcast('command.updated', { command: updated });
+      return;
+    }
+    throw new Error(`Unsupported connector message: ${message.type}`);
+  }
+
+  dispatch(command) {
+    const worker = this.store.getWorker(command.worker_id);
+    const socket = worker && this.connectors.get(worker.connector_id);
+    if (!socket) return false;
+    const task = command.task_id ? this.store.getTask(command.task_id) : null;
+    return this.send(socket, 'command.dispatch', { command: { ...command, task } });
+  }
+
+  replay(connectorId) {
+    for (const command of this.store.listQueuedCommands(connectorId)) this.dispatch(command);
+  }
+}

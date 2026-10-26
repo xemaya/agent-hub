@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Hub · 数字员工调度台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <section id="auth-view" class="auth-shell">
+    <div class="auth-manifest">
+      <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <p class="eyebrow">LOCAL CONTROL NODE / 01</p>
+      <h1>AGENT<br>HUB</h1>
+      <p class="auth-lede">把每一个 Agent Session 登记为独立数字员工。任务有去向，命令有回执，上下文有交接。</p>
+      <div class="manifest-lines" aria-hidden="true">
+        <span>REGISTER</span><span>DISPATCH</span><span>ACKNOWLEDGE</span>
+      </div>
+    </div>
+    <form id="auth-form" class="auth-form">
+      <p class="section-index">ACCESS / 本地中控</p>
+      <h2>接入调度台</h2>
+      <p>输入 Hub 首次启动时生成的 Admin Token。</p>
+      <label for="admin-token">Admin Token</label>
+      <input id="admin-token" name="token" type="password" autocomplete="current-password" required autofocus>
+      <button class="button button-primary" type="submit">建立连接</button>
+      <p id="auth-error" class="form-error" role="alert"></p>
+      <p class="security-note">凭证仅保存在当前浏览器标签页的 sessionStorage，不写入 URL。</p>
+    </form>
+  </section>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark small" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div><strong>AGENT HUB</strong><span>SESSION DISPATCH OFFICE</span></div>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection" class="connection offline"><i></i>未连接</span>
+        <button id="refresh" class="button button-ghost" type="button">刷新</button>
+        <button id="logout" class="button button-ghost" type="button">断开</button>
+      </div>
+    </header>
+
+    <nav class="dispatch-nav" aria-label="中控视图">
+      <button class="nav-item active" data-view="workers">数字员工 <b data-count="workers">0</b></button>
+      <button class="nav-item" data-view="tasks">任务黑板 <b data-count="tasks">0</b></button>
+      <button class="nav-item" data-view="commands">命令回执 <b data-count="commands">0</b></button>
+      <button class="nav-item" data-view="events">事件记录 <b data-count="events">0</b></button>
+      <button class="nav-item" data-view="connectors">机器节点 <b data-count="connectors">0</b></button>
+    </nav>
+
+    <div class="workspace">
+      <main id="main" class="main-content">
+        <section id="view-workers" class="view">
+          <div class="section-heading">
+            <div><p class="section-index">REGISTRY / 01</p><h2>数字员工</h2></div>
+            <p>一个 Session，一个 Worker。连接状态与工作状态分别呈现。</p>
+          </div>
+          <div id="workers-list" class="record-list"></div>
+        </section>
+
+        <section id="view-tasks" class="view" hidden>
+          <div class="section-heading">
+            <div><p class="section-index">BLACKBOARD / 02</p><h2>任务黑板</h2></div>
+            <p>目标、上下文、完成标准和唯一负责人。</p>
+          </div>
+          <div id="tasks-list" class="record-list"></div>
+        </section>
+
+        <section id="view-commands" class="view" hidden>
+          <div class="section-heading">
+            <div><p class="section-index">RECEIPTS / 03</p><h2>命令回执</h2></div>
+            <p>从持久化接收，到执行结束，每一步都有凭据。</p>
+          </div>
+          <div class="command-layout">
+            <div id="commands-list" class="command-list"></div>
+            <article id="command-detail" class="command-detail"><p class="empty-state">选择一条命令查看输出。</p></article>
+          </div>
+        </section>
+
+        <section id="view-events" class="view" hidden>
+          <div class="section-heading">
+            <div><p class="section-index">LEDGER / 04</p><h2>事件记录</h2></div>
+            <p>注册、派发、状态变化和完成事实。</p>
+          </div>
+          <div id="events-list" class="event-ledger"></div>
+        </section>
+
+        <section id="view-connectors" class="view" hidden>
+          <div class="section-heading">
+            <div><p class="section-index">NODES / 05</p><h2>机器节点</h2></div>
+            <p>每台机器一个 Connector，主动出站连接 Hub。</p>
+          </div>
+          <div id="connectors-list" class="record-list"></div>
+        </section>
+      </main>
+
+      <aside class="action-rail">
+        <div class="rail-heading"><span>ACTIONS</span><strong>调度操作</strong></div>
+        <details open>
+          <summary>创建任务 <span>＋</span></summary>
+          <form id="task-form" class="action-form">
+            <label>标题<input name="title" required maxlength="300" placeholder="例如：完成收藏接口 review"></label>
+            <label>目标<textarea name="goal" rows="3" placeholder="为什么做，做到什么"></textarea></label>
+            <label>上下文<textarea name="context" rows="3" placeholder="结论、commit、注意事项"></textarea></label>
+            <label>完成标准<textarea name="acceptance" rows="3" placeholder="每行一条"></textarea></label>
+            <label>负责人<select name="assignee" id="task-assignee"><option value="">暂不分配</option></select></label>
+            <button class="button button-primary" type="submit">写入任务黑板</button>
+          </form>
+        </details>
+        <details>
+          <summary>派发命令 <span>→</span></summary>
+          <form id="command-form" class="action-form">
+            <label>关联任务<select name="task" id="command-task"><option value="">不关联任务</option></select></label>
+            <label>目标 Worker<select name="worker" id="command-worker"><option value="">跟随任务负责人</option></select></label>
+            <label>命令类型<select name="kind"><option value="prompt">Prompt</option><option value="handoff">Handoff</option><option value="review_request">Review request</option><option value="status_request">Status request</option></select></label>
+            <label>指令<textarea name="input" rows="5" required placeholder="明确下一步和需要返回的结果"></textarea></label>
+            <button class="button button-accent" type="submit">立即推送</button>
+            <p class="form-note">在线 managed Worker 直接触发；离线命令持久化，external Worker 标记为人工待处理。</p>
+          </form>
+        </details>
+        <div class="rail-foot"><span>TRANSPORT</span><strong>WebSocket / Event Push</strong><small>没有收件箱轮询</small></div>
+      </aside>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

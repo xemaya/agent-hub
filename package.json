@@ -1,0 +1,24 @@
+{
+  "name": "agent-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight task and command coordination for independent agent sessions",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "packageManager": "pnpm@11.11.0",
+  "bin": {
+    "agent-hub": "./bin/agent-hub.js"
+  },
+  "scripts": {
+    "start": "node ./bin/agent-hub.js hub",
+    "hub": "node ./bin/agent-hub.js hub",
+    "connector": "node ./bin/agent-hub.js connector",
+    "check": "node --check bin/agent-hub.js && node --check src/hub.js && node --check src/connector.js && node --check src/drivers/codex.js && node --check scripts/install-local.js && node --check public/app.js",
+    "test": "node --test --test-reporter=spec test/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

@@ -429,7 +429,16 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 
 这属于“事件到达后创建/恢复 Codex 线程”，不是控制 Codex 桌面端或向已打开的 TUI 注入消息。
 
-### 10.4 Test Driver
+### 10.4 当前交互 Session 启动器
+
+- `agent-hub session start --runtime claude|kimi` 只建立当前原生身份并打开客户端，不注册 Worker、不创建任务。
+- Claude 生成 UUID，以 `claude --session-id <uuid>` 启动；Kimi 通过现有 Server API 创建原生 Session，关闭临时 Server 后以 `kimi --session <id>` 启动，避免 Web/CLI 对同一 Session 的排他占用。
+- 启动器向当前客户端进程注入 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`。`worker register-current` 校验这两个可信值及 Runtime 一致性，缺失时失败，不生成随机 ID、不选择最近会话。
+- 当前交互 Session 默认登记为 external，并保存 `interactive: true` 与 `session_origin`。只有用户明确选择且确认交互实例已退出或 Runtime 支持共享时才使用 managed。
+- Claude 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接，不能用简单 `--session` 替代。
+- `--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。
+
+### 10.5 Test Driver
 
 - 仅在显式测试开关下启用。
 - 用于可控地验证推送、串行、断线和重放，不代表真实 Agent 验证。
@@ -510,6 +519,12 @@ agent-hub worker register \
   --runtime codex --mode managed \
   --name codex-01 --cwd /path/to/project
 
+agent-hub session start --runtime kimi --cwd /path/to/project
+agent-hub session start --runtime claude --cwd /path/to/project
+
+agent-hub worker register-current \
+  --name current-session-role --cwd /path/to/project
+
 agent-hub task create \
   --title "完成接口 review" \
   --goal "确认实现满足任务标准" \
@@ -553,7 +568,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
-Skill 明确区分两种注册：普通“接入 Agent Hub”“注册本机 Agent”默认新建 managed Worker，不要求原生 Session ID，不走 external；Kimi 在注册时由 Connector 创建新 Session，Claude/Codex 在首条命令到达时创建或恢复 Session。只有用户明确要求登记“当前这个已有会话/窗口”时才使用 external，并要求真实原生 Session ID，命令为 `waiting_manual`；无法确认 ID 时不得随机生成或选择最近会话。managed Worker 可接收推送，但不代表发起注册的当前交互窗口。Worker 的能力标签与 `metadata.description` 必须如实填写。
+Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude` 打开的当前 Session 带有可信 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，用户说明职责后通过 `worker register-current` 注册本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接。Claude 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。未通过启动器的旧窗口仍需真实原生 Session ID，不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
 用户可以直接说“添加任务”或“添加并执行”。Agent 从自然语言整理任务字段，按本机 Worker 的自描述与状态选择负责人；只说添加时默认不执行，明确要求执行后才使用 `send --local --wait`。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页表单只是可选的手动后备。这里的 Worker 选择由调用 Skill 的 Agent 完成，不等于 Hub 已有独立智能调度模型，也不允许跨 Connector 任意操作。
 
@@ -625,7 +640,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：21 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限和 CLI 布尔参数。
+- `pnpm test`：25 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数和当前 Session 启动器。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -635,4 +650,5 @@ MVP 完成必须满足：
 - 本机三 Runtime 真实闭环：2026-10-26 使用独立 Hub/Connector 数据目录和随机回环端口，通过真实 Local REST、Admin REST、Connector WebSocket 与 Dashboard WebSocket 注册并触发 Claude、Kimi、Codex 三个 managed Worker。三者分别返回 `AGENT_HUB_CLAUDE_OK`、`AGENT_HUB_KIMI_OK`、`AGENT_HUB_CODEX_OK`；同 Worker 第二次命令分别返回对应的 `_RESUME_OK` 标记，原生 Session ID 均保持不变。六个 Command 全部 `succeeded`，三个 Task 均标记为 `done`，Dashboard 收到全部六个成功事件；重新打开 Hub 数据库后任务和命令结果仍可读取。Codex 使用本机已登录的 `codex-cli 0.164.0`、全新线程和只读沙箱，其稳定注册 ID 与原生线程 ID 按第 10.3 节分别保存。报告位于 `.runtime/local-triad-smoke/result.json`，不含访问令牌；测试后隔离服务已关闭。
 - Agent Skill 与首批注册：2026-10-26 新增 `skills/agent-hub/SKILL.md` 和安全本机安装器，安装器测试覆盖软链接、真实目录、幂等和冲突不覆盖。实际安装到 Kimi/Codex 共享的 `~/.agents/skills` 与 Claude 的 `~/.claude/skills`，当前 Kimi 会话已识别并加载 Skill；`agent-hub` CLI 可从项目外目录使用。通过真实 CLI 在常驻 Connector 注册 `claude-agent-hub-01`、`kimi-agent-hub-01`、`codex-agent-hub-01` 三个新 managed Worker，均在线、空闲且 `push_capable=true`，能力标签和自描述已保存；本次仅注册，未额外调用模型。网页与 Connector 健康检查通过，未修改现有 hooks 或接管交互 Session。
 - Agent 自然语言任务流：新增 Local Token 任务创建、命令派发与事件等待、验收后状态更新；Hub 对 Worker 和 Task 的 Connector 归属做服务端校验。自动化测试覆盖完整任务、超时后继续执行、external 立即返回人工状态、跨 Connector 拒绝、完成时间戳和 CLI 布尔参数。2026-10-26 通过当前 Kimi 按新版 Skill 流程选择 `claude-agent-hub-01`，不使用 Admin Token 或网页表单创建并执行任务，真实回执为 `AGENT_HUB_TASK_OK`，验收后任务更新为 `done`，Worker 恢复空闲。已打开的 Skill 调用如果缓存旧版，需要刷新或重新打开 Session。
+- 当前交互 Session 接入：新增 `session start` 与 `worker register-current`，通过可信环境绑定当前原生 ID，未修改已有 hooks 或接管旧 Session。真实 smoke 使用隔离 Hub/Connector 和全新 Session：Claude 的启动器 ID、注册 ID 与 Hub 恢复 ID 完全一致，交互进程退出后显式选择 managed，返回 `AGENT_HUB_CURRENT_CLAUDE_OK`，任务验收后为 `done`。Kimi 首次暴露出 Web/CLI 对同一 Session 的排他占用，启动器已修正为在打开 CLI 前关闭临时 Server，随后原生启动和 ID 核对通过；当前 Session 默认 external，真实回执为 `waiting_manual`，未宣称支持当前 TUI 主动推送。共享 Web/ACP 桥接和交互并发控制仍未实现。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

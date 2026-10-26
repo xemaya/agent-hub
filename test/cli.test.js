@@ -46,3 +46,58 @@ test('local and wait flags work with task and send commands', async (t) => {
     wait: true,
   });
 });
+
+test('register-current uses launcher identity and rejects unverified sessions', async (t) => {
+  await mkdir(TEST_ROOT, { recursive: true });
+  const dataDir = await mkdtemp(path.join(TEST_ROOT, 'cli-current-'));
+  await writeFile(path.join(dataDir, 'connector.json'), JSON.stringify({ localToken: 'test-local' }), { mode: 0o600 });
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const originalRuntime = process.env.AGENT_HUB_RUNTIME;
+  const originalSessionId = process.env.AGENT_HUB_SESSION_ID;
+  const calls = [];
+  console.log = () => {};
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify({ worker: { worker_id: 'worker-current' } }), {
+      status: 201,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    if (originalRuntime === undefined) delete process.env.AGENT_HUB_RUNTIME;
+    else process.env.AGENT_HUB_RUNTIME = originalRuntime;
+    if (originalSessionId === undefined) delete process.env.AGENT_HUB_SESSION_ID;
+    else process.env.AGENT_HUB_SESSION_ID = originalSessionId;
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  process.env.AGENT_HUB_RUNTIME = 'kimi';
+  process.env.AGENT_HUB_SESSION_ID = 'session-current-test';
+  await run([
+    'worker', 'register-current',
+    '--name', 'current-kimi',
+    '--cwd', '/tmp/project',
+    '--capabilities', 'coding,review',
+    '--metadata', '{"description":"当前职责"}',
+    '--data-dir', dataDir,
+  ]);
+  assert.equal(calls.length, 1);
+  const registration = JSON.parse(calls[0].options.body);
+  assert.equal(registration.runtime, 'kimi');
+  assert.equal(registration.mode, 'external');
+  assert.equal(registration.runtime_session_id, 'session-current-test');
+  assert.equal(registration.metadata.description, '当前职责');
+  assert.equal(registration.metadata.interactive, true);
+  assert.equal(registration.metadata.session_origin, 'agent-hub-session-launcher');
+
+  delete process.env.AGENT_HUB_RUNTIME;
+  delete process.env.AGENT_HUB_SESSION_ID;
+  await assert.rejects(
+    run(['worker', 'register-current', '--data-dir', dataDir]),
+    /start with agent-hub session start/,
+  );
+  assert.equal(calls.length, 1);
+});

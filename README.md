@@ -90,9 +90,35 @@ node scripts/install-local.js --connector-data-dir "$HOME/.agent-hub/connector"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### 5. 注册 managed Worker
+### 5. 注册 Worker
 
-普通“接入 Agent Hub”“注册本机 Agent”默认就是新建 managed Worker：**不需要提供当前原生 Session ID，不要改用 external，也不要传 `--session-id`**。Kimi 会在注册时由 Connector 创建新的原生 Session；Claude/Codex 在首条命令到达时创建或恢复 Session。只有明确要求登记“当前这个已有会话/窗口”时，才需要 external 和真实原生 Session ID。
+#### 方式 A：先开当前 Session，再注册本人
+
+如果希望“先开一个 Kimi/Claude Session，告诉它职责，再让它注册”，使用启动器打开客户端：
+
+```bash
+agent-hub session start --runtime kimi --cwd /path/to/project
+# Claude Code 使用：
+agent-hub session start --runtime claude --cwd /path/to/project
+```
+
+启动器只绑定真实原生 Session ID，不提前注册或创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；Runtime 原生参数可以放在 `--` 后。
+
+在打开的窗口里说明职责，然后调用 Skill：
+
+```text
+/skill:agent-hub 把当前 Session 注册到 Agent Hub，职责是……
+```
+
+Claude 使用 `/agent-hub`。Agent 会执行 `worker register-current`，从启动器环境取得真实 ID，你不需要再提供 `--session-id`。重复注册同一个原生 ID 会复用 Worker。
+
+当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`：Claude 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt；Kimi CLI 与 Web Server 对同一 Session 有排他占用，不能用第二个 Web Server 接管当前 CLI 窗口，当前交互主动推送需要后续的共享 Web/ACP 桥接。
+
+未通过启动器打开的旧窗口仍需真实原生 Session ID 才能 external，不能猜测或选择最近会话。
+
+#### 方式 B：另建独立 managed Worker
+
+如果只是需要一个独立、可调度的数字员工，而不是当前窗口本人，可以直接新建 managed Worker：**不需要提供原生 Session ID，不要传 `--session-id`**。Kimi 会在注册时由 Connector 创建新的原生 Session；Claude/Codex 在首条命令到达时创建或恢复 Session。
 
 在目标项目目录执行，或把 `--cwd` 改成实际工作目录。名称、能力和自描述应反映真实情况。
 
@@ -228,6 +254,7 @@ pnpm check
 
 - 不接管任意已打开的 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。
 - external Worker 只提供人工协作登记，命令为 `waiting_manual`。
+- 当前交互 Session 默认 external；主动执行不是向 TUI 模拟输入。Kimi CLI 与 Web Server 对同一 Session 有排他占用，当前 Kimi 交互主动推送需要共享 Web/ACP 桥接，尚未实现。
 - Hub 不包含独立的智能调度模型、自动拆任务、自由群聊或 Worker 自主跨机互派；调用 Skill 的 Agent 可以为当前任务选择本机 Worker。
 - Hub 的 HTTP 传输位于 Tailscale 加密私网内，但仍必须使用 Admin/Connector/Local Token，并建议通过 Headscale Grants 限制可访问节点和端口。
 - 不启用 Funnel，不默认放开模型工具权限，不把 Runtime 数据目录或凭证作为网页静态资源公开。

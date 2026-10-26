@@ -23,17 +23,46 @@ curl --fail --silent http://127.0.0.1:8788/local/v1/health
 
 不要打印、复制或提交 Local Token、Admin Token、Enrollment Token。Worker 操作不需要 Admin Token。
 
+## 当前交互 Session：通过启动器注册（推荐）
+
+当用户想“先开一个 Kimi/Claude Session，告诉它职责，再让它注册到 Agent Hub”时，使用启动器打开当前窗口：
+
+```bash
+agent-hub session start --runtime kimi --cwd /path/to/project
+# Claude Code 使用：
+agent-hub session start --runtime claude --cwd /path/to/project
+```
+
+启动器只绑定当前原生 Session 并打开客户端，不注册 Worker、不创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；需要传递 Runtime 原生参数时放在 `--` 后。
+
+在当前窗口中，用户说明职责后，使用可信启动器身份注册当前 Session：
+
+```bash
+agent-hub worker register-current \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --name "<体现职责的-worker-名称>" \
+  --cwd "$PWD" \
+  --capabilities "coding,review,analysis" \
+  --metadata '{"description":"<用户刚定义的职责与工作范围>"}'
+```
+
+`register-current` 从 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID` 读取启动器提供的身份，不需要用户填写 `--session-id`。当前交互窗口默认登记为 external，不伪装成可主动推送。不要手动编造或设置这些变量，不要另建 Worker 冒充当前窗口。
+
+只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。Kimi CLI 与 Kimi Web Server 对同一 Session 有排他占用：当前 CLI 窗口打开时不要注册为 managed，也不要启动第二个 Web Server 接管它。Kimi 当前交互 Session 的主动推送需要共享 Web/ACP 桥接，不能用简单的 `--session` 代替。Claude 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
+
+如果当前窗口不是通过启动器打开的，或者缺少上述可信环境变量，不要假装它是启动器 Session；按下面的 external 边界处理，或建议用户下次通过启动器打开。
+
 ## 默认选择：普通接入新建 managed
 
 当用户说“接入 Agent Hub”“注册本机 Agent”“创建一个 Worker”，而没有明确要求登记“当前这个已有会话/窗口”时，一律创建 managed Worker，不走 external，不要求用户提供原生 Session ID，也不传 `--session-id`。Kimi 由 Connector 在注册时创建新的原生 Session；Claude/Codex 在首条命令到达时创建或恢复 Session。此时用户要的是新 Worker，不得以“不能冒充当前会话”为由拒绝或改用 external。
 
-只有用户明确要求“登记当前这个已有会话/窗口”时，才使用 external 并要求真实原生 Session ID。
+如果没有使用启动器，而用户明确要求登记“当前这个已有会话/窗口”，才使用 external 并要求真实原生 Session ID。
 
 ## 先区分两种身份
 
-### 登记当前交互 Session：external
+### 未通过启动器的当前交互 Session：external
 
-适用于用户明确要求“把当前会话注册上来”。必须使用当前会话的真实原生 Session ID：
+适用于用户明确要求“把当前会话注册上来”，但当前窗口没有启动器提供的可信身份。必须使用当前会话的真实原生 Session ID：
 
 ```bash
 agent-hub worker register \

@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hub } from './hub.js';
 import { Connector } from './connector.js';
+import { startSession } from './session-launcher.js';
 
 const HELP = `Agent Hub
 
@@ -9,9 +10,12 @@ Usage:
   agent-hub hub [--host 127.0.0.1] [--port 8787] [--data-dir .runtime/hub]
   agent-hub connector --hub-url URL [--name NAME] [--data-dir .runtime/connector]
                       [--enroll-token TOKEN] [--local-port 8788] [--allow-test-driver]
+  agent-hub session start --runtime claude|kimi [--cwd DIR] [-- RUNTIME_ARGS...]
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
                             [--capabilities a,b] [--metadata JSON]
+  agent-hub worker register-current [--name NAME] [--cwd DIR] [--mode managed|external]
+                                    [--capabilities a,b] [--metadata JSON]
   agent-hub worker list
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
@@ -36,8 +40,13 @@ const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver']);
 function parseArgs(argv) {
   const positionals = [];
   const flags = {};
+  const passthrough = [];
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
+    if (item === '--') {
+      passthrough.push(...argv.slice(index + 1));
+      break;
+    }
     if (!item.startsWith('--')) {
       positionals.push(item);
       continue;
@@ -61,7 +70,7 @@ function parseArgs(argv) {
       index += 1;
     }
   }
-  return { positionals, flags };
+  return { positionals, flags, passthrough };
 }
 
 function port(value, fallback) {
@@ -187,15 +196,34 @@ async function startConnector(flags) {
 
 async function workerCommand(positionals, flags) {
   const action = positionals[0];
-  if (action === 'register') {
+  if (['register', 'register-current'].includes(action)) {
     const metadata = flags.metadata ? JSON.parse(flags.metadata) : {};
+    let runtime = flags.runtime;
+    let sessionId = flags['session-id'];
+    if (action === 'register-current') {
+      const currentRuntime = process.env.AGENT_HUB_RUNTIME;
+      const currentSessionId = process.env.AGENT_HUB_SESSION_ID;
+      if (!currentRuntime || !currentSessionId || !['claude', 'kimi'].includes(currentRuntime)) {
+        throw new Error('Current Session identity is unavailable; start with agent-hub session start');
+      }
+      if (sessionId) throw new Error('register-current uses the launcher identity; do not pass --session-id');
+      if (runtime && runtime !== currentRuntime) {
+        throw new Error(`Current Session runtime is ${currentRuntime}, not ${runtime}`);
+      }
+      runtime = currentRuntime;
+      sessionId = currentSessionId;
+      Object.assign(metadata, {
+        interactive: true,
+        session_origin: 'agent-hub-session-launcher',
+      });
+    }
     print(await localRequest(flags, '/local/v1/workers/register', {
       method: 'POST',
       body: {
         name: flags.name,
-        runtime: flags.runtime,
-        mode: flags.mode ?? 'managed',
-        runtime_session_id: flags['session-id'],
+        runtime,
+        mode: flags.mode ?? (action === 'register-current' ? 'external' : 'managed'),
+        runtime_session_id: sessionId,
         capabilities: flags.capabilities ? flags.capabilities.split(',').map((item) => item.trim()).filter(Boolean) : [],
         cwd: flags.cwd ?? process.cwd(),
         metadata,
@@ -214,7 +242,20 @@ async function workerCommand(positionals, flags) {
     }));
     return;
   }
-  throw new Error('Usage: agent-hub worker register|list|status');
+  throw new Error('Usage: agent-hub worker register|register-current|list|status');
+}
+
+async function sessionCommand(positionals, flags, runtimeArgs) {
+  if (positionals[0] !== 'start') throw new Error('Usage: agent-hub session start --runtime claude|kimi');
+  const result = await startSession({
+    runtime: flags.runtime,
+    cwd: flags.cwd ?? process.cwd(),
+    runtimeArgs,
+    onReady({ runtime, sessionId }) {
+      console.error(`Agent Hub session ready: ${runtime} ${sessionId}`);
+    },
+  });
+  process.exitCode = result.exitCode;
 }
 
 async function taskCommand(positionals, flags) {
@@ -249,7 +290,7 @@ async function taskCommand(positionals, flags) {
 }
 
 export async function run(argv) {
-  const { positionals, flags } = parseArgs(argv);
+  const { positionals, flags, passthrough } = parseArgs(argv);
   const command = positionals[0];
   if (!command || flags.help || command === 'help') {
     console.log(HELP);
@@ -261,6 +302,10 @@ export async function run(argv) {
   }
   if (command === 'connector') {
     await startConnector(flags);
+    return;
+  }
+  if (command === 'session') {
+    await sessionCommand(positionals.slice(1), flags, passthrough);
     return;
   }
   if (command === 'worker') {

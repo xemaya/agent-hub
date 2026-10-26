@@ -553,7 +553,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
-Skill 明确区分两种注册：新建 managed Worker 可接收推送，但不代表发起注册的当前交互窗口；登记当前交互 Session 使用 external，必须提供真实原生 Session ID，命令为 `waiting_manual`。无法确认 ID 时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
+Skill 明确区分两种注册：普通“接入 Agent Hub”“注册本机 Agent”默认新建 managed Worker，不要求原生 Session ID，不走 external；Kimi 在注册时由 Connector 创建新 Session，Claude/Codex 在首条命令到达时创建或恢复 Session。只有用户明确要求登记“当前这个已有会话/窗口”时才使用 external，并要求真实原生 Session ID，命令为 `waiting_manual`；无法确认 ID 时不得随机生成或选择最近会话。managed Worker 可接收推送，但不代表发起注册的当前交互窗口。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
 用户可以直接说“添加任务”或“添加并执行”。Agent 从自然语言整理任务字段，按本机 Worker 的自描述与状态选择负责人；只说添加时默认不执行，明确要求执行后才使用 `send --local --wait`。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页表单只是可选的手动后备。这里的 Worker 选择由调用 Skill 的 Agent 完成，不等于 Hub 已有独立智能调度模型，也不允许跨 Connector 任意操作。
 

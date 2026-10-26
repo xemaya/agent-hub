@@ -23,6 +23,12 @@ curl --fail --silent http://127.0.0.1:8788/local/v1/health
 
 不要打印、复制或提交 Local Token、Admin Token、Enrollment Token。Worker 操作不需要 Admin Token。
 
+## 默认选择：普通接入新建 managed
+
+当用户说“接入 Agent Hub”“注册本机 Agent”“创建一个 Worker”，而没有明确要求登记“当前这个已有会话/窗口”时，一律创建 managed Worker，不走 external，不要求用户提供原生 Session ID，也不传 `--session-id`。Kimi 由 Connector 在注册时创建新的原生 Session；Claude/Codex 在首条命令到达时创建或恢复 Session。此时用户要的是新 Worker，不得以“不能冒充当前会话”为由拒绝或改用 external。
+
+只有用户明确要求“登记当前这个已有会话/窗口”时，才使用 external 并要求真实原生 Session ID。
+
 ## 先区分两种身份
 
 ### 登记当前交互 Session：external
@@ -49,7 +55,7 @@ external Worker 的 `push_capable=false`，命令为 `waiting_manual`。不要�
 
 ### 创建独立可调度 Worker：managed
 
-适用于用户要求“注册一个可由中控派发的 Worker”。不指定 `--session-id`，由 Driver 准备新的独立 Worker；第一条命令到达时才创建真实 Runtime Session：
+适用于用户要求“注册一个可由中控派发的 Worker”。不指定 `--session-id`，由 Driver 准备新的独立 Worker：Kimi 在注册时由 Connector 创建新的原生 Session；Claude/Codex 在第一条命令到达时创建或恢复 Session。无需用户提供当前原生 Session ID：
 
 ```bash
 agent-hub worker register \

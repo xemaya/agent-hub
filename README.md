@@ -92,6 +92,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### 5. 注册 managed Worker
 
+普通“接入 Agent Hub”“注册本机 Agent”默认就是新建 managed Worker：**不需要提供当前原生 Session ID，不要改用 external，也不要传 `--session-id`**。Kimi 会在注册时由 Connector 创建新的原生 Session；Claude/Codex 在首条命令到达时创建或恢复 Session。只有明确要求登记“当前这个已有会话/窗口”时，才需要 external 和真实原生 Session ID。
+
 在目标项目目录执行，或把 `--cwd` 改成实际工作目录。名称、能力和自描述应反映真实情况。
 
 Claude：

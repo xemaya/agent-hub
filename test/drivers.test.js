@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { createServer } from 'node:http';
+import { waitFor } from './helpers.js';
 import { WebSocketServer } from 'ws';
 import { ClaudeDriver } from '../src/drivers/claude.js';
 import { CodexDriver } from '../src/drivers/codex.js';
@@ -161,7 +162,10 @@ test('CodexDriver rejects unsafe sandboxes and propagates execution errors', asy
 
 test('KimiDriver subscribes, submits a prompt and consumes turn events', async (t) => {
   const promptBodies = [];
+  const reloadCalls = [];
+  const pongNonces = [];
   const sockets = new Set();
+  let completionType = 'turn.ended';
   const server = createServer(async (request, response) => {
     if (request.headers.authorization !== 'Bearer kimi-test') {
       response.writeHead(401, { 'content-type': 'application/json' });
@@ -176,13 +180,20 @@ test('KimiDriver subscribes, submits a prompt and consumes turn events', async (
       response.end(JSON.stringify({ code: 0, msg: 'success', data: { id: 'session_kimi' } }));
       return;
     }
+    if (request.method === 'POST' && request.url.endsWith(':reload')) {
+      const sessionId = request.url.split('/').pop().replace(':reload', '');
+      reloadCalls.push(sessionId);
+      response.end(JSON.stringify({ code: 0, msg: 'success', data: { id: sessionId } }));
+      return;
+    }
     if (request.method === 'POST' && request.url === '/api/v1/sessions/session_kimi/prompts') {
       promptBodies.push(body);
       response.end(JSON.stringify({ code: 0, msg: 'success', data: { prompt_id: body.prompt_id } }));
       setImmediate(() => {
         for (const socket of sockets) {
-          socket.send(JSON.stringify({ type: 'assistant.delta', session_id: 'session_kimi', offset: 0, payload: { delta: 'OK' } }));
-          socket.send(JSON.stringify({ type: 'turn.ended', session_id: 'session_kimi', payload: { status: 'completed' } }));
+          socket.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString(), payload: { nonce: 'heartbeat-1' } }));
+          socket.send(JSON.stringify({ type: 'session_event', session_id: 'session_kimi', payload: { type: 'assistant.delta', delta: 'OK' } }));
+          socket.send(JSON.stringify({ type: 'session_event', session_id: 'session_kimi', payload: { type: completionType, reason: 'completed', promptId: body.prompt_id } }));
         }
       });
       return;
@@ -200,8 +211,16 @@ test('KimiDriver subscribes, submits a prompt and consumes turn events', async (
     socket.on('message', (raw) => {
       const frame = JSON.parse(raw.toString());
       if (frame.type === 'subscribe') {
-        socket.send(JSON.stringify({ type: 'ack', id: frame.id, code: 0, msg: 'success', payload: {} }));
+        const missing = frame.payload.session_ids.includes('missing');
+        socket.send(JSON.stringify({
+          type: 'ack',
+          id: frame.id,
+          code: 0,
+          msg: 'success',
+          payload: { accepted: missing ? [] : ['session_kimi'], not_found: missing ? ['missing'] : [] },
+        }));
       }
+      if (frame.type === 'pong') pongNonces.push(frame.payload.nonce);
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -216,13 +235,14 @@ test('KimiDriver subscribes, submits a prompt and consumes turn events', async (
   });
   const prepared = await driver.prepareWorker({ cwd: process.cwd() });
   assert.equal(prepared.runtime_session_id, 'session_kimi');
+  const worker = {
+    runtime_session_id: prepared.runtime_session_id,
+    driver_state: {},
+    metadata: { kimi_permission_mode: 'manual', kimi_model: 'kimi-code/test-model' },
+  };
   let output = '';
   const result = await driver.execute({
-    worker: {
-      runtime_session_id: prepared.runtime_session_id,
-      driver_state: {},
-      metadata: { kimi_permission_mode: 'manual', kimi_model: 'kimi-code/test-model' },
-    },
+    worker,
     command: {
       command_id: 'cmd-kimi',
       kind: 'prompt',
@@ -240,5 +260,27 @@ test('KimiDriver subscribes, submits a prompt and consumes turn events', async (
   assert.equal(promptBodies[0].permission_mode, 'manual');
   assert.equal(promptBodies[0].model, 'kimi-code/test-model');
   assert.match(promptBodies[0].content[0].text, /Kimi task/);
+  completionType = 'prompt.completed';
+  const completed = await driver.execute({
+    worker,
+    command: { command_id: 'cmd-kimi-2', kind: 'prompt', input: 'continue' },
+    onOutput() {},
+    onState() {},
+  });
+  assert.equal(completed.text, 'OK');
+  assert.equal(completed.prompt_id, 'cmd-kimi-2');
+  await assert.rejects(
+    driver.execute({
+      worker: { ...worker, runtime_session_id: 'missing' },
+      command: { command_id: 'cmd-kimi-missing', kind: 'prompt', input: 'missing' },
+      onOutput() {},
+      onState() {},
+    }),
+    /could not be subscribed/,
+  );
+  assert.deepEqual(reloadCalls, ['session_kimi', 'session_kimi', 'missing']);
+  assert.equal(promptBodies.length, 2);
+  await waitFor(() => pongNonces.length === 2);
+  assert.deepEqual(pongNonces, ['heartbeat-1', 'heartbeat-1']);
   await driver.close();
 });

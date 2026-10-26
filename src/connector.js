@@ -463,14 +463,23 @@ export class Connector {
       return;
     }
     this.requireLocalAuth(request);
+    if (request.method === 'GET' && url.pathname === '/local/v1/orchestrations') {
+      await this.whenReady();
+      const { orchestrations } = await this.request('orchestration.list');
+      sendJson(response, 200, { orchestrations });
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/local/v1/tasks') {
       await this.whenReady();
       const body = await readJsonBody(request);
       if (body.assignee_worker_id && !this.store.getWorker(body.assignee_worker_id)) {
         throw localError('Assignee worker does not belong to this Connector', 403);
       }
-      const { task } = await this.request('task.create', body);
-      sendJson(response, 201, { task });
+      const { task, orchestration } = await this.request('task.create', body);
+      sendJson(response, body.orchestrate === true ? 202 : 201, {
+        task,
+        ...(orchestration ? { orchestration } : {}),
+      });
       return;
     }
     const taskMatch = /^\/local\/v1\/tasks\/([^/]+)$/.exec(url.pathname);

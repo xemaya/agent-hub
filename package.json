@@ -15,7 +15,7 @@
     "start": "node ./bin/agent-hub.js hub",
     "hub": "node ./bin/agent-hub.js hub",
     "connector": "node ./bin/agent-hub.js connector",
-    "check": "node --check bin/agent-hub.js && node --check src/cli.js && node --check src/session-launcher.js && node --check src/hub.js && node --check src/connector.js && node --check src/drivers/codex.js && node --check scripts/install-local.js && node --check public/app.js",
+    "check": "node --check bin/agent-hub.js && node --check src/cli.js && node --check src/session-launcher.js && node --check src/coordinator.js && node --check src/hub.js && node --check src/connector.js && node --check src/drivers/kimi.js && node --check src/drivers/codex.js && node --check scripts/install-local.js && node --check public/app.js",
     "test": "node --test --test-reporter=spec test/*.test.js"
   },
   "dependencies": {

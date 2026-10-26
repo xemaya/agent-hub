@@ -24,6 +24,16 @@ function errorMessage(payload, fallback) {
   return fallback;
 }
 
+function normalizeFrame(frame) {
+  if (frame?.type !== 'session_event' || !frame.payload || typeof frame.payload !== 'object') return frame;
+  const event = frame.payload;
+  return {
+    ...event,
+    session_id: frame.session_id ?? event.session_id,
+    payload: event.payload ?? event,
+  };
+}
+
 export class KimiDriver {
   constructor(options = {}) {
     this.executable = options.executable ?? 'kimi';
@@ -33,6 +43,7 @@ export class KimiDriver {
     this.WebSocket = options.WebSocket ?? globalThis.WebSocket;
     this.startupTimeoutMs = options.startupTimeoutMs ?? 15000;
     this.model = options.model ?? this.env.AGENT_HUB_KIMI_MODEL ?? null;
+    this.debug = options.debug ?? this.env.AGENT_HUB_KIMI_DEBUG === '1';
     this.server = options.server
       ? { baseUrl: options.server.baseUrl.replace(/\/$/, ''), token: options.server.token, owned: false }
       : null;
@@ -146,6 +157,10 @@ export class KimiDriver {
   async execute({ worker, command, onOutput, onState }) {
     const server = await this.ensureServer();
     const sessionId = worker.runtime_session_id;
+    await this.api(`/api/v1/sessions/${encodeURIComponent(sessionId)}:reload`, {
+      method: 'POST',
+      body: {},
+    });
     const url = new URL(`${server.baseUrl}/api/v1/ws`);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new this.WebSocket(url, [`kimi-code.bearer.${server.token}`]);
@@ -202,14 +217,31 @@ export class KimiDriver {
     socket.addEventListener('message', (event) => {
       let frame;
       try {
-        frame = JSON.parse(String(event.data));
+        const rawFrame = JSON.parse(String(event.data));
+        if (this.debug) {
+          const eventType = rawFrame.type === 'session_event' ? rawFrame.payload?.type : rawFrame.type;
+          onOutput(`[kimi event] ${eventType ?? 'unknown'}\n`);
+          if (rawFrame.type === 'ack') onOutput(`[kimi ack] ${JSON.stringify(rawFrame.payload)}\n`);
+        }
+        frame = normalizeFrame(rawFrame);
       } catch {
         return;
       }
       if (frame.session_id && frame.session_id !== sessionId) return;
+      if (frame.type === 'ping') {
+        const nonce = frame.payload?.nonce;
+        if (typeof nonce === 'string' && socket.readyState === this.WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'pong', payload: { nonce } }));
+        }
+        return;
+      }
       if (frame.type === 'ack' && frame.id === subscriptionId) {
-        if (frame.code === 0) resolveSubscribed(frame.payload);
-        else rejectSubscribed(new Error(frame.msg ?? 'Kimi subscription failed'));
+        const accepted = frame.payload?.accepted ?? [];
+        const notFound = frame.payload?.not_found ?? [];
+        if (frame.code !== 0) rejectSubscribed(new Error(frame.msg ?? 'Kimi subscription failed'));
+        else if (notFound.includes(sessionId) || (accepted.length > 0 && !accepted.includes(sessionId))) {
+          rejectSubscribed(new Error(`Kimi session could not be subscribed: ${sessionId}`));
+        } else resolveSubscribed(frame.payload);
         return;
       }
       if (frame.type === 'assistant.delta') {
@@ -234,9 +266,18 @@ export class KimiDriver {
         return;
       }
       if (frame.type === 'turn.ended') {
-        const status = String(frame.payload?.status ?? frame.payload?.outcome ?? '').toLowerCase();
-        if (frame.payload?.error || ['failed', 'error', 'cancelled', 'canceled', 'interrupted', 'aborted'].includes(status)) {
+        const status = String(frame.reason ?? frame.payload?.status ?? frame.payload?.outcome ?? '').toLowerCase();
+        if (frame.payload?.error || ['failed', 'error', 'cancelled', 'canceled', 'interrupted', 'aborted', 'blocked'].includes(status)) {
           fail(new Error(errorMessage(frame.payload, `Kimi turn ended with status ${status || 'failed'}`)));
+        } else {
+          succeed();
+        }
+        return;
+      }
+      if (frame.type === 'prompt.completed' || frame.type === 'prompt.aborted') {
+        const status = String(frame.reason ?? '').toLowerCase();
+        if (frame.type === 'prompt.aborted' || ['failed', 'blocked', 'cancelled', 'canceled', 'interrupted', 'aborted'].includes(status)) {
+          fail(new Error(errorMessage(frame.payload, `Kimi prompt ended with status ${status || 'aborted'}`)));
         } else {
           succeed();
         }
@@ -248,9 +289,10 @@ export class KimiDriver {
       fail(error);
     };
     socket.addEventListener('error', connectionFailed);
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (event) => {
       if (!settled) {
-        const error = new Error('Kimi WebSocket closed before the turn ended');
+        const reason = event.reason ? `: ${event.reason}` : '';
+        const error = new Error(`Kimi WebSocket closed before the turn ended (${event.code}${reason})`);
         rejectSubscribed(error);
         fail(error);
       }

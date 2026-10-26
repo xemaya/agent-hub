@@ -19,10 +19,12 @@ Usage:
   agent-hub worker list
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
-                        [--acceptance LINE1\\nLINE2] [--worker-id ID] [--local]
+                        [--acceptance LINE1\\nLINE2] [--worker-id ID] [--local] [--orchestrate]
   agent-hub task update TASK_ID [--status STATUS] [--worker-id ID] [--local]
   agent-hub send --prompt TEXT [--worker-id ID] [--task-id ID] [--kind KIND]
                  [--local] [--wait]
+  agent-hub orchestration list [--local]
+  agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub list workers|connectors|tasks|commands|events
 
 Environment:
@@ -35,7 +37,7 @@ Environment:
   AGENT_HUB_CODEX_MODEL         Default model for managed Codex Workers
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -83,15 +85,20 @@ function print(value) {
   console.log(JSON.stringify(value, null, 2));
 }
 
-function adminOptions(flags) {
+async function adminOptions(flags) {
+  let token = process.env.AGENT_HUB_ADMIN_TOKEN;
+  if (!token && flags['hub-data-dir']) {
+    const stored = JSON.parse(await readFile(path.join(path.resolve(flags['hub-data-dir']), 'credentials.json'), 'utf8'));
+    token = stored.adminToken;
+  }
   return {
     baseUrl: flags['hub-url'] ?? process.env.AGENT_HUB_URL ?? 'http://127.0.0.1:8787',
-    token: process.env.AGENT_HUB_ADMIN_TOKEN,
+    token,
   };
 }
 
 async function adminRequest(flags, pathname, { method = 'GET', body } = {}) {
-  const options = adminOptions(flags);
+  const options = await adminOptions(flags);
   if (!options.token) throw new Error('AGENT_HUB_ADMIN_TOKEN is required');
   const response = await fetch(`${options.baseUrl.replace(/\/$/, '')}${pathname}`, {
     method,
@@ -272,6 +279,7 @@ async function taskCommand(positionals, flags) {
         context: flags.context ?? '',
         acceptance: flags.acceptance ? flags.acceptance.split('\\n') : [],
         assignee_worker_id: flags['worker-id'],
+        orchestrate: flags.orchestrate === true,
       },
     }));
     return;
@@ -287,6 +295,33 @@ async function taskCommand(positionals, flags) {
     return;
   }
   throw new Error('Usage: agent-hub task create|update');
+}
+
+async function coordinatorCommand(positionals, flags) {
+  const action = positionals[0];
+  if (!['status', 'enable', 'disable'].includes(action)) {
+    throw new Error('Usage: agent-hub coordinator enable|disable|status');
+  }
+  const body = { enabled: action !== 'disable' };
+  if (action === 'enable') {
+    if (!flags['worker-id']) throw new Error('--worker-id is required');
+    body.worker_id = flags['worker-id'];
+  }
+  if (flags['max-steps'] !== undefined) {
+    const maxSteps = Number(flags['max-steps']);
+    if (!Number.isInteger(maxSteps)) throw new Error('--max-steps must be an integer');
+    body.max_steps = maxSteps;
+  }
+  print(await adminRequest(flags, '/api/v1/coordinator', {
+    method: action === 'status' ? 'GET' : 'PUT',
+    ...(action === 'status' ? {} : { body }),
+  }));
+}
+
+async function orchestrationCommand(positionals, flags) {
+  if (positionals[0] !== 'list') throw new Error('Usage: agent-hub orchestration list [--local]');
+  const request = flags.local ? localRequest : adminRequest;
+  print(await request(flags, flags.local ? '/local/v1/orchestrations' : '/api/v1/orchestrations'));
 }
 
 export async function run(argv) {
@@ -310,6 +345,14 @@ export async function run(argv) {
   }
   if (command === 'worker') {
     await workerCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'coordinator') {
+    await coordinatorCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'orchestration') {
+    await orchestrationCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'task') {

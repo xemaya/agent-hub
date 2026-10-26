@@ -46,6 +46,7 @@
     <nav class="dispatch-nav" aria-label="中控视图">
       <button class="nav-item active" data-view="workers">数字员工 <b data-count="workers">0</b></button>
       <button class="nav-item" data-view="tasks">任务黑板 <b data-count="tasks">0</b></button>
+      <button class="nav-item" data-view="orchestrations">中央大脑 <b data-count="orchestrations">0</b></button>
       <button class="nav-item" data-view="commands">命令回执 <b data-count="commands">0</b></button>
       <button class="nav-item" data-view="events">事件记录 <b data-count="events">0</b></button>
       <button class="nav-item" data-view="connectors">机器节点 <b data-count="connectors">0</b></button>
@@ -69,9 +70,18 @@
           <div id="tasks-list" class="record-list"></div>
         </section>
 
+        <section id="view-orchestrations" class="view" hidden>
+          <div class="section-heading">
+            <div><p class="section-index">ORCHESTRATION / 03</p><h2>中央大脑</h2></div>
+            <p>规划、依赖、执行与终审，全程可见。</p>
+          </div>
+          <div id="coordinator-status" class="coordinator-status"></div>
+          <div id="orchestrations-list" class="record-list"></div>
+        </section>
+
         <section id="view-commands" class="view" hidden>
           <div class="section-heading">
-            <div><p class="section-index">RECEIPTS / 03</p><h2>命令回执</h2></div>
+            <div><p class="section-index">RECEIPTS / 04</p><h2>命令回执</h2></div>
             <p>从持久化接收，到执行结束，每一步都有凭据。</p>
           </div>
           <div class="command-layout">
@@ -82,7 +92,7 @@
 
         <section id="view-events" class="view" hidden>
           <div class="section-heading">
-            <div><p class="section-index">LEDGER / 04</p><h2>事件记录</h2></div>
+            <div><p class="section-index">LEDGER / 05</p><h2>事件记录</h2></div>
             <p>注册、派发、状态变化和完成事实。</p>
           </div>
           <div id="events-list" class="event-ledger"></div>
@@ -90,7 +100,7 @@
 
         <section id="view-connectors" class="view" hidden>
           <div class="section-heading">
-            <div><p class="section-index">NODES / 05</p><h2>机器节点</h2></div>
+            <div><p class="section-index">NODES / 06</p><h2>机器节点</h2></div>
             <p>每台机器一个 Connector，主动出站连接 Hub。</p>
           </div>
           <div id="connectors-list" class="record-list"></div>

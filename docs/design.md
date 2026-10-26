@@ -29,11 +29,12 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - Claude、Kimi、Codex 托管 Worker 的实际触发适配器。
 - 外部 Session 的登记和人工协作模式。
 - 一个无构建步骤的 Web 中控页面和通用 CLI。
+- 管理员启用的中央协调器：全局规划、Worker 匹配、依赖编排与最终证据评审。
 - 默认回环地址运行；后续可绑定本机 Tailscale IP，让其他 Mac 注册。
 
 ### 2.2 暂不包含
 
-- Agent 自由群聊、自动拆任务和智能调度。
+- Agent 自由群聊、无限自动重试、跨 Hub 多主调度。
 - 多 Hub、多主写入、分布式锁和消息队列集群。
 - 双向文件同步、自动解决 Git 冲突、向量数据库。
 - 直接控制任意已经打开的交互式 TUI。
@@ -410,8 +411,10 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 - Connector 首次需要 Kimi Driver 时启动专用 `kimi web --no-open --host 127.0.0.1`。
 - 从启动输出取得实际监听地址和令牌；端口被占用时允许 Kimi 顺延端口。
 - 通过 REST 创建 Session，保存返回的 `runtime_session_id`。
-- 通过本机 WebSocket 订阅 Session 事件并等待订阅 ACK，再提交 Prompt。
-- 将 `turn.started`、工具事件、`turn.ended` 等映射为 Command 状态与输出。
+- 每次执行前通过官方 `:reload` 恢复持久化 Session 的活动状态，再订阅事件，避免 REST 接受 Prompt 但 ACK 为 `not_found` 后永久等待。
+- 通过本机 WebSocket 订阅 Session 事件并等待订阅 ACK，再提交 Prompt；ACK 明确拒绝或 `not_found` 时立即失败。
+- 解包 `session_event`，将 `turn.started`、工具事件、`turn.ended`、`prompt.completed` 等映射为 Command 状态与输出。
+- 回复服务端应用层 `ping`，`pong` 使用相同 `nonce`；连接关闭时记录关闭码和原因。`AGENT_HUB_KIMI_DEBUG=1` 可输出事件类型与 ACK 诊断，默认关闭且不输出 Token。
 - Worker `metadata.kimi_model` 可为 Prompt 显式指定模型；也可用 Connector 的 `AGENT_HUB_KIMI_MODEL` 作为默认值。Kimi 配置没有默认模型时必须设置其中一种，否则会返回 `Model not set`。
 - Worker `metadata.kimi_permission_mode` 可显式选择 `manual` / `yolo` / `auto`，`metadata.kimi_disabled_tools` 可限制工具；默认沿用本机 Kimi 配置，不擅自放开权限。
 - Connector 退出时关闭自己启动的 Kimi Server。
@@ -443,6 +446,17 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 - 仅在显式测试开关下启用。
 - 用于可控地验证推送、串行、断线和重放，不代表真实 Agent 验证。
 
+### 10.6 中央协调器
+
+- 管理员通过 `PUT /api/v1/coordinator` 指定一个 managed、可推送 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Worker 自声明协调者身份不会获得权限，未启用时 `orchestrate` 请求返回 `coordinator_disabled`。
+- 协调者只生成规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含 Driver 私有状态、任意 metadata 或 Token。
+- `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由。
+- 规划使用特殊 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。规划与评审在 Command 回执中也可审计。
+- 一步能完成就不硬拆，默认最多 4 步。Hub 校验 JSON Schema、字段、Worker 可用性、重复 key、未知依赖与环。子 Task 初始不指定负责人，轮到执行时才分配，避免提前占用多个 `current_task_id`；派发前还会检查 Worker 是否忙碌及其当前 Task 是否活跃。
+- 状态为 `planning → in_progress → review → done`，可进入 `blocked` 或停留在 `review`。子步骤为 `ready / running / review / done / blocked`。命令成功后步骤先进入 `review`，终审通过才进入 `done`。依赖只在前序命令成功后继续，终审仍可拒绝父任务。
+- 每个编排只有一次规划和一次终审，不自动重试或扩写计划。计划失败或无效进入 `blocked`；步骤执行失败进入 `blocked`；评审证据不足、拒绝或无法解析时停留在 `review`，不能伪造完成。终审只根据返回证据，不虚构独立测试。
+- 重启时按持久化的编排和 Command 状态恢复，不重复创建子任务或命令。`orchestration.list` 仅返回当前 Connector 创建的或其 Worker/协调者参与的编排。
+
 ## 11. HTTP API
 
 ### 公共
@@ -472,9 +486,13 @@ GET    /api/v1/commands
 POST   /api/v1/commands
 GET    /api/v1/commands/:id
 GET    /api/v1/events
+GET    /api/v1/coordinator
+PUT    /api/v1/coordinator
+GET    /api/v1/orchestrations
+GET    /api/v1/orchestrations/:id
 ```
 
-`POST /api/v1/commands` 至少包含 `worker_id` 和 `input`，可关联 `task_id`、`kind`。创建 Task 时可以同时指定负责人。
+`POST /api/v1/commands` 至少包含 `worker_id` 和 `input`，可关联 `task_id`、`kind`。创建 Task 时可以同时指定负责人；传入 `orchestrate: true` 时不指定初始负责人，由已启用的中央协调器规划。Connector 的 `task.create` 同样支持该字段，`orchestration.list` 用于受限的编排状态读取。
 
 ### Connector Local REST
 
@@ -483,6 +501,7 @@ GET   /local/v1/health
 GET   /local/v1/workers
 POST  /local/v1/workers/register
 POST  /local/v1/workers/:id/status
+GET   /local/v1/orchestrations
 POST  /local/v1/tasks
 PATCH /local/v1/tasks/:id
 POST  /local/v1/commands
@@ -549,6 +568,16 @@ agent-hub send --local --wait \
 
 agent-hub task update --local task_... --status done
 
+agent-hub task create --local --orchestrate \
+  --title "需要协调多个 Worker 的总目标" \
+  --goal "整体结果" \
+  --acceptance "整体第一条验收\n整体第二条验收"
+
+agent-hub orchestration list --local
+agent-hub coordinator enable --worker-id worker_... --max-steps 4
+agent-hub coordinator status
+agent-hub coordinator disable
+
 agent-hub list workers
 agent-hub list tasks
 agent-hub list commands
@@ -570,7 +599,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude` 打开的当前 Session 带有可信 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，用户说明职责后通过 `worker register-current` 注册本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接。Claude 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。未通过启动器的旧窗口仍需真实原生 Session ID，不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
-用户可以直接说“添加任务”或“添加并执行”。Agent 从自然语言整理任务字段，按本机 Worker 的自描述与状态选择负责人；只说添加时默认不执行，明确要求执行后才使用 `send --local --wait`。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页表单只是可选的手动后备。这里的 Worker 选择由调用 Skill 的 Agent 完成，不等于 Hub 已有独立智能调度模型，也不允许跨 Connector 任意操作。
+用户可以直接说“添加任务”“添加并执行”或“交给中央大脑”。普通任务由 Agent 从自然语言整理字段并选择本机 Worker；中央编排由管理员指定的协调者生成计划、Hub 校验后跨 Connector 调度。Worker 仍不能自主跨机互派。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页表单只是可选的手动后备。
 
 ### Dashboard
 
@@ -579,6 +608,7 @@ Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start
 - Workers：名称、Runtime、机器、模式、在线状态、工作状态、当前任务、最后活跃。
 - Connectors：名称、地址、连接时间和最后心跳。
 - Tasks：目标、负责人、状态、上下文和完成标准。
+- 中央大脑：协调者状态、编排摘要、步骤负责人、依赖、状态、执行证据与评审原因。
 - Commands/Events：命令状态、输出、错误和审计时间线。
 - 创建任务、分配 Worker、发送命令的基本表单。
 
@@ -588,6 +618,8 @@ Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认�
 
 - 首次启动生成随机 Admin Token 和 Enrollment Token，写入 0600 凭证文件；也允许通过环境变量显式提供。
 - Connector Token 和 Local Token 都是独立随机凭证。
+- 协调者配置只能由 Admin 修改，Worker 自声明不会获得中央权限。协调器接收的 Registry 不包含 Token、Driver 私有状态或任意 metadata；模型输出始终作为不可信输入进行 Schema、Worker 和依赖校验。
+- 每个编排最多 4 步，只有一次规划和一次终审，不自动重试。父任务只有在全部步骤和整体验收都通过后才能完成，执行失败、证据不足和评审拒绝都不能冒充成功。
 - Hub 数据目录、Connector 数据目录和凭证文件不作为静态资源暴露。
 - 默认只监听回环地址；绑定 Tailscale IP 是有意的部署操作。
 - Tailscale 提供加密私网传输，但不替代应用层认证。
@@ -640,7 +672,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：25 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数和当前 Session 启动器。
+- `pnpm test`：31 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -651,4 +683,5 @@ MVP 完成必须满足：
 - Agent Skill 与首批注册：2026-10-26 新增 `skills/agent-hub/SKILL.md` 和安全本机安装器，安装器测试覆盖软链接、真实目录、幂等和冲突不覆盖。实际安装到 Kimi/Codex 共享的 `~/.agents/skills` 与 Claude 的 `~/.claude/skills`，当前 Kimi 会话已识别并加载 Skill；`agent-hub` CLI 可从项目外目录使用。通过真实 CLI 在常驻 Connector 注册 `claude-agent-hub-01`、`kimi-agent-hub-01`、`codex-agent-hub-01` 三个新 managed Worker，均在线、空闲且 `push_capable=true`，能力标签和自描述已保存；本次仅注册，未额外调用模型。网页与 Connector 健康检查通过，未修改现有 hooks 或接管交互 Session。
 - Agent 自然语言任务流：新增 Local Token 任务创建、命令派发与事件等待、验收后状态更新；Hub 对 Worker 和 Task 的 Connector 归属做服务端校验。自动化测试覆盖完整任务、超时后继续执行、external 立即返回人工状态、跨 Connector 拒绝、完成时间戳和 CLI 布尔参数。2026-10-26 通过当前 Kimi 按新版 Skill 流程选择 `claude-agent-hub-01`，不使用 Admin Token 或网页表单创建并执行任务，真实回执为 `AGENT_HUB_TASK_OK`，验收后任务更新为 `done`，Worker 恢复空闲。已打开的 Skill 调用如果缓存旧版，需要刷新或重新打开 Session。
 - 当前交互 Session 接入：新增 `session start` 与 `worker register-current`，通过可信环境绑定当前原生 ID，未修改已有 hooks 或接管旧 Session。真实 smoke 使用隔离 Hub/Connector 和全新 Session：Claude 的启动器 ID、注册 ID 与 Hub 恢复 ID 完全一致，交互进程退出后显式选择 managed，返回 `AGENT_HUB_CURRENT_CLAUDE_OK`，任务验收后为 `done`。Kimi 首次暴露出 Web/CLI 对同一 Session 的排他占用，启动器已修正为在打开 CLI 前关闭临时 Server，随后原生启动和 ID 核对通过；当前 Session 默认 external，真实回执为 `waiting_manual`，未宣称支持当前 TUI 主动推送。共享 Web/ACP 桥接和交互并发控制仍未实现。
+- 中央大脑：管理员启用独立 managed `kimi-coordinator-01` 后，通过真实 `--orchestrate` 创建两步依赖任务。协调者生成合法计划并选择 Claude 与 Kimi 执行 Worker，第一步返回 `AGENT_HUB_BRAIN_FIRST_OK`，第二步在依赖完成后返回 `AGENT_HUB_BRAIN_SECOND_OK`，终审全部通过，父任务和两个步骤均为 `done`。真实浏览器中的中央大脑视图已验证协调者、依赖、状态和评审原因，截图保存在 `.runtime/central-brain-dashboard.png`。排查并修复了 Kimi 的心跳、`session_event` 解包和持久化 Session 的 `not_found` 订阅问题：每次执行前 `:reload`，ACK 拒绝立即失败；早期失败和卡住记录保留为 `blocked`/`outcome_unknown`，未改写成成功。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

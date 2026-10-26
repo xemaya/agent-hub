@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { HubStore } from './db.js';
+import { Coordinator } from './coordinator.js';
 import { bearerToken, hashToken, tokensEqual } from './auth.js';
 import { loadHubCredentials } from './credentials.js';
 import { createId, createToken } from './ids.js';
@@ -17,7 +18,7 @@ const STATIC_FILES = new Map([
 ]);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
-const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request']);
+const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review']);
 
 function protocolError(message, statusCode = 400, code = 'connector_request_failed') {
   const error = new Error(message);
@@ -77,6 +78,12 @@ export class Hub {
     this.credentials = credentials;
     this.connectors = new Map();
     this.dashboards = new Set();
+    this.coordinator = new Coordinator({
+      store: this.store,
+      emit: (...args) => this.emit(...args),
+      dispatch: (command) => this.dispatch(command),
+      logger: this.logger,
+    });
     this.server = createServer((request, response) => {
       this.handleRequest(request, response).catch((error) => {
         this.logger.error?.(error);
@@ -232,6 +239,35 @@ export class Hub {
     }
     this.requireAdmin(request);
 
+    if (request.method === 'GET' && pathname === '/api/v1/coordinator') {
+      sendJson(response, 200, { coordinator: this.coordinator.status() });
+      return;
+    }
+    if (request.method === 'PUT' && pathname === '/api/v1/coordinator') {
+      const body = await readJsonBody(request);
+      if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+        sendJson(response, 400, { error: 'enabled must be a boolean' });
+        return;
+      }
+      const coordinator = this.coordinator.configure({
+        workerId: body.worker_id,
+        enabled: body.enabled ?? true,
+        maxSteps: body.max_steps,
+      });
+      sendJson(response, 200, { coordinator });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/orchestrations') {
+      sendJson(response, 200, { orchestrations: this.coordinator.list() });
+      return;
+    }
+    const orchestrationMatch = /^\/api\/v1\/orchestrations\/([^/]+)$/.exec(pathname);
+    if (request.method === 'GET' && orchestrationMatch) {
+      const orchestration = this.coordinator.get(orchestrationMatch[1]);
+      if (orchestration) sendJson(response, 200, { orchestration });
+      else sendJson(response, 404, { error: 'Orchestration not found' });
+      return;
+    }
     if (request.method === 'GET' && pathname === '/api/v1/connectors') {
       sendJson(response, 200, { connectors: this.store.listConnectors() });
       return;
@@ -259,7 +295,30 @@ export class Hub {
     }
     if (request.method === 'POST' && pathname === '/api/v1/tasks') {
       const body = await readJsonBody(request);
+      if (body.orchestrate !== undefined && typeof body.orchestrate !== 'boolean') {
+        sendJson(response, 400, { error: 'orchestrate must be a boolean' });
+        return;
+      }
       const assignee = body.assignee_worker_id ?? null;
+      if (body.orchestrate === true) {
+        if (assignee) {
+          sendJson(response, 400, { error: 'Orchestrated tasks cannot have an initial assignee' });
+          return;
+        }
+        const result = this.coordinator.createOrchestration({
+          title: requiredString(body.title, 'title', { max: 300 }),
+          goal: optionalString(body.goal),
+          context: optionalString(body.context),
+          acceptance: stringArray(body.acceptance),
+          createdBy: 'admin',
+          actor: { type: 'admin', id: 'admin' },
+        });
+        sendJson(response, 202, {
+          task: result.task,
+          orchestration: this.coordinator.present(result.orchestration),
+        });
+        return;
+      }
       if (assignee && !this.store.getWorker(assignee)) {
         sendJson(response, 400, { error: 'Assignee worker does not exist' });
         return;
@@ -352,6 +411,7 @@ export class Hub {
           worker_id: updated.assignee_worker_id,
           payload: { status: updated.status, assignee_worker_id: updated.assignee_worker_id },
         });
+        await this.coordinator.resume();
         sendJson(response, 200, { task: updated });
         return;
       }
@@ -415,6 +475,7 @@ export class Hub {
           this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
           this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId) });
           this.replay(connectorId);
+          this.coordinator.resume().catch((error) => this.logger.error?.(error));
         }
         return;
       }
@@ -449,8 +510,33 @@ export class Hub {
 
   async handleConnectorMessage(socket, connectorId, message) {
     const payload = message.payload ?? {};
+    if (message.type === 'orchestration.list') {
+      this.send(socket, 'orchestration.list', {
+        orchestrations: this.coordinator.listForConnector(connectorId),
+      }, message.id);
+      return;
+    }
     if (message.type === 'task.create') {
+      if (payload.orchestrate !== undefined && typeof payload.orchestrate !== 'boolean') {
+        throw protocolError('orchestrate must be a boolean');
+      }
       const assignee = payload.assignee_worker_id ?? null;
+      if (payload.orchestrate === true) {
+        if (assignee) throw protocolError('Orchestrated tasks cannot have an initial assignee');
+        const result = this.coordinator.createOrchestration({
+          title: requiredString(payload.title, 'title', { max: 300 }),
+          goal: optionalString(payload.goal),
+          context: optionalString(payload.context),
+          acceptance: stringArray(payload.acceptance),
+          createdBy: `connector:${connectorId}`,
+          actor: { type: 'connector', id: connectorId },
+        });
+        this.send(socket, 'task.created', {
+          task: result.task,
+          orchestration: this.coordinator.present(result.orchestration),
+        }, message.id);
+        return;
+      }
       if (assignee && !this.store.getWorkerForConnector(assignee, connectorId)) {
         throw protocolError('Assignee worker does not belong to this connector', 403, 'worker_forbidden');
       }
@@ -483,6 +569,7 @@ export class Hub {
         worker_id: updated.assignee_worker_id,
         payload: { status: updated.status, assignee_worker_id: updated.assignee_worker_id },
       });
+      await this.coordinator.resume();
       this.send(socket, 'task.updated', { task: updated }, message.id);
       return;
     }
@@ -599,6 +686,7 @@ export class Hub {
       });
       this.broadcast('command.updated', { command });
       this.broadcast('worker.updated', { worker });
+      await this.coordinator.onCommandFinished(command);
       return;
     }
     if (message.type === 'command.sync') {
@@ -614,6 +702,7 @@ export class Hub {
           error: payload.error,
           outcomeUnknown: Boolean(payload.outcome_unknown),
         });
+        await this.coordinator.onCommandFinished(updated);
       }
       this.broadcast('command.updated', { command: updated });
       return;

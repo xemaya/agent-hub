@@ -4,6 +4,8 @@ const state = {
   view: 'workers',
   workers: [],
   tasks: [],
+  orchestrations: [],
+  coordinator: null,
   commands: [],
   events: [],
   connectors: [],
@@ -173,13 +175,68 @@ function renderConnectors() {
     </article>`).join('') : empty('还没有 Connector。');
 }
 
+function renderCoordinator() {
+  const coordinator = state.coordinator ?? { enabled: false, worker: null, active_orchestrations: 0 };
+  $('#coordinator-status').innerHTML = `
+    <article class="coordinator-console">
+      <div>
+        <p class="record-kicker">COORDINATOR</p>
+        <h3>${escapeHtml(coordinator.worker?.name ?? '尚未启用中央大脑')}</h3>
+        <p>${coordinator.worker
+          ? `${escapeHtml(coordinator.worker.runtime)} · ${escapeHtml(coordinator.worker.presence)} · 每个计划最多 ${escapeHtml(coordinator.max_steps)} 步`
+          : '由管理员指定一个 managed Worker 后，才能开始全局编排。'}</p>
+      </div>
+      <div class="status-row">
+        ${badge(coordinator.enabled ? 'enabled' : 'disabled')}
+        ${badge(`${coordinator.active_orchestrations} active`)}
+      </div>
+    </article>`;
+  $('#orchestrations-list').innerHTML = state.orchestrations.length ? state.orchestrations.map((orchestration) => `
+    <article class="record-card orchestration-card">
+      <div class="orchestration-head">
+        <div>
+          <p class="record-kicker">${escapeHtml(orchestration.orchestration_id)}</p>
+          <h3>${escapeHtml(orchestration.parent_task?.title ?? '未命名编排')}</h3>
+          <p class="orchestration-summary">${escapeHtml(orchestration.summary || '等待中央大脑生成计划。')}</p>
+        </div>
+        <div class="status-row">${badge(orchestration.status)}</div>
+      </div>
+      <dl class="record-meta">
+        <dt>协调者</dt><dd>${escapeHtml(orchestration.coordinator_worker?.name ?? '—')}</dd>
+        <dt>父任务</dt><dd><code>${escapeHtml(orchestration.parent_task_id)}</code></dd>
+        <dt>更新时间</dt><dd>${escapeHtml(dateTime(orchestration.updated_at))}</dd>
+      </dl>
+      ${orchestration.error ? `<p class="orchestration-error">${escapeHtml(orchestration.error.message)}</p>` : ''}
+      <ol class="orchestration-steps">
+        ${orchestration.steps.map((step) => `
+          <li>
+            <div class="step-heading">
+              <strong>${escapeHtml(step.key)} · ${escapeHtml(step.title)}</strong>
+              ${badge(step.status)}
+            </div>
+            <p>${escapeHtml(step.goal)}</p>
+            <dl class="record-meta">
+              <dt>负责人</dt><dd>${escapeHtml(step.worker_name ?? step.worker_id)}</dd>
+              <dt>依赖</dt><dd>${escapeHtml(step.depends_on.length ? step.depends_on.join(', ') : '无')}</dd>
+              <dt>Task</dt><dd><code>${escapeHtml(step.task_id ?? '待生成')}</code></dd>
+              <dt>Command</dt><dd><code>${escapeHtml(step.command_id ?? '待派发')}</code></dd>
+            </dl>
+            ${step.review?.reason ? `<p class="step-review">评审：${escapeHtml(step.review.reason)}</p>` : ''}
+            ${step.error?.message ? `<p class="orchestration-error">${escapeHtml(step.error.message)}</p>` : ''}
+            ${step.result?.text ? `<details class="step-evidence"><summary>执行证据</summary><p>${escapeHtml(step.result.text)}</p></details>` : ''}
+          </li>`).join('')}
+      </ol>
+    </article>`).join('') : empty('还没有编排任务。通过 --orchestrate 把总目标交给中央大脑。');
+}
+
 function render() {
-  for (const resource of ['workers', 'tasks', 'commands', 'events', 'connectors']) {
+  for (const resource of ['workers', 'tasks', 'orchestrations', 'commands', 'events', 'connectors']) {
     $(`[data-count="${resource}"]`).textContent = state[resource].length;
   }
   renderSelects();
   renderWorkers();
   renderTasks();
+  renderCoordinator();
   renderCommands();
   renderEvents();
   renderConnectors();
@@ -187,18 +244,22 @@ function render() {
 }
 
 async function refresh() {
-  const [workers, tasks, commands, events, connectors] = await Promise.all([
+  const [workers, tasks, commands, events, connectors, coordinator, orchestrations] = await Promise.all([
     api('/api/v1/workers'),
     api('/api/v1/tasks'),
     api('/api/v1/commands'),
     api('/api/v1/events'),
     api('/api/v1/connectors'),
+    api('/api/v1/coordinator'),
+    api('/api/v1/orchestrations'),
   ]);
   state.workers = workers.workers;
   state.tasks = tasks.tasks;
   state.commands = commands.commands;
   state.events = events.events;
   state.connectors = connectors.connectors;
+  state.coordinator = coordinator.coordinator;
+  state.orchestrations = orchestrations.orchestrations;
   if (!state.selectedCommand && state.commands.length) state.selectedCommand = state.commands[0].command_id;
   render();
 }

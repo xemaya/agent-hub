@@ -97,6 +97,31 @@ function eventView(row) {
   };
 }
 
+function coordinatorConfigView(row) {
+  if (!row) return { worker_id: null, enabled: false, max_steps: 4, updated_at: null };
+  return {
+    worker_id: row.worker_id,
+    enabled: Boolean(row.enabled),
+    max_steps: row.max_steps,
+    updated_at: row.updated_at,
+  };
+}
+
+function orchestrationView(row) {
+  if (!row) return null;
+  return {
+    orchestration_id: row.orchestration_id,
+    parent_task_id: row.parent_task_id,
+    coordinator_worker_id: row.coordinator_worker_id,
+    status: row.status,
+    summary: row.summary,
+    steps: parseJson(row.steps_json, []),
+    error: parseJson(row.error_json, null),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 const WORKER_SELECT = `
   SELECT w.*, c.name AS connector_name, c.online AS connector_online
   FROM workers w JOIN connectors c ON c.connector_id = w.connector_id
@@ -185,12 +210,31 @@ export class HubStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS coordinator_config (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        worker_id TEXT REFERENCES workers(worker_id),
+        enabled INTEGER NOT NULL,
+        max_steps INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS coordinator_orchestrations (
+        orchestration_id TEXT PRIMARY KEY,
+        parent_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+        coordinator_worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        steps_json TEXT NOT NULL DEFAULT '[]',
+        error_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_workers_connector ON workers(connector_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_worker_id);
       CREATE INDEX IF NOT EXISTS idx_commands_worker ON commands(worker_id, status);
       CREATE INDEX IF NOT EXISTS idx_commands_task ON commands(task_id);
       CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
-      PRAGMA user_version = 1;
+      CREATE INDEX IF NOT EXISTS idx_coordinator_orchestrations_status ON coordinator_orchestrations(status);
+      PRAGMA user_version = 2;
     `);
   }
 
@@ -483,6 +527,68 @@ export class HubStore {
       WHERE command_id = ?
     `).run(status, stringifyJson(result), stringifyJson(error), outcomeUnknown ? 1 : 0, timestamp, commandId);
     return this.getCommand(commandId);
+  }
+
+  getCoordinatorConfig() {
+    return coordinatorConfigView(this.db.prepare('SELECT * FROM coordinator_config WHERE singleton = 1').get());
+  }
+
+  setCoordinatorConfig({ workerId, enabled, maxSteps }) {
+    this.db.prepare(`
+      INSERT INTO coordinator_config (singleton, worker_id, enabled, max_steps, updated_at)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET
+        worker_id = excluded.worker_id, enabled = excluded.enabled,
+        max_steps = excluded.max_steps, updated_at = excluded.updated_at
+    `).run(workerId ?? null, enabled ? 1 : 0, maxSteps, now());
+    return this.getCoordinatorConfig();
+  }
+
+  createOrchestration({ parentTaskId, coordinatorWorkerId }) {
+    const orchestrationId = createId('orch');
+    const timestamp = now();
+    this.db.prepare(`
+      INSERT INTO coordinator_orchestrations (
+        orchestration_id, parent_task_id, coordinator_worker_id,
+        status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'planning', ?, ?)
+    `).run(orchestrationId, parentTaskId, coordinatorWorkerId, timestamp, timestamp);
+    return this.getOrchestration(orchestrationId);
+  }
+
+  getOrchestration(orchestrationId) {
+    return orchestrationView(this.db.prepare(`
+      SELECT * FROM coordinator_orchestrations WHERE orchestration_id = ?
+    `).get(orchestrationId));
+  }
+
+  getOrchestrationByTask(parentTaskId) {
+    return orchestrationView(this.db.prepare(`
+      SELECT * FROM coordinator_orchestrations WHERE parent_task_id = ?
+    `).get(parentTaskId));
+  }
+
+  listOrchestrations({ active = false } = {}) {
+    const where = active ? "WHERE status IN ('planning', 'in_progress', 'review')" : '';
+    return this.db.prepare(`
+      SELECT * FROM coordinator_orchestrations ${where}
+      ORDER BY created_at DESC, rowid DESC
+    `).all().map(orchestrationView);
+  }
+
+  updateOrchestration(orchestrationId, data) {
+    const current = this.getOrchestration(orchestrationId);
+    if (!current) return null;
+    const status = data.status ?? current.status;
+    const summary = data.summary ?? current.summary;
+    const steps = data.steps === undefined ? current.steps : data.steps;
+    const error = data.error === undefined ? current.error : data.error;
+    this.db.prepare(`
+      UPDATE coordinator_orchestrations
+      SET status = ?, summary = ?, steps_json = ?, error_json = ?, updated_at = ?
+      WHERE orchestration_id = ?
+    `).run(status, summary, stringifyJson(steps), stringifyJson(error), now(), orchestrationId);
+    return this.getOrchestration(orchestrationId);
   }
 
   recordEvent({ event_type: eventType, actor_type: actorType, actor_id: actorId, ...refs }) {

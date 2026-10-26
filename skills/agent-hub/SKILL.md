@@ -201,6 +201,32 @@ agent-hub task update --local TASK_ID --status done \
 
 最终向用户简要返回：`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。任务看板与命令回执会自动更新，不要求用户在网页上补录。
 
+## 交给中央大脑：全局规划与编排
+
+当用户明确要求“交给中央大脑”“自动拆任务”“协调多个 Worker/机器”时，不要自己拆步骤或指定 Worker。改为整理总目标、上下文和父任务验收标准，使用 `--orchestrate`，不传 `--worker-id`：
+
+```bash
+agent-hub task create --local --orchestrate \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --title "<总目标>" \
+  --goal "<整体结果>" \
+  --context "<已核实的上下文>" \
+  --acceptance "<整体第一条验收>\n<整体第二条验收>"
+```
+
+`--orchestrate` 会立即开始规划，因此只在用户明确要求中央协调执行时使用；仅记录任务仍用普通创建。中央协调者负责选择 Worker、拆步骤和最终评审，不要再用 `send` 给父任务派发普通命令，不要手工关闭父任务。
+
+需要向用户汇报进度时，按需执行一次：
+
+```bash
+agent-hub orchestration list --local \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+返回总任务、编排状态、步骤负责人、依赖和评审原因。不要循环查询。`blocked`、`review` 都不是完成；只有父任务和全部步骤符合终审结果时才报告 `done`。
+
+如果返回 `coordinator_disabled`，说明中央大脑尚未由管理员启用，不要退回到普通派发冒充中央编排，也不要自行获取 Admin Token。只有用户明确要求配置中央大脑时，才先注册一个独立的 managed 协调者 Worker，再由管理员通过 `agent-hub coordinator enable --worker-id ...` 启用；本地 Hub 可显式使用 `--hub-data-dir`，由 CLI 内部读取凭证，不能打印或转交 Token。
+
 只在需要时查询，不要启动循环轮询。Skill 不是常驻进程，也不负责启动即自动注册；如需自动启动注册，应另行配置明确的启动指令或 hook，不得覆盖已有 hooks。
 
-Agent 可以按上述规则为当前任务选择本机 Worker，但这不等于 Hub 内置智能调度模型，也不支持 Worker 自主跨机互派。不要通过读取 Admin Token 绕过权限边界；需要这些能力时应明确说明并实现相应 Hub 功能。
+普通任务由 Agent 按上述规则选择本机 Worker；中央编排由管理员指定的协调者生成计划、Hub 校验并跨 Connector 调度。Worker 仍不能自主跨机互派，不要通过读取 Admin Token 绕过权限边界。

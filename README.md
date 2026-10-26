@@ -216,6 +216,70 @@ agent-hub task update --local TASK_ID --status done \
 
 **登记当前交互 Session 是另一种操作：** 使用 `--mode external` 和真实原生 `--session-id`。external 不会被伪装成可推送 Worker；无法确认 Session ID 时不要随机生成，也不要使用 Codex `--last`。新建 managed Worker 不代表发起注册的当前窗口。
 
+## 中央大脑
+
+中央大脑由管理员明确指定一个 managed Worker 担任。它负责根据总目标和全局 Worker 自描述生成计划、选择负责人、拆解步骤，并在执行结束后审查证据。Hub 负责校验、依赖调度和状态变更，模型不能直接操作 Admin API 或数据库。
+
+### 启用协调者
+
+先注册一个独立 managed Worker（这里以 Kimi 为例）：
+
+```bash
+agent-hub worker register \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --runtime kimi --mode managed \
+  --name "kimi-coordinator-01" --cwd "$PWD/.runtime/coordinator" \
+  --capabilities "orchestration,planning,review" \
+  --metadata '{"description":"中央协调者：规划、拆解步骤并审查证据。","kimi_model":"kimi-code/kimi-for-coding"}'
+```
+
+然后由管理员启用，并限制每个计划最多 4 步：
+
+```bash
+agent-hub coordinator enable \
+  --worker-id WORKER_ID --max-steps 4 \
+  --hub-data-dir .runtime/hub
+
+agent-hub coordinator status --hub-data-dir .runtime/hub
+# 停用：agent-hub coordinator disable --hub-data-dir .runtime/hub
+```
+
+`--hub-data-dir` 让 CLI 在本地读取必要凭证，不打印 Token，也不需要你复制到聊天中。远程管理员可用 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 代替。
+
+### 交给中央大脑
+
+直接对装好 Skill 的 Agent 说：
+
+```text
+/agent-hub 交给中央大脑：拆解并完成……；父任务验收是……
+```
+
+也可以直接使用 CLI，不要指定 `--worker-id`：
+
+```bash
+agent-hub task create --local --orchestrate \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --title "总目标" \
+  --goal "需要协调多个 Worker 完成的结果" \
+  --context "已核实的背景与约束" \
+  --acceptance "整体第一条验收\n整体第二条验收"
+
+agent-hub orchestration list --local \
+  --data-dir "$HOME/.agent-hub/connector"
+```
+
+`--orchestrate` 会立即开始规划。规划与终审都通过特殊的持久化 Command 执行，支持去重、断线重放和恢复；执行 Worker 仍按原 Connector 权限接收命令。
+
+- 一步能完成就不硬拆，最多 4 步，依赖不能成环。
+- 命令成功后步骤先进入 `review`，终审明确通过才进入 `done`。
+- 执行失败会进入 `blocked`；计划无效或证据不足会进入 `blocked` 或 `review`，不会自动完成。
+- 每个编排只有一次规划和一次终审，不自动重试或扩写计划。终审只根据返回证据判断，不虚构独立测试。
+- 中控“中央大脑”视图可查看协调者、计划摘要、步骤负责人、依赖、状态和评审原因。
+
+### 协议兼容性
+
+Kimi Driver 会在每次执行前通过官方 `:reload` 恢复持久化 Session 的活动状态，回复应用层 `ping` 的相同 `nonce` `pong`，解包 `session_event`，并处理 `turn.ended` 与 `prompt.completed`。订阅 ACK 返回 `not_found` 时会立即失败，而不是无限等待。`AGENT_HUB_KIMI_DEBUG=1` 可输出事件类型和 ACK 诊断（不含 Token），默认关闭。
+
 ## 部署新的中控
 
 通常只需一台中控机器。不要在每台 Worker Mac 上重复启动 Hub。
@@ -255,6 +319,6 @@ pnpm check
 - 不接管任意已打开的 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。
 - external Worker 只提供人工协作登记，命令为 `waiting_manual`。
 - 当前交互 Session 默认 external；主动执行不是向 TUI 模拟输入。Kimi CLI 与 Web Server 对同一 Session 有排他占用，当前 Kimi 交互主动推送需要共享 Web/ACP 桥接，尚未实现。
-- Hub 不包含独立的智能调度模型、自动拆任务、自由群聊或 Worker 自主跨机互派；调用 Skill 的 Agent 可以为当前任务选择本机 Worker。
+- 中央大脑需管理员显式启用，规划和终审都有边界；不包含无限重试、自由群聊或 Worker 自主跨机互派。普通任务仍可由调用 Skill 的 Agent 选择本机 Worker。
 - Hub 的 HTTP 传输位于 Tailscale 加密私网内，但仍必须使用 Admin/Connector/Local Token，并建议通过 Headscale Grants 限制可访问节点和端口。
 - 不启用 Funnel，不默认放开模型工具权限，不把 Runtime 数据目录或凭证作为网页静态资源公开。

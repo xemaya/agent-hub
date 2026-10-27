@@ -434,11 +434,12 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 
 ### 10.4 当前交互 Session 启动器
 
-- `agent-hub session start --runtime claude|kimi` 只建立当前原生身份并打开客户端，不注册 Worker、不创建任务。
+- `agent-hub session start --runtime claude|kimi|codex` 只建立当前原生身份并打开客户端，不注册 Worker、不创建任务。
 - Claude 生成 UUID，以 `claude --session-id <uuid>` 启动；Kimi 通过现有 Server API 创建原生 Session，关闭临时 Server 后以 `kimi --session <id>` 启动，避免 Web/CLI 对同一 Session 的排他占用。
-- 启动器向当前客户端进程注入 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`。`worker register-current` 校验这两个可信值及 Runtime 一致性，缺失时失败，不生成随机 ID、不选择最近会话。
+- Codex 没有新会话 `--session-id` 参数。启动器直接打开新 Codex 客户端并只注入 `AGENT_HUB_RUNTIME`，不预创建空 Thread、不选择最近会话。Codex 自身向工具进程注入 `CODEX_SESSION_ID`，`worker register-current` 读取这个真实原生 ID；因此未通过启动器打开的现有 Codex 窗口也可以登记。若同时存在启动器 ID，必须与原生 ID 一致。
+- Claude/Kimi 由启动器注入 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`；Codex 以原生 `CODEX_SESSION_ID` 为身份来源。`worker register-current` 校验 Runtime 一致性，缺失时失败，不生成随机 ID、不选择最近会话，并记录实际身份来源。
 - 当前交互 Session 默认登记为 external，并保存 `interactive: true` 与 `session_origin`。只有用户明确选择且确认交互实例已退出或 Runtime 支持共享时才使用 managed。
-- Claude 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接，不能用简单 `--session` 替代。
+- Claude/Codex 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接，不能用简单 `--session` 替代。
 - `--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。
 
 ### 10.5 Test Driver
@@ -545,6 +546,7 @@ agent-hub worker register \
 
 agent-hub session start --runtime kimi --cwd /path/to/project
 agent-hub session start --runtime claude --cwd /path/to/project
+agent-hub session start --runtime codex --cwd /path/to/project
 
 agent-hub worker register-current \
   --name current-session-role --cwd /path/to/project
@@ -603,7 +605,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
-Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude` 打开的当前 Session 带有可信 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，用户说明职责后通过 `worker register-current` 注册本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接。Claude 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。未通过启动器的旧窗口仍需真实原生 Session ID，不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
+Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude|codex` 打开客户端后，Claude/Kimi 使用启动器提供的 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，Codex 使用自身注入工具进程的 `CODEX_SESSION_ID`，因此已有 Codex 窗口也能通过 `worker register-current` 登记本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接。Claude/Codex 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。缺少可信原生身份时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
 用户可以直接说“添加任务”“添加并执行”或“交给中央大脑”。普通任务由 Agent 从自然语言整理字段并选择本机 Worker；中央编排由管理员指定的协调者生成计划、Hub 校验后跨 Connector 调度。Worker 仍不能自主跨机互派。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页不提供任务编辑或调度表单；管理员通过中央对话安排工作，Agent 原有 Local Token 和 CLI 流程不变。
 
@@ -689,7 +691,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：53 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：54 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -712,4 +714,5 @@ MVP 完成必须满足：
 - 万圣节实际任务复盘：核对正式 Codex 方案、Kimi 审核和中央终审，确认两步按依赖顺序完成且父任务为 `done`。将该任务的只读记录复制到隔离环境验证页面，方案全文、改进建议、表格和两份结果原文复制均一致；旧版超长步骤汇报仅在显示层收敛，正式数据未被修改。报告与截图位于 `.runtime/delivery-ui-smoke/fixture-browser-result.json`。
 - 真实双 Runtime 交付闭环：2026-10-27 使用全新隔离 Codex/Kimi managed Session 和真实 Chrome，Codex 先返回《交付闭环》Markdown，Kimi 的后续 Prompt 直接包含完全一致的上游正文并完成审核，中央终审与父任务均为 `done`。验证了顺序、依赖正文逐字一致、`result_truncated=false`、结果页及完整复制；报告位于 `.runtime/real-delivery-smoke/browser-result.json`，未混入正式任务，隔离服务已关闭。
 - 任务交付优化正式上线：2026-10-27 在原 Tailscale 地址和原数据目录重启正式 Hub/Connector，数据库保持 `user_version=5`。3 个 Task、1 个 Orchestration、7 个 Command、11 条对话及 4 位 Worker 均保留，员工在线空闲，协调者配置与凭证不变。Dashboard 和 Markdown 静态资源返回 200，未认证清空对话仍返回 401，Connector 连接正常；已重载现有 Chrome 中控页。未清理历史、未新增正式任务或修改 Worker 注册。
+- Codex 当前 Session 原生注册：2026-10-27 使用真实 `codex-cli 0.164.0` 工具进程核对 `CODEX_SESSION_ID` / `CODEX_THREAD_ID` 与 `thread.started` 完全一致。通过 `session start --runtime codex` 启动的真实 Codex exec，以及不带启动器身份的真实 Codex exec，分别由 agent 自己执行 `worker register-current`，两条路径在隔离 Hub/Connector 均注册成功：原生 ID 逐字一致、`runtime=codex`、`mode=external`、`push_capable=false`、`interactive=true`，身份来源分别为 `agent-hub-session-launcher` 与 `codex-native-runtime`。报告位于 `.runtime/codex-current-smoke/native-launcher-result.json` 和 `native-existing-result.json`。测试使用独立临时目录并显式允许该次沙箱网络访问，未修改正式 Worker 权限、正式任务或正式注册；隔离服务和临时 Codex Session 已清理。真实交互 TUI 不通过模拟键盘结果验收，第二台 Mac 的现有交互窗口仍需在该机器上实际确认。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

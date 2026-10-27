@@ -15,6 +15,13 @@ curl --fail --silent http://127.0.0.1:8788/local/v1/health
 
 如果失败，说明本机 Connector 不可达。报告这个问题，不要擅自启动第二个 Connector、修改网络配置或读取凭证文件。
 
+只有用户明确要求**从零安装并接入一台新 Mac** 时，才按仓库 README 的“其他 Mac：接入已有中控”执行首次接入：
+
+- `tailscale` 命令不存在时，先安装官方 Standalone App，或使用 `brew install --cask tailscale-app`；系统扩展和 VPN 授权由用户在 macOS 图形界面完成。
+- 新机器使用管理员提供的地址执行 `tailscale up --login-server="https://<Headscale地址>"`，按浏览器流程登录。需要节点批准时，把注册信息交给管理员在 Headscale 服务端处理，不能假装已加入。
+- 已有其他账号或控制服务器时，先报告 `ControlURL` 和账号列表，不要擅自切换、退出、重置或覆盖原网络。
+- 必须通过 `tailscale status` 和 Hub 的 `/healthz` 验证，再安装 Connector、CLI 和 Skill。只克隆仓库或安装依赖不等于接入完成。
+
 后续命令统一使用以下数据目录；CLI 会自行读取 Local Token：
 
 ```bash
@@ -25,15 +32,17 @@ curl --fail --silent http://127.0.0.1:8788/local/v1/health
 
 ## 当前交互 Session：通过启动器注册（推荐）
 
-当用户想“先开一个 Kimi/Claude Session，告诉它职责，再让它注册到 Agent Hub”时，使用启动器打开当前窗口：
+当用户想“先开一个 Kimi/Claude/Codex Session，告诉它职责，再让它注册到 Agent Hub”时，使用启动器打开当前窗口：
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project
 # Claude Code 使用：
 agent-hub session start --runtime claude --cwd /path/to/project
+# Codex 使用：
+agent-hub session start --runtime codex --cwd /path/to/project
 ```
 
-启动器只绑定当前原生 Session 并打开客户端，不注册 Worker、不创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；需要传递 Runtime 原生参数时放在 `--` 后。
+启动器不注册 Worker、不创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；Codex 直接打开新客户端，不选择最近会话，真实 ID 由 Codex 注入其工具进程的 `CODEX_SESSION_ID` 提供，注册时读取。需要传递 Runtime 原生参数时放在 `--` 后。
 
 在当前窗口中，用户说明职责后，使用可信启动器身份注册当前 Session：
 
@@ -46,11 +55,11 @@ agent-hub worker register-current \
   --metadata '{"description":"<用户刚定义的职责与工作范围>"}'
 ```
 
-`register-current` 从 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID` 读取启动器提供的身份，不需要用户填写 `--session-id`。当前交互窗口默认登记为 external，不伪装成可主动推送。不要手动编造或设置这些变量，不要另建 Worker 冒充当前窗口。
+Claude/Kimi 的 `register-current` 从 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID` 读取启动器提供的身份；Codex 读取 Codex 注入工具进程的 `CODEX_SESSION_ID`，已有 Codex 窗口也可以登记。不需要用户填写 `--session-id`。当前交互窗口默认登记为 external，不伪装成可主动推送。不要手动编造或设置这些变量，不要另建 Worker 冒充当前窗口。
 
-只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。Kimi CLI 与 Kimi Web Server 对同一 Session 有排他占用：当前 CLI 窗口打开时不要注册为 managed，也不要启动第二个 Web Server 接管它。Kimi 当前交互 Session 的主动推送需要共享 Web/ACP 桥接，不能用简单的 `--session` 代替。Claude 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
+只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。Kimi CLI 与 Kimi Web Server 对同一 Session 有排他占用：当前 CLI 窗口打开时不要注册为 managed，也不要启动第二个 Web Server 接管它。Kimi 当前交互 Session 的主动推送需要共享 Web/ACP 桥接，不能用简单的 `--session` 代替。Claude/Codex 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
 
-如果当前窗口不是通过启动器打开的，或者缺少上述可信环境变量，不要假装它是启动器 Session；按下面的 external 边界处理，或建议用户下次通过启动器打开。
+如果 Claude/Kimi 当前窗口不是通过启动器打开的，或者缺少上述可信环境变量，不要假装它是启动器 Session；按下面的 external 边界处理，或建议用户下次通过启动器打开。Codex 缺少原生 `CODEX_SESSION_ID` 时同样不能注册，不要退回随机 ID 或最近会话。
 
 ## 默认选择：普通接入新建 managed
 

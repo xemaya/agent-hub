@@ -47,7 +47,7 @@ test('local and wait flags work with task and send commands', async (t) => {
   });
 });
 
-test('register-current uses launcher identity and rejects unverified sessions', async (t) => {
+test('register-current uses launcher or Codex native identity and rejects unverified sessions', async (t) => {
   await mkdir(TEST_ROOT, { recursive: true });
   const dataDir = await mkdtemp(path.join(TEST_ROOT, 'cli-current-'));
   await writeFile(path.join(dataDir, 'connector.json'), JSON.stringify({ localToken: 'test-local' }), { mode: 0o600 });
@@ -55,6 +55,7 @@ test('register-current uses launcher identity and rejects unverified sessions', 
   const originalLog = console.log;
   const originalRuntime = process.env.AGENT_HUB_RUNTIME;
   const originalSessionId = process.env.AGENT_HUB_SESSION_ID;
+  const originalCodexSessionId = process.env.CODEX_SESSION_ID;
   const calls = [];
   console.log = () => {};
   globalThis.fetch = async (url, options) => {
@@ -71,6 +72,8 @@ test('register-current uses launcher identity and rejects unverified sessions', 
     else process.env.AGENT_HUB_RUNTIME = originalRuntime;
     if (originalSessionId === undefined) delete process.env.AGENT_HUB_SESSION_ID;
     else process.env.AGENT_HUB_SESSION_ID = originalSessionId;
+    if (originalCodexSessionId === undefined) delete process.env.CODEX_SESSION_ID;
+    else process.env.CODEX_SESSION_ID = originalCodexSessionId;
     await rm(dataDir, { recursive: true, force: true });
   });
 
@@ -95,9 +98,48 @@ test('register-current uses launcher identity and rejects unverified sessions', 
 
   delete process.env.AGENT_HUB_RUNTIME;
   delete process.env.AGENT_HUB_SESSION_ID;
+  process.env.CODEX_SESSION_ID = 'thread-current-codex';
+  await run([
+    'worker', 'register-current',
+    '--name', 'current-codex',
+    '--cwd', '/tmp/project',
+    '--capabilities', 'qa,review',
+    '--data-dir', dataDir,
+  ]);
+  const codexRegistration = JSON.parse(calls[1].options.body);
+  assert.equal(codexRegistration.runtime, 'codex');
+  assert.equal(codexRegistration.mode, 'external');
+  assert.equal(codexRegistration.runtime_session_id, 'thread-current-codex');
+  assert.equal(codexRegistration.metadata.interactive, true);
+  assert.equal(codexRegistration.metadata.session_origin, 'codex-native-runtime');
+
+  process.env.AGENT_HUB_RUNTIME = 'codex';
+  process.env.AGENT_HUB_SESSION_ID = 'different-id';
+  await assert.rejects(
+    run(['worker', 'register-current', '--data-dir', dataDir]),
+    /does not match the launcher identity/,
+  );
+  assert.equal(calls.length, 2);
+
+  process.env.AGENT_HUB_SESSION_ID = 'thread-current-codex';
+  await run(['worker', 'register-current', '--data-dir', dataDir]);
+  const launchedCodexRegistration = JSON.parse(calls[2].options.body);
+  assert.equal(launchedCodexRegistration.runtime_session_id, 'thread-current-codex');
+  assert.equal(launchedCodexRegistration.metadata.session_origin, 'agent-hub-session-launcher');
+
+  delete process.env.CODEX_SESSION_ID;
+  await assert.rejects(
+    run(['worker', 'register-current', '--data-dir', dataDir]),
+    /Codex native Session identity is unavailable/,
+  );
+  assert.equal(calls.length, 3);
+
+  delete process.env.AGENT_HUB_RUNTIME;
+  delete process.env.AGENT_HUB_SESSION_ID;
+  delete process.env.CODEX_SESSION_ID;
   await assert.rejects(
     run(['worker', 'register-current', '--data-dir', dataDir]),
     /start with agent-hub session start/,
   );
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 3);
 });

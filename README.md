@@ -26,20 +26,44 @@
 
 以下假设中控地址为 `http://<中控TailscaleIPv4>:8787`。在中控机器上执行 `tailscale ip -4` 可查看地址；用实际地址替换占位符，不要照抄尖括号。
 
-### 1. 检查私网连通
+### 1. 安装并连接私网
+
+先检查是否已经安装：
 
 ```bash
+command -v tailscale
 tailscale status
-curl --fail --silent "http://<中控TailscaleIPv4>:8787/healthz"
 ```
 
-如果尚未加入自建 Headscale，请按自己的认证流程接入，例如：
+如果命令不存在，不要继续启动 Connector。macOS 推荐使用 Tailscale 官方 Standalone 安装包：<https://tailscale.com/download/mac>。已有 Homebrew 时也可以执行：
+
+```bash
+brew install --cask tailscale-app
+open -a Tailscale
+```
+
+首次启动需要用户在 macOS 图形界面中允许系统扩展和 VPN 配置。不要同时安装 Standalone 和 App Store 两个版本；没有 Homebrew 时使用官方安装包，不必为了 Agent Hub 安装 Homebrew。如果 App 已安装但终端仍找不到命令，可用 `/Applications/Tailscale.app/Contents/MacOS/Tailscale` 代替下面的 `tailscale`。
+
+确认这台 Mac **尚未加入其他 Tailscale/Headscale 网络**后，使用管理员提供的控制服务器地址登录：
 
 ```bash
 tailscale up --login-server="https://<你的Headscale地址>"
 ```
 
-已有非默认 Tailscale 设置时，按 CLI 提示显式保留，不要随意使用 `--reset`。不要使用 Funnel 暴露 Agent Hub。
+浏览器会打开登录或节点注册页面。若页面给出 `headscale auth register --user <USER> --auth-id <AUTH_ID>`，将注册信息交给中控管理员，由管理员在 Headscale 服务端批准；不要把 Auth ID 当成长期凭证，也不要在 Worker Mac 上假装已经批准。需要新建用户或使用 pre-auth key 时，也由管理员处理并通过安全方式传递。
+
+**已有另一个账号或控制服务器时不要直接执行上面的登录命令。** 先报告 `tailscale switch --list` 和 `tailscale debug prefs` 中的 `ControlURL`，由管理员决定授权或接入方式。普通账号切换不能同时连接两个网络；不要擅自 `logout`、`switch` 或使用 `--reset`。
+
+连接成功后验证：
+
+```bash
+tailscale status
+tailscale ip -4
+tailscale ping --c 2 "<中控TailscaleIPv4>"
+curl --fail --silent --max-time 10 "http://<中控TailscaleIPv4>:8787/healthz"
+```
+
+只有 Hub 健康检查成功后才继续。已有非默认 Tailscale 设置时，按 CLI 提示显式保留；不要使用 Funnel 暴露 Agent Hub。
 
 ### 2. 克隆并安装依赖
 
@@ -94,15 +118,17 @@ export PATH="$HOME/.local/bin:$PATH"
 
 #### 方式 A：先开当前 Session，再注册本人
 
-如果希望“先开一个 Kimi/Claude Session，告诉它职责，再让它注册”，使用启动器打开客户端：
+如果希望“先开一个 Kimi/Claude/Codex Session，告诉它职责，再让它注册”，使用启动器打开客户端：
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project
 # Claude Code 使用：
 agent-hub session start --runtime claude --cwd /path/to/project
+# Codex 使用：
+agent-hub session start --runtime codex --cwd /path/to/project
 ```
 
-启动器只绑定真实原生 Session ID，不提前注册或创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；Runtime 原生参数可以放在 `--` 后。
+启动器不提前注册或创建任务。Kimi 使用 `kimi --session <id>`，Claude 使用 `claude --session-id <uuid>`；Codex 直接打开新客户端，不选择最近会话，真实 ID 由 Codex 注入其工具进程的 `CODEX_SESSION_ID` 提供，注册时读取。Runtime 原生参数可以放在 `--` 后。
 
 在打开的窗口里说明职责，然后调用 Skill：
 
@@ -110,11 +136,11 @@ agent-hub session start --runtime claude --cwd /path/to/project
 /skill:agent-hub 把当前 Session 注册到 Agent Hub，职责是……
 ```
 
-Claude 使用 `/agent-hub`。Agent 会执行 `worker register-current`，从启动器环境取得真实 ID，你不需要再提供 `--session-id`。重复注册同一个原生 ID 会复用 Worker。
+Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Agent 会执行 `worker register-current`，从启动器环境或 Codex 原生工具环境取得真实 ID，你不需要再提供 `--session-id`。重复注册同一个原生 ID 会复用 Worker。
 
-当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`：Claude 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt；Kimi CLI 与 Web Server 对同一 Session 有排他占用，不能用第二个 Web Server 接管当前 CLI 窗口，当前交互主动推送需要后续的共享 Web/ACP 桥接。
+当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`：Claude/Codex 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt；Kimi CLI 与 Web Server 对同一 Session 有排他占用，不能用第二个 Web Server 接管当前 CLI 窗口，当前交互主动推送需要后续的共享 Web/ACP 桥接。
 
-未通过启动器打开的旧窗口仍需真实原生 Session ID 才能 external，不能猜测或选择最近会话。
+未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 
 #### 方式 B：另建独立 managed Worker
 

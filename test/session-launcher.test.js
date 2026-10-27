@@ -81,3 +81,26 @@ test('Kimi launcher closes its server when the client cannot start', async () =>
   }), /client unavailable/);
   assert.equal(closed, 1);
 });
+
+test('Codex launcher opens a fresh client and leaves native identity to Codex', async () => {
+  const calls = [];
+  const result = await startSession({
+    runtime: 'codex',
+    cwd: process.cwd(),
+    runtimeArgs: ['--no-alt-screen'],
+    env: { EXISTING: 'preserved', AGENT_HUB_SESSION_ID: 'stale-id' },
+    spawn(executable, args, options) {
+      calls.push({ executable, args, options });
+      return fakeChild();
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.runtime, 'codex');
+  assert.equal(result.sessionId, null);
+  assert.equal(calls[0].executable, 'codex');
+  assert.deepEqual(calls[0].args, ['--no-alt-screen']);
+  assert.equal(calls[0].options.cwd, path.resolve(process.cwd()));
+  assert.equal(calls[0].options.env.AGENT_HUB_RUNTIME, 'codex');
+  assert.equal(Object.hasOwn(calls[0].options.env, 'AGENT_HUB_SESSION_ID'), false);
+  assert.equal(calls[0].options.env.EXISTING, 'preserved');
+});

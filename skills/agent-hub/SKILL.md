@@ -145,6 +145,19 @@ agent-hub worker status WORKER_ID idle \
 
 也可以使用 `waiting` 或 `blocked`，但必须反映真实状态。未核对验收标准时，不得把 Task 标记为 `done`。managed Worker 的运行状态主要由 Connector 回报。
 
+## 撤下当前 Worker
+
+只有用户明确要求“撤下自己”“注销当前 Worker”时，才执行：
+
+```bash
+agent-hub worker unregister-current \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+身份解析与 `register-current` 相同：Claude/Kimi 使用启动器身份，Codex 使用原生 `CODEX_SESSION_ID`。不要手工传 Session ID，不要用其他 Worker 代替，也不需要 Admin Token。
+
+撤下是软注销，不删除任务、命令、事件或原生 Session。默认列表、`@` 和新命令都不再包含该 Worker；重复撤下幂等，显式重新注册同一身份可恢复。存在活动命令、进行中任务、未结束编排分配或当前协调者身份时会拒绝，不能强制撤下或擅自取消工作。管理员按 Worker ID 撤下使用 `agent-hub worker unregister WORKER_ID`，需要管理员授权，普通 Agent 不要读取 Admin Token。
+
 ## 添加任务：用户不需要填写网页表单
 
 当用户通过此 Skill 要求“添加任务”“创建任务”或“添加并执行”时，由你整理字段并调用 CLI，不要求用户补填网页表单。
@@ -225,7 +238,7 @@ agent-hub task create --local --orchestrate \
 
 `--orchestrate` 会立即规划并执行，因此只在用户明确要求中央协调执行时使用；仅记录任务仍用普通创建。中央协调者负责选择 Worker、拆步骤和最终评审，不要再用 `send` 给父任务派发普通命令，不要手工关闭父任务。
 
-管理员也可以在操作台与中央大脑对话：“先只规划，不要执行”会保存 `ready` 计划而不派发步骤，“开始执行”按钮或对话只启动已有的 `ready` 计划。输入 `@` 可点名 managed 员工或引用任务；点击员工旁的 `@` 只带入输入框，发送明确要求后才安排工作。任务看板默认显示全部任务，完成详情优先展示完整交付和验收结论。网页对话需要 Admin Token；你持有的 Local Token 不能读取、发送或清空管理员对话，不要尝试绕过。Agent 的 Skill、CLI 和 Local Token 流程不变，不要代替用户在网页中输入。
+管理员也可以在操作台与中央大脑对话：“先只规划，不要执行”会保存 `ready` 计划而不派发步骤，“开始执行”按钮或对话只启动已有的 `ready` 计划。输入 `@` 可点名 managed 员工或引用任务；单独 `@员工` 提问会转给该员工本人回答，不创建任务，回复显示员工名字；明确要求做事时才安排执行并继续终审。点击员工旁的 `@` 只带入输入框，不会立即发送。任务看板默认显示全部任务，完成详情优先展示完整交付和验收结论。网页对话需要 Admin Token；你持有的 Local Token 不能读取、发送或清空管理员对话，不要尝试绕过。Agent 的 Skill、CLI 和 Local Token 流程不变，不要代替用户在网页中输入。
 
 需要向用户汇报进度时，按需执行一次：
 

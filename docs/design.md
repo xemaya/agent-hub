@@ -175,6 +175,14 @@ Local CLI/Session
 - Connector 保存映射，Hub 不读取各 Runtime 的私有 Session 文件。
 - 本地 API 要求 Local Token；CLI 从 Connector 数据目录读取，避免把令牌放进命令行。
 
+### 5.3 Worker 撤下与恢复
+
+- `workers.retired_at` 记录可恢复的软注销，数据库迁移到 `user_version=6`。默认 `listWorkers`、Connector 本地列表、Dashboard、@选择器和调度 Registry 都排除已撤下员工；`getWorker`、历史 Task/Command/Event 与 `GET /api/v1/workers?include_retired=true` 仍可读取。
+- 当前 Agent 通过 `POST /local/v1/workers/unregister-current` 提交 runtime 和原生 Session ID，Connector 以 `worker.unregister` 请求 Hub 校验归属并撤下；管理员通过 `DELETE /api/v1/workers/:id` 撤下指定员工。`worker unregister-current` 复用注册时的可信身份，不需要 Admin Token；管理员命令为 `worker unregister WORKER_ID`。
+- 撤下在事务中检查 queued/accepted/running/waiting_manual 命令、进行中任务、ready/planning/in_progress/待终审编排分配及当前协调者身份，存在活动工作时返回 409，不自动取消。已结束或失败的历史计划不阻止撤下。
+- `createCommand`、@解析、直接问答、协调者配置和已有计划启动都拒绝已撤下员工。重复撤下幂等；显式重新注册同一 `runtime + runtime_session_id` 恢复原 Worker ID 并清除 `retired_at`，心跳和 Connector 重连不会自动恢复。
+- Hub 发出 `worker.unregistered` 事件并同步新版 Connector 的 `retired_at`，Dashboard 立即移除员工及未发送的 @引用；旧版 Connector 忽略未知消息，需更新后才支持自注销和本地状态同步。历史消息中的 speaker 姓名保留。
+
 ## 6. 任务与命令模型
 
 ### 6.1 Task
@@ -453,6 +461,7 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 - 协调者生成受限对话动作、规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含 Driver 私有状态、任意 metadata 或 Token。
 - `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误、`auto_start`、来源消息、终审理由和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由。`coordinator_chat_messages` 保存用户、协调者和任务活动消息，通过 request/source 去重键及 Command/Task 关联支持恢复。
 - 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
+- 单独 `@员工` 的 `action=chat` 是转交问答，不采用中央代答。Hub 从回复的来源键找回原用户消息，向目标 Worker 发出 `worker_chat` Command，附带必要的 @任务上下文，`task_id=null`，不创建 Orchestration。创建 Command 与更新回复关联在同一事务提交，最终回复和 Hub 重启恢复按 Command 幂等完成，不重复转交。Worker 的纯文本结果才是最终回复；失败、空结果和未知结果明确失败，不伪造验收。
 - 一步能完成就不硬拆，默认最多 4 步。Hub 校验 JSON Schema、字段、Worker 可用性、重复 key、未知依赖与环。子 Task 初始不指定负责人，轮到执行时才分配，避免提前占用多个 `current_task_id`；派发前还会检查 Worker 是否忙碌及其当前 Task 是否活跃。
 - 自动编排状态为 `planning → in_progress → review → done`，可进入 `blocked` 或停留在 `review`。只规划对话在计划生成后进入 `ready`，确认后只启动这个已有计划，不重新规划，也不重跑失败、评审或完成任务。子步骤为 `ready / running / review / done / blocked`。命令成功后步骤先进入 `review`，终审通过才进入 `done`。依赖只在前序命令成功后继续，终审仍可拒绝父任务。
 - 步骤 Prompt 直接携带已完成直接依赖的真实结果（总预算 64,000 字符）和来源消息中 `@任务` 的历史结果（总预算 24,000 字符，再按各任务步骤分配），不再要求 Worker 自行查询上游。超出预算标记 `result_truncated`，Runtime 的 `output_gap` 映射为 `result_incomplete`；不完整证据不能被描述为已经完整阅读。终审每个结果最多使用 12,000 字符，并附带同样的不完整标记，无法确认的验收必须拒绝。
@@ -480,6 +489,7 @@ Authorization: Bearer <enrollment-token>
 GET    /api/v1/connectors
 GET    /api/v1/workers
 GET    /api/v1/workers/:id
+DELETE /api/v1/workers/:id
 GET    /api/v1/tasks
 POST   /api/v1/tasks
 GET    /api/v1/tasks/:id
@@ -506,6 +516,7 @@ POST   /api/v1/history/clear
 GET   /local/v1/health
 GET   /local/v1/workers
 POST  /local/v1/workers/register
+POST  /local/v1/workers/unregister-current
 POST  /local/v1/workers/:id/status
 GET   /local/v1/orchestrations
 POST  /local/v1/tasks
@@ -550,6 +561,9 @@ agent-hub session start --runtime codex --cwd /path/to/project
 
 agent-hub worker register-current \
   --name current-session-role --cwd /path/to/project
+
+agent-hub worker unregister WORKER_ID
+agent-hub worker unregister-current
 
 agent-hub task create \
   --title "完成接口 review" \
@@ -618,11 +632,11 @@ Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start
 
 主界面不设置宣传/教学文案、命令回执、事件流水或调度表单。交付使用 `public/markdown.js` 渲染常用 Markdown 结构，不再截断为 6000 字；Agent 原文先转义，原始 HTML 不执行，链接仅允许安全协议。支持单步和全部结果复制，保留完整原始返回。Enter 发送，Cmd/Ctrl+Enter 或 Shift+Enter 换行；每条消息可复制，Clipboard API 不可用时使用兼容复制路径。中央忙碌时待回复消息显示排队，旧版本留下的超长步骤汇报只在显示层收敛，不改写原始记录。
 
-输入框的 `@` 提供可键盘操作的员工和任务选择器，保存结构化引用而不是把显示名当成身份。`@员工` 对后续计划的可选 Registry 和计划校验施加同一约束，模型不能改派其他 Worker；`@任务` 只补充真实任务/计划快照，仍遵守启动边界。未选择员工时继续按能力自动匹配。external、离线和协调者本人不作为主动派单目标。
+输入框的 `@` 提供可键盘操作的员工和任务选择器，保存结构化引用而不是把显示名当成身份。单独 `@员工` 提问或讨论时转交该员工本人回答，不创建任务；回复通过关联的 `worker_chat` Command 计算 `speaker`，页面和 `chat.updated` 显示真实员工名，并区分回复等待与忙碌排队。`@员工` 派活仍对后续计划的可选 Registry 和计划校验施加同一约束，模型不能改派其他 Worker；`@任务` 只补充真实任务/计划快照，仍遵守启动边界。未选择员工时继续按能力自动匹配。external、离线和协调者本人不作为主动派单目标。
 
 Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认证，不进入 URL。底层 Command/Event/API 继续用于审计与恢复。
 
-`POST /api/v1/coordinator/chat` 接收 `{message, request_id, mentions?}`，其中 `mentions` 是最多 8 个 `{type: "worker"|"task", id}` 的去重引用。Hub 验证真实 ID 与 Worker 的可调度状态，持久化到对话（数据库 `user_version=5`），返回用户消息和协调者回复；`request_id` 用于重试去重。回复处理及任务进展通过 `chat.updated` 主动推送给已认证的 Dashboard。只有 Admin 能读取或发送对话，Local/Connector API 不暴露此能力。
+`POST /api/v1/coordinator/chat` 接收 `{message, request_id, mentions?}`，其中 `mentions` 是最多 8 个 `{type: "worker"|"task", id}` 的去重引用。Hub 验证真实 ID 与 Worker 的可调度状态，持久化到对话（数据库 `user_version=5`），返回用户消息和回复；`request_id` 用于重试去重。回复处理及任务进展通过 `chat.updated` 主动推送给已认证的 Dashboard，直接问答的说话人来自实际 Worker Command，不新增数据库字段。只有 Admin 能读取或发送对话，Local/Connector API 不暴露此能力。
 
 `DELETE /api/v1/coordinator/chat` 清空当前对话批次，不删除任务、命令、事件或内部来源关联。每条消息保存 `conversation_epoch`；清空时递增 epoch，API 和 `chat.cleared` 返回新 epoch，页面忽略旧 epoch 的迟到更新。对话历史及新对话上下文只读取当前 epoch，内部按 ID 查询和编排 @Worker 约束仍然有效。整体历史清理会重置 epoch。
 
@@ -691,7 +705,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：54 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：59 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -715,4 +729,8 @@ MVP 完成必须满足：
 - 真实双 Runtime 交付闭环：2026-10-27 使用全新隔离 Codex/Kimi managed Session 和真实 Chrome，Codex 先返回《交付闭环》Markdown，Kimi 的后续 Prompt 直接包含完全一致的上游正文并完成审核，中央终审与父任务均为 `done`。验证了顺序、依赖正文逐字一致、`result_truncated=false`、结果页及完整复制；报告位于 `.runtime/real-delivery-smoke/browser-result.json`，未混入正式任务，隔离服务已关闭。
 - 任务交付优化正式上线：2026-10-27 在原 Tailscale 地址和原数据目录重启正式 Hub/Connector，数据库保持 `user_version=5`。3 个 Task、1 个 Orchestration、7 个 Command、11 条对话及 4 位 Worker 均保留，员工在线空闲，协调者配置与凭证不变。Dashboard 和 Markdown 静态资源返回 200，未认证清空对话仍返回 401，Connector 连接正常；已重载现有 Chrome 中控页。未清理历史、未新增正式任务或修改 Worker 注册。
 - Codex 当前 Session 原生注册：2026-10-27 使用真实 `codex-cli 0.164.0` 工具进程核对 `CODEX_SESSION_ID` / `CODEX_THREAD_ID` 与 `thread.started` 完全一致。通过 `session start --runtime codex` 启动的真实 Codex exec，以及不带启动器身份的真实 Codex exec，分别由 agent 自己执行 `worker register-current`，两条路径在隔离 Hub/Connector 均注册成功：原生 ID 逐字一致、`runtime=codex`、`mode=external`、`push_capable=false`、`interactive=true`，身份来源分别为 `agent-hub-session-launcher` 与 `codex-native-runtime`。报告位于 `.runtime/codex-current-smoke/native-launcher-result.json` 和 `native-existing-result.json`。测试使用独立临时目录并显式允许该次沙箱网络访问，未修改正式 Worker 权限、正式任务或正式注册；隔离服务和临时 Codex Session 已清理。真实交互 TUI 不通过模拟键盘结果验收，第二台 Mac 的现有交互窗口仍需在该机器上实际确认。
+- @员工直接问答：2026-10-27 新增持久化 `worker_chat`，单员工提问由本人回答，不创建任务，speaker 显示真实员工，明确派活仍走编排与终审。自动化覆盖原问题和 @任务上下文、非中央代答、失败/未知结果、重复完成与 Hub 重启不重复转交。可控执行器和真实 Chrome 验证忙碌排队、员工名、真实回复、刷新保留及移动端，报告位于 `.runtime/direct-chat-smoke/browser-result.json`。真实 Kimi 协调者与 managed Codex 完成直接问答，员工本人返回 `DIRECT_QA_OK`，speaker 正确、Task 数为 0、存在真实 `worker_chat` 回执，报告位于 `.runtime/real-direct-chat-smoke/browser-result.json`；隔离服务已关闭，第二台 Mac 的页面实际复测仍由用户确认。
+- @员工直接问答正式上线：2026-10-27 在确认无活动命令和 pending 对话后，按原 Tailscale 地址、数据目录和凭证重启正式 Hub/Connector。数据库保持 `user_version=5`，3 个历史 Task 和 6 位 Worker 保留，所有已登记 Connector 均在线，远程 managed QA 在线空闲且可推送，协调者配置不变。Dashboard 静态资源升级为 `v=7`，未认证对话仍返回 401；已重载现有 Chrome 标签页，未清理历史、重发 Token 或新增正式任务。
+- Worker 软注销与恢复：2026-10-27 新增 `retired_at`、管理员撤下、Codex 原生自注销、活动工作保护和显式重注册恢复。自动化覆盖旧库迁移、重复撤下、协调者与活动工作保护、新命令/@拒绝、历史保留和身份恢复；真实 Chrome 验证员工立即消失、未发送 @清除、同 ID 恢复、刷新隐藏与撤下记录查询，报告位于 `.runtime/worker-retirement-smoke/browser-result.json`。第二台 Mac 的自注销与本地状态同步需更新后验证，不以管理员撤下代替跨机自注销验收。
+- Worker 软注销正式部署与原 external 撤下：2026-10-27 先创建备份 `.runtime/hub/backups/pre-worker-retirement-2026-10-27T12-37-26-011Z.db`，确认无活动工作后按原地址和凭证重启，数据库迁移到 `user_version=6`。通过 `worker unregister worker_3ea75be5de22474bb16981355eb24a4c` 将原 external“有闲 QA · Codex”软注销，默认列表和 @已移除，原 Worker ID 与历史保留；managed“有闲 QA · Codex 执行”仍在线可调度。正式页面升级为 `v=8` 并重载，未删除任务或重发 Token。第二台 Mac 的自注销需更新仓库后复测。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

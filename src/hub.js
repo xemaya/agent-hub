@@ -19,7 +19,7 @@ const STATIC_FILES = new Map([
 ]);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
-const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat']);
+const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat', 'worker_chat']);
 const COORDINATOR_COMMAND_KINDS = new Set(['coordinator_plan', 'coordinator_review', 'coordinator_chat']);
 
 function workerActivity(store, worker) {
@@ -32,13 +32,14 @@ function workerActivity(store, worker) {
   const recent = commands.find((command) => ['succeeded', 'failed'].includes(command.status)) ?? null;
   const orchestrations = store.listOrchestrations();
   const orchestration = current
-    ? orchestrations.find((item) => item.parent_task_id === current.task_id
-      || item.steps.some((step) => step.command_id === current.command_id || step.task_id === current.task_id))
+    ? orchestrations.find((item) => (current.task_id && item.parent_task_id === current.task_id)
+      || item.steps.some((step) => step.command_id === current.command_id
+        || (current.task_id && step.task_id === current.task_id)))
     : null;
   const step = current && orchestration
     ? orchestration.steps.find((item) => item.command_id === current.command_id || item.task_id === current.task_id)
     : null;
-  const taskId = current?.task_id ?? (worker.work_state === 'working' ? worker.current_task_id : null);
+  const taskId = current ? current.task_id : (worker.work_state === 'working' ? worker.current_task_id : null);
   const task = taskId ? store.getTask(taskId) : null;
   let phase = 'idle';
   if (worker.presence === 'offline') phase = 'offline';
@@ -46,7 +47,7 @@ function workerActivity(store, worker) {
   else if (current && ['queued', 'accepted'].includes(current.status)) phase = 'queued';
   else if (current?.kind === 'coordinator_plan') phase = 'planning';
   else if (current?.kind === 'coordinator_review') phase = 'reviewing';
-  else if (current?.kind === 'coordinator_chat') phase = 'chatting';
+  else if (['coordinator_chat', 'worker_chat'].includes(current?.kind)) phase = 'chatting';
   else if (current || worker.work_state === 'working') phase = 'working';
   else if (['waiting', 'blocked'].includes(worker.work_state)) phase = worker.work_state;
   const details = {
@@ -72,7 +73,7 @@ function workerActivity(store, worker) {
     command_id: current?.command_id ?? null,
     command_status: current?.status ?? null,
     task_id: orchestration?.parent_task_id ?? taskId,
-    task_title: step?.title ?? task?.title ?? (current?.kind === 'coordinator_chat' ? '中央对话' : null),
+    task_title: step?.title ?? task?.title ?? (current?.kind === 'coordinator_chat' ? '中央对话' : current?.kind === 'worker_chat' ? '直接对话' : null),
     parent_task_title: orchestration ? store.getTask(orchestration.parent_task_id)?.title ?? null : null,
     output_text: output,
     output_truncated: Boolean(current?.output_truncated || (current && current.output_text.length > output.length)),
@@ -146,7 +147,7 @@ export class Hub {
       store: this.store,
       emit: (...args) => this.emit(...args),
       dispatch: (command) => this.dispatch(command),
-      notify: (message) => this.broadcast('chat.updated', { message }),
+      notify: (message) => this.broadcast('chat.updated', { message: this.coordinator.presentChatMessage(message) }),
       logger: this.logger,
     });
     this.server = createServer((request, response) => {
@@ -276,6 +277,28 @@ export class Hub {
     return worker ? { ...worker, activity: workerActivity(this.store, worker) } : null;
   }
 
+  unregisterWorker({ workerId = null, connectorId = null, runtime = null, runtimeSessionId = null, actor = { type: 'admin', id: 'admin' } }) {
+    const current = runtimeSessionId
+      ? this.store.getWorkerBySession(connectorId, runtime, runtimeSessionId)
+      : this.store.getWorker(workerId);
+    if (!current || (connectorId && current.connector_id !== connectorId)) {
+      const error = new Error('Worker not found');
+      error.code = 'worker_not_found';
+      error.statusCode = 404;
+      throw error;
+    }
+    const worker = this.store.retireWorker(current.worker_id, { connectorId });
+    this.emit('worker.unregistered', actor, {
+      connector_id: worker.connector_id,
+      worker_id: worker.worker_id,
+      payload: { name: worker.name, runtime: worker.runtime, mode: worker.mode, retired_at: worker.retired_at },
+    });
+    this.broadcast('worker.unregistered', { worker: this.presentWorker(worker) });
+    const socket = this.connectors.get(worker.connector_id);
+    if (socket) this.send(socket, 'worker.unregistered', { worker });
+    return worker;
+  }
+
   async handleRequest(request, response) {
     const url = new URL(request.url, 'http://localhost');
     const pathname = url.pathname;
@@ -380,7 +403,8 @@ export class Hub {
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/workers') {
-      sendJson(response, 200, { workers: this.store.listWorkers().map((worker) => this.presentWorker(worker)) });
+      const includeRetired = url.searchParams.get('include_retired') === 'true';
+      sendJson(response, 200, { workers: this.store.listWorkers({ includeRetired }).map((worker) => this.presentWorker(worker)) });
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/tasks') {
@@ -525,6 +549,11 @@ export class Hub {
     }
 
     const workerMatch = /^\/api\/v1\/workers\/([^/]+)$/.exec(pathname);
+    if (request.method === 'DELETE' && workerMatch) {
+      const worker = this.unregisterWorker({ workerId: workerMatch[1] });
+      sendJson(response, 200, { worker });
+      return;
+    }
     if (request.method === 'GET' && workerMatch) {
       const worker = this.presentWorker(this.store.getWorker(workerMatch[1]));
       sendJson(response, worker ? 200 : 404, worker ? { worker } : { error: 'Worker not found' });
@@ -715,6 +744,16 @@ export class Hub {
         payload: { name: worker.name, runtime: worker.runtime, mode: worker.mode },
       });
       this.send(socket, 'worker.registered', { worker }, message.id);
+      return;
+    }
+    if (message.type === 'worker.unregister') {
+      const worker = this.unregisterWorker({
+        connectorId,
+        runtime: requiredString(payload.runtime, 'runtime'),
+        runtimeSessionId: requiredString(payload.runtime_session_id, 'runtime_session_id'),
+        actor: { type: 'connector', id: connectorId },
+      });
+      this.send(socket, 'worker.unregistered', { worker }, message.id);
       return;
     }
     if (message.type === 'worker.status') {

@@ -191,6 +191,27 @@ Codex 未指定模型时沿用本机配置。只有明确允许工作区写入�
 agent-hub worker list --data-dir "$HOME/.agent-hub/connector"
 ```
 
+### 撤下 Worker 与恢复
+
+当前 Agent 明确要求撤下自己时，使用与注册相同的原生身份：
+
+```bash
+agent-hub worker unregister-current \
+  --data-dir "$HOME/.agent-hub/connector"
+```
+
+Claude/Kimi 使用启动器身份，Codex 使用原生 `CODEX_SESSION_ID`，不需要手工传 `--session-id`。普通 Agent 只使用 Local Token，不能撤下其他 Connector 的 Worker。
+
+管理员可以按 Worker ID 撤下：
+
+```bash
+agent-hub worker unregister WORKER_ID \
+  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --hub-data-dir .runtime/hub
+```
+
+撤下是**可恢复的软注销**：默认员工列表、`@`、调度候选和新命令都移除该 Worker，但 Task、Command、Event 和原生 Session 历史保留。活动命令、进行中任务、未结束编排分配或当前协调者身份会返回 409，不会强制取消工作。重复撤下幂等；之后显式重新注册同一 `runtime + runtime_session_id`，会恢复原 Worker ID 并清除撤下标记，Connector 重连或心跳不会自动恢复。管理员可用 `GET /api/v1/workers?include_retired=true` 查看撤下记录。旧版 Connector 需要更新仓库后才有自注销和本地撤下状态同步。
+
 ### 6. 使用 Skill 和中控页面
 
 - Kimi：新 Session 中使用 `/skill:agent-hub`。
@@ -244,7 +265,7 @@ agent-hub task update --local TASK_ID --status done \
 
 Enter 发送消息，Cmd/Ctrl+Enter 或 Shift+Enter 换行。消息可以逐条复制；“清空对话”只隐藏当前对话批次，不取消任务或删除执行记录，后续新进展仍会显示。中央大脑忙碌时，新消息显示排队状态。
 
-在输入框键入 `@` 后，用鼠标或方向键、Enter 选择员工或任务。`@员工` 明确要求做事时，Hub 将规划和执行限制在这位员工，不能改派他人；只提问不会自动创建任务。`@任务` 只引用真实上下文，不会自动启动、重试或修改任务；明确要求继续或修订时可以创建新工作，原任务保持不变。不点名员工时，中央大脑仍按能力和状态自动匹配。只有在线 managed Worker 可以被点名主动执行，external 仍通过本机 Skill 人工协作。
+在输入框键入 `@` 后，用鼠标或方向键、Enter 选择员工或任务。单独 `@员工` 提问或讨论时，原问题会转给这位员工，回复显示员工本人的名字，不创建任务；明确要求做事时，Hub 将规划和执行限制在这位员工，不能改派他人，并继续经过任务终审。`@任务` 只引用真实上下文，不会自动启动、重试或修改任务；明确要求继续或修订时可以创建新工作，原任务保持不变。不点名员工时，中央大脑仍按能力和状态自动匹配。只有在线 managed Worker 可以被点名回复或主动执行，external 仍通过本机 Skill 人工协作。
 
 网页不提供任务编辑或调度表单，业务输入统一从中央大脑的对话框进入。命令回执和事件仍保留在底层用于审计与恢复，但不在主界面展示。Local Token 只允许操作当前 Connector 的 Worker 和分配给他的任务，不能跨 Connector 任意派发或改状态，也不能读取管理员对话。
 

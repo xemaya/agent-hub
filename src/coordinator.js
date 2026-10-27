@@ -183,7 +183,7 @@ export class Coordinator {
     const config = this.store.getCoordinatorConfig();
     const worker = config.worker_id ? this.store.getWorker(config.worker_id) : null;
     if (!config.enabled || !worker) throw coordinatorError('Coordinator is not configured', 'coordinator_disabled');
-    if (worker.mode !== 'managed' || !worker.push_capable) {
+    if (worker.retired_at || worker.mode !== 'managed' || !worker.push_capable) {
       throw coordinatorError('Coordinator must be a managed, push-capable Worker', 'coordinator_worker_invalid');
     }
     return { config, worker };
@@ -215,7 +215,7 @@ export class Coordinator {
   configure({ workerId, enabled = true, maxSteps }) {
     if (enabled) {
       const worker = workerId ? this.store.getWorker(workerId) : null;
-      if (!worker || worker.mode !== 'managed' || !worker.push_capable) {
+      if (!worker || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable) {
         throw coordinatorError('Coordinator must be a managed, push-capable Worker', 'coordinator_worker_invalid');
       }
     }
@@ -254,7 +254,7 @@ export class Coordinator {
       if (item.type === 'worker') {
         const worker = this.store.getWorker(id);
         if (!worker) throw coordinatorError('Mentioned Worker does not exist', 'mention_worker_not_found', 404);
-        if (worker.worker_id === coordinatorWorkerId || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
+        if (worker.worker_id === coordinatorWorkerId || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
           throw coordinatorError('Mentioned Worker must be an online, managed execution Worker', 'mention_worker_unavailable', 409);
         }
       } else if (!this.store.getTask(id)) {
@@ -566,7 +566,7 @@ export class Coordinator {
   }
 
   workerAvailable(worker, taskId) {
-    if (worker.work_state === 'working') return false;
+    if (worker.retired_at || worker.work_state === 'working') return false;
     if (!worker.current_task_id || worker.current_task_id === taskId) return true;
     const current = this.store.getTask(worker.current_task_id);
     return current ? FINISHED_STEP_STATUSES.has(current.status) || ['cancelled', 'blocked'].includes(current.status) : true;
@@ -650,6 +650,10 @@ export class Coordinator {
   }
 
   onCommandFinished(command) {
+    if (command.kind === 'worker_chat') {
+      this.acceptWorkerChat(command);
+      return true;
+    }
     if (command.kind === 'coordinator_chat') {
       this.acceptChat(command);
       return true;
@@ -717,7 +721,11 @@ export class Coordinator {
     const history = this.store.listChatMessages({ limit: 20, epoch: this.store.conversationEpoch() })
       .filter((message) => message.message_id !== userMessage.message_id && message.status === 'done')
       .slice(-12)
-      .map((message) => ({ role: message.role, content: message.content.slice(0, 2000) }));
+      .map((message) => ({
+        role: message.role,
+        speaker: this.presentChatMessage(message).speaker,
+        content: message.content.slice(0, 2000),
+      }));
     const orchestrations = this.list().slice(0, 10).map((orchestration) => ({
       orchestration_id: orchestration.orchestration_id,
       parent_task_id: orchestration.parent_task_id,
@@ -756,6 +764,7 @@ export class Coordinator {
       '用户明确要求只记录、只规划、先不要执行时，使用 plan；用户明确要求完成、修复、安排并执行新工作时，使用 orchestrate。两者格式均为：{"reply":"简短确认","action":{"type":"plan|orchestrate","task":{"title":"简短标题","goal":"整体目标","context":"用户已提供的上下文","acceptance":["可检查的整体验收"]}}}。plan 不执行；orchestrate 会开始执行。',
       '用户要启动之前已规划且 status=ready 的任务时，使用：{"reply":"简短确认","action":{"type":"start","orchestration_id":"快照中的真实 ID"}}。start 只用于 ready；不要重试 blocked/review，不要重复启动已完成或正在执行的任务。',
       '界面传入的 @ 引用已经由 Hub 核验。用户明确给 @员工 派新工作时使用 plan 或 orchestrate，后续只能在引用的 Worker 中分配，不得改派；只是 @员工 提问或没有明确做事时不要创建任务。@任务 是阅读和讨论的上下文，不代表自动启动、重试或修改该任务。',
+      '当且仅当用户只 @ 一位员工并进行提问或讨论时，action=chat 表示将原问题转交该员工本人。此时 reply 只需简短说明会转交，绝对不要代替该员工回答，也不要把自描述摘要冒充员工本人的回复。',
       '用户明确要求根据 @任务 继续、修订或补充工作时，使用 plan 或 orchestrate 创建新工作；执行 Worker 会收到引用任务的结果。不要宣称已修改原任务或自动重试。',
       '回答进展或结果问题时可以概述真实步骤和实际交付；创建任务的确认不需要复述步骤。不要输出 worker_id、内部凭证或 Markdown。',
       '最近对话 JSON:',
@@ -771,6 +780,110 @@ export class Coordinator {
     ].join('\n\n');
   }
 
+  presentChatMessage(message) {
+    const command = message.command_id ? this.store.getCommand(message.command_id) : null;
+    if (command?.kind === 'worker_chat') {
+      const worker = this.store.getWorker(command.worker_id);
+      return {
+        ...message,
+        speaker: {
+          type: 'worker',
+          worker_id: command.worker_id,
+          name: worker?.name ?? '数字员工',
+        },
+      };
+    }
+    return {
+      ...message,
+      speaker: message.role === 'coordinator'
+        ? { type: 'coordinator', name: '中央大脑' }
+        : { type: message.role },
+    };
+  }
+
+  chatUserMessage(message) {
+    const prefix = 'chat-reply:';
+    if (!message.source_key?.startsWith(prefix)) return null;
+    const user = this.store.getChatMessage(message.source_key.slice(prefix.length));
+    return user?.role === 'user' ? user : null;
+  }
+
+  startWorkerChat(message, workerId) {
+    const worker = this.store.getWorker(workerId);
+    const user = this.chatUserMessage(message);
+    if (!user) {
+      this.completeChat(message, { status: 'failed', content: '没有找到要转交的原问题，请重新发送。' });
+      return;
+    }
+    if (!worker || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
+      this.completeChat(message, {
+        status: 'failed',
+        content: `${worker?.name ?? '这位员工'}当前不在线或不能主动接收问题，没有创建任务。`,
+      });
+      return;
+    }
+    const identity = this.workerRegistry().find((item) => item.worker_id === workerId);
+    const taskIds = (user.mentions ?? []).filter((mention) => mention.type === 'task').map((mention) => mention.id);
+    const resultBudget = Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(taskIds.length, 1));
+    const references = taskIds.map((taskId) => this.taskReference(taskId, { resultBudget })).filter(Boolean);
+    const input = [
+      '你是被管理员在 Agent Hub 操作台直接点名的数字员工。请亲自用中文回答，不要冒充中央大脑。',
+      '这是直接问答，不是自动创建或修改任务的授权。可以在现有权限内核实事实，但不要创建任务、修改任务状态或虚构执行与验收。直接回答问题，不要只回复收到。',
+      `你的身份与职责 JSON：${JSON.stringify(identity)}`,
+      ...(references.length ? [`引用的任务上下文 JSON（若标记不完整，不得声称完整阅读）：${JSON.stringify(references)}`] : []),
+      '管理员的原消息：',
+      user.content,
+    ].join('\n\n');
+    try {
+      const busy = worker.work_state === 'working';
+      const { command, pending } = this.store.transaction(() => {
+        const created = this.store.createCommand({
+          task_id: null,
+          worker_id: workerId,
+          kind: 'worker_chat',
+          input,
+          push_capable: true,
+        });
+        const updated = this.store.updateChatMessage(message.message_id, {
+          commandId: created.command_id,
+          content: busy ? `${worker.name} 正在处理其他工作，你的问题已排队。` : `正在等待 ${worker.name} 本人回复。`,
+        });
+        if (!updated) throw coordinatorError('The chat reply no longer exists', 'chat_not_found', 404);
+        return { command: created, pending: updated };
+      });
+      this.notify(pending);
+      this.emit('coordinator.worker_chat.requested', { type: 'worker', id: workerId }, {
+        command_id: command.command_id,
+        payload: { message_id: user.message_id },
+      });
+      this.dispatch(command);
+    } catch (error) {
+      this.completeChat(message, {
+        status: 'failed',
+        content: `${worker.name} 的问题未能进入执行队列：${error.message}`,
+      });
+    }
+  }
+
+  acceptWorkerChat(command) {
+    const message = this.store.getChatMessageByCommand(command.command_id);
+    if (!message || message.status !== 'pending') return;
+    const workerName = this.store.getWorker(command.worker_id)?.name ?? '这位员工';
+    if (command.status !== 'succeeded' || command.outcome_unknown) {
+      this.completeChat(message, {
+        status: 'failed',
+        content: `${workerName} 未能完成回复：${command.error?.message ?? '回复结果无法确认'}。`,
+      });
+      return;
+    }
+    const content = resultText(command.result).trim();
+    if (!content) {
+      this.completeChat(message, { status: 'failed', content: `${workerName} 没有返回可显示的回复。` });
+      return;
+    }
+    this.completeChat(message, { content });
+  }
+
   sendChat({ message, requestId, mentions }) {
     const { worker } = this.configuredWorker();
     const content = text(message, 'message', { max: 20000 });
@@ -781,7 +894,7 @@ export class Coordinator {
     const user = this.store.createChatMessage({ role: 'user', content, requestId: normalizedRequestId, mentions: normalizedMentions });
     const sourceKey = `chat-reply:${user.message_id}`;
     const existing = this.store.getChatMessageBySourceKey(sourceKey);
-    if (existing) return { user, message: existing };
+    if (existing) return { user, message: this.presentChatMessage(existing) };
     let reply = this.store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey, mentions: user.mentions });
     try {
       const command = this.store.createCommand({
@@ -799,7 +912,7 @@ export class Coordinator {
         payload: { message_id: user.message_id },
       });
       this.dispatch(command);
-      return { user, message: reply };
+      return { user, message: this.presentChatMessage(reply) };
     } catch (error) {
       if (!reply.command_id) {
         this.completeChat(reply, {
@@ -874,7 +987,9 @@ export class Coordinator {
     try {
       const { action } = response;
       if (action.type === 'chat') {
-        this.completeChat(message, { content: response.reply });
+        const workerIds = this.mentionedWorkerIds(message);
+        if (workerIds.length === 1) this.startWorkerChat(message, workerIds[0]);
+        else this.completeChat(message, { content: response.reply });
         return;
       }
       if (action.type === 'start') {
@@ -959,7 +1074,8 @@ export class Coordinator {
   }
 
   chat() {
-    return this.store.listChatMessages({ epoch: this.store.conversationEpoch() });
+    return this.store.listChatMessages({ epoch: this.store.conversationEpoch() })
+      .map((message) => this.presentChatMessage(message));
   }
 
   listForConnector(connectorId) {

@@ -81,8 +81,8 @@ export class ConnectorStore {
     await this.save();
   }
 
-  listWorkers() {
-    return structuredClone(this.state.workers);
+  listWorkers({ includeRetired = false } = {}) {
+    return structuredClone(this.state.workers.filter((worker) => includeRetired || !worker.retired_at));
   }
 
   getWorker(workerId) {
@@ -103,6 +103,18 @@ export class ConnectorStore {
     else this.state.workers[index] = { ...this.state.workers[index], ...structuredClone(worker) };
     await this.save();
     return this.getWorker(worker.worker_id);
+  }
+
+  async retireWorker(workerId, { retiredAt = timestamp() } = {}) {
+    const worker = this.state.workers.find((item) => item.worker_id === workerId);
+    if (!worker) return null;
+    if (!worker.retired_at) {
+      worker.retired_at = retiredAt;
+      worker.work_state = 'idle';
+      worker.current_task_id = null;
+      await this.save();
+    }
+    return this.getWorker(workerId);
   }
 
   async updateDriverState(workerId, driverState) {

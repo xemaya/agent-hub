@@ -46,7 +46,8 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 6);
+  assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'conversation_epoch'));
   const migrated = store.getOrchestration('orch_legacy');

@@ -14,9 +14,11 @@ function scriptedDriver() {
     review: null,
     chat: null,
     chatGate: null,
+    workerChatGate: null,
     workGate: null,
     work: null,
     failWork: false,
+    failWorkerChat: false,
     async prepareWorker(input) {
       sequence += 1;
       return { runtime_session_id: input.runtime_session_id ?? `session-${sequence}`, driver_state: {} };
@@ -25,8 +27,10 @@ function scriptedDriver() {
       driver.executions.push({ worker: worker.name, kind: command.kind, input: command.input, command_id: command.command_id });
       await onState({ started: true });
       if (command.kind === 'coordinator_chat' && driver.chatGate) await driver.chatGate;
+      if (command.kind === 'worker_chat' && driver.workerChatGate) await driver.workerChatGate;
       if (command.kind === 'prompt' && driver.workGate) await driver.workGate;
       if (driver.failWork && command.kind === 'prompt') throw new Error('work failed');
+      if (driver.failWorkerChat && command.kind === 'worker_chat') throw new Error('worker reply failed');
       const text = command.kind === 'coordinator_plan'
         ? driver.plan
         : command.kind === 'coordinator_review'
@@ -294,6 +298,132 @@ test('Central chat answers questions without creating tasks or exposing chat to 
   const idle = await context.admin(`/api/v1/workers/${coordinator.worker_id}`);
   assert.equal(idle.payload.worker.activity.phase, 'idle');
   assert.equal(idle.payload.worker.activity.recent_result, '');
+});
+
+async function directChatReply(context, userMessageId) {
+  return waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/coordinator/chat');
+    const message = payload.messages.find((item) => item.source_key === `chat-reply:${userMessageId}`);
+    return message && message.status !== 'pending' ? message : null;
+  });
+}
+
+test('An @Worker question is answered by that Worker with context and without a new task', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  const dashboard = await context.openDashboard();
+  const referenced = await context.admin('/api/v1/tasks', {
+    method: 'POST',
+    body: {
+      title: 'Direct chat reference',
+      goal: 'DIRECT_CHAT_REFERENCE_CONTEXT',
+      context: 'Known context only',
+      acceptance: ['Existing acceptance'],
+      assignee_worker_id: worker.worker_id,
+    },
+  });
+  assert.equal(referenced.response.status, 201);
+  const referencedTask = referenced.payload.task;
+  driver.chat = JSON.stringify({ reply: '中央代答不应出现', action: { type: 'chat' } });
+  driver.work = ({ command }) => command.kind === 'worker_chat'
+    ? '这是 worker-test 本人的真实回答。'
+    : '不应执行普通任务';
+  let releaseWorkerChat;
+  driver.workerChatGate = new Promise((resolve) => { releaseWorkerChat = resolve; });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: {
+      message: '@worker-test 你能做啥？顺便看看引用任务。',
+      request_id: 'direct-worker-question',
+      mentions: [
+        { type: 'worker', id: worker.worker_id },
+        { type: 'task', id: referencedTask.task_id },
+      ],
+    },
+  });
+  assert.equal(sent.response.status, 202);
+  const execution = await waitFor(() => driver.executions.find((item) => item.kind === 'worker_chat'));
+  const sourceKey = `chat-reply:${sent.payload.user.message_id}`;
+  const pending = await waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/coordinator/chat');
+    const message = payload.messages.find((item) => item.source_key === sourceKey);
+    return message?.speaker?.type === 'worker' && message.status === 'pending' ? message : null;
+  });
+  assert.equal(pending.speaker.name, 'worker-test');
+  assert.equal(pending.command_id, execution.command_id);
+  const live = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+  assert.equal(live.payload.worker.activity.phase, 'chatting');
+  assert.equal(live.payload.worker.activity.task_title, '直接对话');
+  context.hub.coordinator.onCommandFinished(context.hub.store.getCommand(sent.payload.message.command_id));
+  assert.equal(driver.executions.filter((item) => item.kind === 'worker_chat').length, 1);
+  releaseWorkerChat();
+  const reply = await directChatReply(context, sent.payload.user.message_id);
+  assert.equal(reply.status, 'done');
+  assert.equal(reply.content, '这是 worker-test 本人的真实回答。');
+  assert.doesNotMatch(reply.content, /中央代答/);
+  assert.equal(reply.speaker.type, 'worker');
+  assert.equal(reply.speaker.worker_id, worker.worker_id);
+  assert.equal(reply.task_id, null);
+  assert.match(execution.input, /@worker-test 你能做啥/);
+  assert.match(execution.input, /DIRECT_CHAT_REFERENCE_CONTEXT/);
+  assert.deepEqual(driver.executions.map((item) => item.kind), ['coordinator_chat', 'worker_chat']);
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 1);
+  assert.equal((await context.admin('/api/v1/orchestrations')).payload.orchestrations.length, 0);
+  const idle = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+  assert.equal(idle.payload.worker.activity.phase, 'idle');
+  assert.equal(idle.payload.worker.activity.recent_result, '这是 worker-test 本人的真实回答。');
+  const updated = dashboard.messages.find((message) => (
+    message.type === 'chat.updated'
+    && message.payload.message.message_id === reply.message_id
+    && message.payload.message.status === 'done'
+  ));
+  assert.equal(updated.payload.message.speaker.name, 'worker-test');
+  const callCount = driver.executions.length;
+  await context.restartHub();
+  assert.equal(driver.executions.length, callCount);
+  await context.hub.coordinator.resume();
+  assert.equal(driver.executions.length, callCount);
+  const restored = await directChatReply(context, sent.payload.user.message_id);
+  assert.equal(restored.content, reply.content);
+  assert.equal(restored.speaker.worker_id, worker.worker_id);
+});
+
+test('Direct Worker chat reports execution failure and unknown outcomes without central substitutes', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  driver.chat = JSON.stringify({ reply: '中央代答不应出现', action: { type: 'chat' } });
+  driver.failWorkerChat = true;
+  const mentions = [{ type: 'worker', id: worker.worker_id }];
+  const failed = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: { message: '@worker-test 请回答', request_id: 'direct-worker-failure', mentions },
+  });
+  const failureReply = await directChatReply(context, failed.payload.user.message_id);
+  assert.equal(failureReply.status, 'failed');
+  assert.match(failureReply.content, /worker reply failed/);
+  assert.doesNotMatch(failureReply.content, /中央代答/);
+
+  driver.failWorkerChat = false;
+  driver.work = () => '这个内容不能作为已知结果展示';
+  let releaseWorkerChat;
+  driver.workerChatGate = new Promise((resolve) => { releaseWorkerChat = resolve; });
+  const unknown = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: { message: '@worker-test 再回答一次', request_id: 'direct-worker-unknown', mentions },
+  });
+  await waitFor(() => driver.executions.filter((item) => item.kind === 'worker_chat').length === 2);
+  const execution = driver.executions.at(-1);
+  const command = context.hub.store.finishCommand(execution.command_id, context.connector.connectorId, {
+    status: 'succeeded',
+    result: { text: '这个内容不能作为已知结果展示' },
+    outcomeUnknown: true,
+  });
+  context.hub.coordinator.onCommandFinished(command);
+  releaseWorkerChat();
+  const unknownReply = await directChatReply(context, unknown.payload.user.message_id);
+  assert.equal(unknownReply.status, 'failed');
+  assert.match(unknownReply.content, /回复结果无法确认/);
+  assert.doesNotMatch(unknownReply.content, /这个内容不能作为已知结果展示|中央代答/);
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 0);
+  assert.equal((await context.admin('/api/v1/orchestrations')).payload.orchestrations.length, 0);
 });
 
 test('Chat planning stays ready, then starts the same plan and reports real completion', async (t) => {

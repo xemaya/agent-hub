@@ -246,6 +246,10 @@ export class Connector {
       await this.receiveCommand(message.payload.command);
       return;
     }
+    if (message.type === 'worker.unregistered') {
+      await this.applyWorkerRetirement(message.payload.worker);
+      return;
+    }
     if (message.type === 'error') {
       throw new Error(message.payload?.error ?? 'Hub error');
     }
@@ -430,6 +434,21 @@ export class Connector {
     return worker;
   }
 
+  async applyWorkerRetirement(worker) {
+    const existing = this.store.getWorker(worker.worker_id);
+    if (!existing) return this.store.upsertWorker({ ...worker, driver_state: {} });
+    return this.store.retireWorker(worker.worker_id, { retiredAt: worker.retired_at ?? undefined });
+  }
+
+  async unregisterCurrent(input) {
+    await this.whenReady();
+    const runtime = typeof input.runtime === 'string' ? input.runtime.trim() : '';
+    const sessionId = typeof input.runtime_session_id === 'string' ? input.runtime_session_id.trim() : '';
+    if (!runtime || !sessionId) throw localError('runtime and runtime_session_id are required');
+    const response = await this.request('worker.unregister', { runtime, runtime_session_id: sessionId });
+    return this.applyWorkerRetirement(response.worker);
+  }
+
   validateLocalRequest(request) {
     const host = request.headers.host;
     try {
@@ -519,6 +538,12 @@ export class Connector {
     }
     if (request.method === 'GET' && url.pathname === '/local/v1/workers') {
       sendJson(response, 200, { workers: this.store.listWorkers() });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/local/v1/workers/unregister-current') {
+      const body = await readJsonBody(request);
+      const worker = await this.unregisterCurrent(body);
+      sendJson(response, 200, { worker });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/local/v1/workers/register') {

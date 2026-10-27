@@ -39,6 +39,7 @@ function workerView(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_seen_at: row.last_seen_at,
+    retired_at: row.retired_at ?? null,
   };
 }
 
@@ -187,6 +188,7 @@ export class HubStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
+        retired_at TEXT,
         UNIQUE(connector_id, runtime, runtime_session_id)
       );
       CREATE TABLE IF NOT EXISTS tasks (
@@ -296,10 +298,14 @@ export class HubStore {
     if (!chatColumns.has('conversation_epoch')) {
       this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN conversation_epoch INTEGER NOT NULL DEFAULT 0');
     }
+    const workerColumns = new Set(this.db.prepare('PRAGMA table_info(workers)').all().map((column) => column.name));
+    if (!workerColumns.has('retired_at')) {
+      this.db.exec('ALTER TABLE workers ADD COLUMN retired_at TEXT');
+    }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
-      PRAGMA user_version = 5;
+      PRAGMA user_version = 6;
     `);
   }
 
@@ -375,7 +381,7 @@ export class HubStore {
         name = excluded.name, mode = excluded.mode, capabilities_json = excluded.capabilities_json,
         cwd = excluded.cwd, metadata_json = excluded.metadata_json,
         push_capable = excluded.push_capable, updated_at = excluded.updated_at,
-        last_seen_at = excluded.last_seen_at
+        last_seen_at = excluded.last_seen_at, retired_at = NULL
     `).run(
       workerId,
       connectorId,
@@ -402,8 +408,51 @@ export class HubStore {
     return workerView(this.db.prepare(`${WORKER_SELECT} WHERE w.worker_id = ? AND w.connector_id = ?`).get(workerId, connectorId));
   }
 
-  listWorkers() {
-    return this.db.prepare(`${WORKER_SELECT} ORDER BY w.created_at DESC, w.rowid DESC`).all().map(workerView);
+  getWorkerBySession(connectorId, runtime, sessionId) {
+    return workerView(this.db.prepare(`${WORKER_SELECT} WHERE w.connector_id = ? AND w.runtime = ? AND w.runtime_session_id = ?`).get(connectorId, runtime, sessionId));
+  }
+
+  listWorkers({ includeRetired = false } = {}) {
+    const where = includeRetired ? '' : 'WHERE w.retired_at IS NULL';
+    return this.db.prepare(`${WORKER_SELECT} ${where} ORDER BY w.created_at DESC, w.rowid DESC`).all().map(workerView);
+  }
+
+  retireWorker(workerId, { connectorId = null } = {}) {
+    return this.transaction(() => {
+      const worker = this.getWorker(workerId);
+      if (!worker || (connectorId && worker.connector_id !== connectorId)) return null;
+      if (worker.retired_at) return worker;
+      const fail = (message, code) => {
+        const error = new Error(message);
+        error.code = code;
+        error.statusCode = 409;
+        throw error;
+      };
+      const config = this.getCoordinatorConfig();
+      if (config.enabled && config.worker_id === workerId) {
+        fail('The active Coordinator cannot be retired', 'worker_coordinator_active');
+      }
+      const activeCommands = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM commands
+        WHERE worker_id = ? AND status IN ('queued', 'accepted', 'running', 'waiting_manual')
+      `).get(workerId).count;
+      const activeTasks = this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE assignee_worker_id = ? AND status = 'in_progress'").get(workerId).count;
+      const activeSteps = this.listOrchestrations().filter((orchestration) => (
+        ['ready', 'planning', 'in_progress'].includes(orchestration.status)
+        || (orchestration.status === 'review' && !orchestration.error)
+      )).flatMap((orchestration) => (
+        orchestration.steps.filter((step) => step.worker_id === workerId && !['done', 'blocked'].includes(step.status))
+      ));
+      if (activeCommands || activeTasks || activeSteps.length) {
+        fail('Worker has active work and cannot be retired', 'worker_active_work');
+      }
+      const timestamp = now();
+      this.db.prepare(`
+        UPDATE workers SET retired_at = ?, work_state = 'idle', current_task_id = NULL, updated_at = ?
+        WHERE worker_id = ?
+      `).run(timestamp, timestamp, workerId);
+      return this.getWorker(workerId);
+    });
   }
 
   updateWorkerStatus(connectorId, workerId, { work_state: workState, current_task_id: currentTaskId }) {
@@ -505,6 +554,13 @@ export class HubStore {
   }
 
   createCommand(data) {
+    const worker = this.getWorker(data.worker_id);
+    if (worker?.retired_at) {
+      const error = new Error('Retired Workers cannot receive new commands');
+      error.code = 'worker_retired';
+      error.statusCode = 409;
+      throw error;
+    }
     const timestamp = now();
     const commandId = createId('cmd');
     const status = data.push_capable ? 'queued' : 'waiting_manual';

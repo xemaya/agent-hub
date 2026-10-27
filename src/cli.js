@@ -16,6 +16,8 @@ Usage:
                             [--capabilities a,b] [--metadata JSON]
   agent-hub worker register-current [--name NAME] [--cwd DIR] [--mode managed|external]
                                     [--capabilities a,b] [--metadata JSON]
+  agent-hub worker unregister WORKER_ID
+  agent-hub worker unregister-current
   agent-hub worker list
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
@@ -202,42 +204,65 @@ async function startConnector(flags) {
   await waitForSignal(() => connector.close());
 }
 
+function currentSessionIdentity({ runtime = null, sessionId = null, operation = 'register-current' } = {}) {
+  const launcherRuntime = process.env.AGENT_HUB_RUNTIME;
+  const launcherSessionId = process.env.AGENT_HUB_SESSION_ID;
+  const codexSessionId = process.env.CODEX_SESSION_ID;
+  const currentRuntime = launcherRuntime ?? (codexSessionId ? 'codex' : null);
+  if (!currentRuntime || !SESSION_RUNTIMES.includes(currentRuntime)) {
+    throw new Error('Current Session identity is unavailable; start with agent-hub session start');
+  }
+  if (sessionId) throw new Error(`${operation} uses verified runtime identity; do not pass --session-id`);
+  if (runtime && runtime !== currentRuntime) {
+    throw new Error(`Current Session runtime is ${currentRuntime}, not ${runtime}`);
+  }
+  let currentSessionId;
+  if (currentRuntime === 'codex') {
+    if (!codexSessionId) {
+      throw new Error('Codex native Session identity is unavailable; run this command from a Codex tool');
+    }
+    if (launcherSessionId && launcherSessionId !== codexSessionId) {
+      throw new Error('Codex native Session ID does not match the launcher identity');
+    }
+    currentSessionId = codexSessionId;
+  } else {
+    if (!launcherSessionId) {
+      throw new Error('Current Session identity is unavailable; start with agent-hub session start');
+    }
+    currentSessionId = launcherSessionId;
+  }
+  return {
+    runtime: currentRuntime,
+    sessionId: currentSessionId,
+    origin: launcherRuntime ? 'agent-hub-session-launcher' : 'codex-native-runtime',
+  };
+}
+
 async function workerCommand(positionals, flags) {
   const action = positionals[0];
+  if (action === 'unregister-current') {
+    const identity = currentSessionIdentity({ runtime: flags.runtime, sessionId: flags['session-id'], operation: action });
+    print(await localRequest(flags, '/local/v1/workers/unregister-current', {
+      method: 'POST',
+      body: { runtime: identity.runtime, runtime_session_id: identity.sessionId },
+    }));
+    return;
+  }
+  if (action === 'unregister' && positionals[1]) {
+    print(await adminRequest(flags, `/api/v1/workers/${encodeURIComponent(positionals[1])}`, { method: 'DELETE' }));
+    return;
+  }
   if (['register', 'register-current'].includes(action)) {
     const metadata = flags.metadata ? JSON.parse(flags.metadata) : {};
     let runtime = flags.runtime;
     let sessionId = flags['session-id'];
     if (action === 'register-current') {
-      const launcherRuntime = process.env.AGENT_HUB_RUNTIME;
-      const launcherSessionId = process.env.AGENT_HUB_SESSION_ID;
-      const codexSessionId = process.env.CODEX_SESSION_ID;
-      const currentRuntime = launcherRuntime ?? (codexSessionId ? 'codex' : null);
-      if (!currentRuntime || !SESSION_RUNTIMES.includes(currentRuntime)) {
-        throw new Error('Current Session identity is unavailable; start with agent-hub session start');
-      }
-      if (sessionId) throw new Error('register-current uses verified runtime identity; do not pass --session-id');
-      if (runtime && runtime !== currentRuntime) {
-        throw new Error(`Current Session runtime is ${currentRuntime}, not ${runtime}`);
-      }
-      if (currentRuntime === 'codex') {
-        if (!codexSessionId) {
-          throw new Error('Codex native Session identity is unavailable; run this command from a Codex tool');
-        }
-        if (launcherSessionId && launcherSessionId !== codexSessionId) {
-          throw new Error('Codex native Session ID does not match the launcher identity');
-        }
-        sessionId = codexSessionId;
-      } else {
-        if (!launcherSessionId) {
-          throw new Error('Current Session identity is unavailable; start with agent-hub session start');
-        }
-        sessionId = launcherSessionId;
-      }
-      runtime = currentRuntime;
+      const identity = currentSessionIdentity({ runtime, sessionId, operation: action });
+      runtime = identity.runtime;
+      sessionId = identity.sessionId;
       Object.assign(metadata, {
         interactive: true,
-        session_origin: launcherRuntime ? 'agent-hub-session-launcher' : 'codex-native-runtime',
+        session_origin: identity.origin,
       });
     }
     print(await localRequest(flags, '/local/v1/workers/register', {
@@ -265,7 +290,7 @@ async function workerCommand(positionals, flags) {
     }));
     return;
   }
-  throw new Error('Usage: agent-hub worker register|register-current|list|status');
+  throw new Error('Usage: agent-hub worker register|register-current|unregister|unregister-current|list|status');
 }
 
 async function sessionCommand(positionals, flags, runtimeArgs) {

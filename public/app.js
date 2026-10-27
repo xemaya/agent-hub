@@ -545,6 +545,17 @@ function messageContent(message) {
 }
 
 function pendingMessageLabel(message) {
+  if (message.speaker?.type === 'worker') {
+    const worker = state.workers.find((item) => item.worker_id === message.speaker.worker_id);
+    const name = message.speaker.name;
+    if (worker?.presence === 'offline') return `等待 ${name} 上线`;
+    const activity = worker?.activity;
+    if (activity && !['idle', 'offline'].includes(activity.phase) && activity.command_id !== message.command_id) {
+      return `${name} 正在忙，你的问题已排队`;
+    }
+    if (['queued', 'accepted'].includes(activity?.command_status)) return `${name} 已收到问题，等待本人回复`;
+    return `正在等待 ${name} 本人回复`;
+  }
   const worker = state.workers.find((item) => item.worker_id === state.coordinator?.worker_id);
   const presence = worker?.presence ?? state.coordinator?.worker?.presence;
   if (presence === 'offline') return '等待中央大脑上线';
@@ -589,7 +600,7 @@ function renderChat(forceScroll = false) {
       const failed = message.status === 'failed';
       content = `
         <article class="chat-message ${own ? 'own' : 'assistant'} ${pending ? 'pending' : ''} ${failed ? 'failed' : ''}">
-          <p class="message-meta">${own ? '你' : '中央大脑'} · ${escapeHtml(time(message.created_at))}</p>
+          <p class="message-meta">${own ? '你' : escapeHtml(message.speaker?.name ?? '中央大脑')} · ${escapeHtml(time(message.created_at))}</p>
           ${pending
             ? `<div class="thinking"><i></i><i></i><i></i><span>${escapeHtml(pendingMessageLabel(message))}</span></div>`
             : `<p class="message-content">${escapeHtml(message.content)}</p>`}
@@ -795,11 +806,27 @@ function connectSocket() {
       scheduleRefresh();
       return;
     }
+    if (message.type === 'worker.unregistered') {
+      const workerId = message.payload.worker.worker_id;
+      state.workers = state.workers.filter((worker) => worker.worker_id !== workerId);
+      for (const mention of state.mentions.filter((item) => item.type === 'worker' && item.id === workerId)) {
+        removeMention('worker', workerId);
+      }
+      renderWorkers();
+      renderCoordinator();
+      renderChat();
+      renderMentionPicker();
+      return;
+    }
     if (message.type === 'worker.updated') {
       const worker = message.payload.worker;
-      const index = state.workers.findIndex((item) => item.worker_id === worker.worker_id);
-      if (index === -1) state.workers.push(worker);
-      else state.workers[index] = worker;
+      if (worker.retired_at) {
+        state.workers = state.workers.filter((item) => item.worker_id !== worker.worker_id);
+      } else {
+        const index = state.workers.findIndex((item) => item.worker_id === worker.worker_id);
+        if (index === -1) state.workers.push(worker);
+        else state.workers[index] = worker;
+      }
       renderWorkers();
       renderCoordinator();
       renderChat();

@@ -164,6 +164,27 @@ Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Agent 会执行 `worker
 
 当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`：Claude/Codex 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt；Kimi CLI 与 Web Server 对同一 Session 有排他占用，不能用第二个 Web Server 接管当前 CLI 窗口，当前交互主动推送需要后续的共享 Web/ACP 桥接。
 
+#### 方式 A+：让中控直接把任务推进打开的 Claude 窗口
+
+Claude Code 可以加 `--push` 打开，中控派来的任务和 @ 提问会直接出现在这个交互窗口里，Claude 做完后把结果交回中控：
+
+```bash
+agent-hub session start --runtime claude --push --cwd /path/to/project
+# 带着已有上下文重新打开某个 Claude Session：
+agent-hub session start --runtime claude --push --resume <session-id> --cwd /path/to/project
+```
+
+1. 启动时 Claude Code 会显示开发版 channel 的警告，选择 **I am using this for local development**。横幅里的 `no MCP server configured with that name` 可以忽略，消息照常送达。
+2. 在窗口里按方式 A 注册为 external（`/agent-hub 把当前 Session 注册到 Agent Hub，职责是……`）；已注册过的 Session 再次打开会自动接通。
+3. 窗口接通期间，该员工在中控显示为「交互会话 · 已接通」，可以 @ 和直接派活；关掉窗口后自动退回人工协作，新命令重新变成 `waiting_manual`。
+
+送达的消息在终端显示为 `← agent-hub: …`，Claude 用 `agent_hub_ack` 和 `agent_hub_report` 两个工具回执（启动器已放行这两个工具，不会弹确认）。你在终端里可以随时插话或改方向。限制：
+
+- 这是 Claude Code 的研究预览功能，需要 claude.ai 或 Console 登录；Team/Enterprise 组织要由管理员开启 Channels。每次启动都会弹一次开发版警告。
+- 任务执行中关闭窗口，命令记为 `failed` 且 `outcome_unknown=true`，不会自动重跑。
+- 工具权限确认仍只在终端里出现，暂未转到中控；中央大脑的自动拆解只派给 managed 员工，不会自动往你的交互窗口塞步骤。
+- 只支持 Claude。Kimi 需要共享 Web/ACP 桥接，Codex 需要 app-server 适配，后续再做。
+
 未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 
 #### 方式 B：另建独立 managed Worker

@@ -161,6 +161,11 @@ function validateReview(value, steps) {
   return { parentPass: value.parent_pass, reason, verdicts };
 }
 
+// managed Workers, or external ones while their interactive channel is attached.
+function canReceivePush(worker) {
+  return Boolean(worker && !worker.retired_at && worker.push_capable && worker.presence === 'online');
+}
+
 function resultText(result) {
   if (typeof result?.text === 'string') return result.text;
   return result == null ? '' : JSON.stringify(result);
@@ -254,8 +259,8 @@ export class Coordinator {
       if (item.type === 'worker') {
         const worker = this.store.getWorker(id);
         if (!worker) throw coordinatorError('Mentioned Worker does not exist', 'mention_worker_not_found', 404);
-        if (worker.worker_id === coordinatorWorkerId || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
-          throw coordinatorError('Mentioned Worker must be an online, managed execution Worker', 'mention_worker_unavailable', 409);
+        if (worker.worker_id === coordinatorWorkerId || !canReceivePush(worker)) {
+          throw coordinatorError('Mentioned Worker must be online and able to receive pushed work', 'mention_worker_unavailable', 409);
         }
       } else if (!this.store.getTask(id)) {
         throw coordinatorError('Mentioned Task does not exist', 'mention_task_not_found', 404);
@@ -815,7 +820,7 @@ export class Coordinator {
       this.completeChat(message, { status: 'failed', content: '没有找到要转交的原问题，请重新发送。' });
       return;
     }
-    if (!worker || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
+    if (!canReceivePush(worker)) {
       this.completeChat(message, {
         status: 'failed',
         content: `${worker?.name ?? '这位员工'}当前不在线或不能主动接收问题，没有创建任务。`,

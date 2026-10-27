@@ -294,8 +294,8 @@ function renderInlineTask(taskId) {
 }
 
 function canMentionWorker(worker) {
-  return worker.mode === 'managed'
-    && worker.push_capable
+  return worker.push_capable
+    && !worker.retired_at
     && worker.presence === 'online'
     && worker.worker_id !== state.coordinator?.worker_id;
 }
@@ -654,7 +654,7 @@ function renderWorkers() {
     const liveKey = `live-${worker.worker_id}`;
     const recentKey = `recent-${worker.worker_id}`;
     const description = worker.metadata?.description || '暂无简介';
-    const mentionHint = canMention ? `@ ${worker.name}` : worker.mode === 'external' ? '人工协作' : '当前不可主动派单';
+    const mentionHint = canMention ? `@ ${worker.name}` : worker.mode === 'external' ? '人工协作（会话未接通）' : '当前不可主动派单';
     return `
       <details class="worker-row ${active ? 'is-working' : ''}" data-worker-card="${escapeHtml(worker.worker_id)}" ${expanded.get(worker.worker_id) ? 'open' : ''}>
         <summary class="worker-summary">
@@ -666,7 +666,7 @@ function renderWorkers() {
           <button class="worker-mention" type="button" data-mention-worker="${escapeHtml(worker.worker_id)}" title="${escapeHtml(mentionHint)}" aria-label="${escapeHtml(mentionHint)}" ${canMention ? '' : 'disabled'}>@</button>
         </summary>
         <div class="worker-details">
-          <p class="worker-runtime">${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${worker.mode === 'external' ? '人工协作' : '可主动调度'}</p>
+          <p class="worker-runtime">${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${worker.mode === 'external' ? (worker.push_capable ? '交互会话 · 已接通' : '人工协作') : '可主动调度'}</p>
           <div class="capabilities">${worker.capabilities.map((capability) => `<span>${escapeHtml(capability)}</span>`).join('')}</div>
           ${active ? `<div class="worker-current">
             <strong>${escapeHtml(activity.task_title ?? activity.detail)}</strong>

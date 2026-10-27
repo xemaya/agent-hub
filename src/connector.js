@@ -7,6 +7,7 @@ import { createId } from './ids.js';
 import { readJsonBody, sendJson } from './json.js';
 import { createDefaultDrivers } from './drivers/index.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
+import { commandPrompt } from './drivers/prompt.js';
 
 function deferred() {
   const state = { settled: false };
@@ -70,6 +71,10 @@ export class Connector {
     this.checkedHubCommits = new Set();
     this.onRestartRequested = options.onRestartRequested ?? null;
     this.restartRequested = false;
+    // Interactive channels: worker_id -> { response, deliveries }, plus streams whose Session is not registered yet.
+    this.channels = new Map();
+    this.pendingChannels = new Set();
+    this.channelKeepaliveMs = options.channelKeepaliveMs ?? 15000;
     this.localServer = createServer((request, response) => {
       this.handleLocalRequest(request, response).catch((error) => {
         sendJson(response, error.statusCode ?? 500, { error: error.message ?? 'Internal server error' });
@@ -317,6 +322,7 @@ export class Connector {
       this.hubBuild = message.payload?.hub ?? null;
       this.readyState.resolve(message.payload);
       this.checkHubVersion();
+      await this.syncChannels();
       await this.syncAndPump();
       return;
     }
@@ -357,6 +363,113 @@ export class Connector {
     this.onRestartRequested?.();
   }
 
+  writeChannelEvent(channel, event) {
+    channel.response.write(`data: ${JSON.stringify(event)}\n\n`);
+  }
+
+  openChannel(request, response, { runtime, sessionId }) {
+    if (!runtime || !sessionId) throw localError('runtime and session_id are required');
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    const channel = { runtime, sessionId, response, workerId: null, deliveries: new Map() };
+    const keepalive = setInterval(() => response.write(': keepalive\n\n'), this.channelKeepaliveMs);
+    keepalive.unref();
+    response.on('close', () => {
+      clearInterval(keepalive);
+      this.closeChannel(channel).catch((error) => this.logger.error?.(error));
+    });
+    this.pendingChannels.add(channel);
+    this.adoptPendingChannels();
+    if (this.pendingChannels.has(channel)) this.writeChannelEvent(channel, { type: 'waiting_registration' });
+  }
+
+  adoptPendingChannels() {
+    for (const channel of this.pendingChannels) {
+      const worker = this.store.getWorkerBySession(channel.runtime, channel.sessionId);
+      if (!worker || worker.retired_at) continue;
+      if (worker.mode !== 'external') {
+        this.pendingChannels.delete(channel);
+        this.writeChannelEvent(channel, { type: 'rejected', reason: 'managed Workers run headless; register this Session as external' });
+        channel.response.end();
+        continue;
+      }
+      this.pendingChannels.delete(channel);
+      const previous = this.channels.get(worker.worker_id);
+      if (previous && previous !== channel) previous.response.end();
+      channel.workerId = worker.worker_id;
+      this.channels.set(worker.worker_id, channel);
+      this.writeChannelEvent(channel, { type: 'attached', worker_id: worker.worker_id, name: worker.name });
+      this.announceChannel(worker.worker_id, true).catch((error) => this.logger.error?.(error));
+      this.scheduleWorker(worker.worker_id);
+    }
+  }
+
+  async closeChannel(channel) {
+    this.pendingChannels.delete(channel);
+    if (!channel.workerId || this.channels.get(channel.workerId) !== channel) return;
+    this.channels.delete(channel.workerId);
+    for (const delivery of channel.deliveries.values()) {
+      delivery.reject(Object.assign(new Error('Interactive session closed before reporting a result'), {
+        code: 'channel_closed',
+        outcomeUnknown: true,
+      }));
+    }
+    channel.deliveries.clear();
+    if (!this.stopping) await this.announceChannel(channel.workerId, false);
+  }
+
+  async announceChannel(workerId, attached) {
+    if (!this.ready) return;
+    await this.request('worker.channel', { worker_id: workerId, attached }).catch((error) => {
+      this.logger.error?.(`Channel state for ${workerId} not recorded: ${error.message}`);
+    });
+  }
+
+  // Tells the Hub which external Workers are live after every (re)connect.
+  async syncChannels() {
+    for (const worker of this.store.listWorkers()) {
+      if (worker.mode !== 'external') continue;
+      await this.announceChannel(worker.worker_id, this.channels.has(worker.worker_id));
+    }
+  }
+
+  deliverToChannel(channel, command) {
+    return new Promise((resolve, reject) => {
+      channel.deliveries.set(command.command_id, { resolve, reject });
+      this.writeChannelEvent(channel, {
+        type: 'command',
+        command_id: command.command_id,
+        task_id: command.task_id ?? command.task?.task_id ?? null,
+        kind: command.kind,
+        content: commandPrompt(command),
+      });
+      this.emitOutput(command.command_id, '[delivered to the interactive session]\n');
+    });
+  }
+
+  handleChannelCall(commandId, action, body) {
+    const channel = [...this.channels.values()].find((item) => item.deliveries.has(commandId));
+    if (!channel) throw localError('No interactive delivery is waiting for this command', 404);
+    if (action === 'ack') {
+      this.emitOutput(commandId, '[accepted by the interactive session]\n');
+      return { ok: true };
+    }
+    if (!['succeeded', 'failed'].includes(body.status)) throw localError('status must be succeeded or failed');
+    const text = typeof body.result === 'string' ? body.result : '';
+    const delivery = channel.deliveries.get(commandId);
+    channel.deliveries.delete(commandId);
+    if (text) this.emitOutput(commandId, `${text}\n`);
+    if (body.status === 'succeeded') {
+      delivery.resolve({ text, session_id: channel.sessionId, delivery: 'channel' });
+    } else {
+      delivery.reject(Object.assign(new Error(text || 'Interactive session reported failure'), { code: 'reported_failure' }));
+    }
+    return { ok: true };
+  }
+
   async syncAndPump() {
     for (const command of this.store.listCommands()) {
       this.send('command.sync', {
@@ -395,11 +508,17 @@ export class Connector {
     });
   }
 
+  canRun(worker) {
+    return Boolean(worker && (this.channels.has(worker.worker_id) || (worker.mode === 'managed' && this.drivers[worker.runtime])));
+  }
+
   async pumpWorker(workerId) {
     try {
       const command = this.store.nextAcceptedCommand(workerId);
       if (!command || this.stopping) return;
       const worker = this.store.getWorker(workerId);
+      // An external Worker's commands wait here until its interactive channel attaches.
+      if (worker && worker.mode === 'external' && !this.channels.has(workerId)) return;
       if (!worker) {
         const failed = await this.store.updateCommand(command.command_id, {
           status: 'failed',
@@ -412,8 +531,9 @@ export class Connector {
       this.send('command.started', { command_id: command.command_id });
       try {
         const driver = this.drivers[worker.runtime];
-        if (worker.mode !== 'managed' || !driver) throw new Error(`No managed driver for ${worker.runtime}`);
-        const result = await driver.execute({
+        const channel = this.channels.get(workerId);
+        if (!channel && (worker.mode !== 'managed' || !driver)) throw new Error(`No managed driver for ${worker.runtime}`);
+        const result = channel ? await this.deliverToChannel(channel, command) : await driver.execute({
           worker,
           command,
           onOutput: (chunk) => this.emitOutput(command.command_id, chunk),
@@ -438,12 +558,15 @@ export class Connector {
               status: 'failed',
               error: normalizeError(error),
               result: null,
+              ...(error.outcomeUnknown ? { outcome_unknown: true } : {}),
             });
         this.send('command.finished', finished);
       }
     } finally {
       this.activeWorkers.delete(workerId);
-      if (!this.stopping && this.store.nextAcceptedCommand(workerId)) this.scheduleWorker(workerId);
+      if (!this.stopping && this.store.nextAcceptedCommand(workerId) && this.canRun(this.store.getWorker(workerId))) {
+        this.scheduleWorker(workerId);
+      }
       this.maybeRestart();
     }
   }
@@ -534,7 +657,9 @@ export class Connector {
       ...response.worker,
       driver_state: driverState,
     });
-    return worker;
+    this.adoptPendingChannels();
+    if (this.channels.has(worker.worker_id)) await this.announceChannel(worker.worker_id, true);
+    return this.store.getWorker(worker.worker_id);
   }
 
   async applyWorkerRetirement(worker) {
@@ -674,6 +799,19 @@ export class Connector {
       sendJson(response, 202, { ok: true });
       return;
     }
+    if (request.method === 'GET' && url.pathname === '/local/v1/channel') {
+      this.openChannel(request, response, {
+        runtime: url.searchParams.get('runtime') ?? '',
+        sessionId: url.searchParams.get('session_id') ?? '',
+      });
+      return;
+    }
+    const channelMatch = /^\/local\/v1\/channel\/commands\/([^/]+)\/(ack|report)$/.exec(url.pathname);
+    if (request.method === 'POST' && channelMatch) {
+      const body = await readJsonBody(request);
+      sendJson(response, 200, this.handleChannelCall(channelMatch[1], channelMatch[2], body));
+      return;
+    }
     sendJson(response, 404, { error: 'Not found' });
   }
 
@@ -684,6 +822,7 @@ export class Connector {
     this.reconnectTimer = null;
     clearInterval(this.watchdogTimer);
     this.watchdogTimer = null;
+    for (const channel of [...this.channels.values(), ...this.pendingChannels]) channel.response.end();
     await this.store.failRunningCommands();
     if (this.ws) this.ws.close(1000, 'Connector shutting down');
     for (const { reject, timer } of this.pendingRequests.values()) {

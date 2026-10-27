@@ -6,6 +6,7 @@ import { SESSION_RUNTIMES, startSession } from './session-launcher.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
 import { selfUpdate } from './updater.js';
 import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
+import { ChannelServer } from './channel.js';
 
 const HELP = `Agent Hub
 
@@ -18,6 +19,8 @@ Usage:
   agent-hub service uninstall|status
   agent-hub update
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
+  agent-hub session start --runtime claude --push [--resume SESSION_ID] [--data-dir DIR]
+  agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
                             [--capabilities a,b] [--metadata JSON]
@@ -48,7 +51,7 @@ Environment:
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -360,11 +363,36 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
     runtime: flags.runtime,
     cwd: flags.cwd ?? process.cwd(),
     runtimeArgs,
+    push: flags.push === true,
+    resumeSessionId: typeof flags.resume === 'string' ? flags.resume : undefined,
+    dataDir: flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'),
+    connectorUrl: flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL,
     onReady({ runtime, sessionId }) {
       console.error(`Agent Hub session ready: ${runtime}${sessionId ? ` ${sessionId}` : ''}`);
     },
   });
   process.exitCode = result.exitCode;
+}
+
+// stdout carries MCP JSON-RPC, so everything human-readable goes to stderr.
+async function channelCommand(flags) {
+  const runtime = flags.runtime ?? process.env.AGENT_HUB_RUNTIME;
+  const sessionId = flags['session-id'] ?? process.env.AGENT_HUB_SESSION_ID;
+  if (!runtime || !sessionId) throw new Error('channel needs AGENT_HUB_RUNTIME and AGENT_HUB_SESSION_ID');
+  const options = await localOptions({
+    ...flags,
+    'data-dir': flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'),
+  });
+  const server = new ChannelServer({
+    connectorUrl: options.baseUrl,
+    token: options.token,
+    runtime,
+    sessionId,
+    logger: { error: (message) => console.error(message) },
+  });
+  await server.start();
+  await new Promise((resolve) => process.stdin.once('close', resolve));
+  server.stop();
 }
 
 async function taskCommand(positionals, flags) {
@@ -448,6 +476,10 @@ export async function run(argv) {
   }
   if (command === 'connector') {
     await startConnector(flags);
+    return;
+  }
+  if (command === 'channel') {
+    await channelCommand(flags);
     return;
   }
   if (command === 'service') {

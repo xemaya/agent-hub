@@ -472,6 +472,16 @@ export class HubStore {
     return this.getWorker(workerId);
   }
 
+  // Only external Workers toggle: they can receive pushes while an interactive channel is attached.
+  setWorkerChannel(connectorId, workerId, attached) {
+    const worker = this.getWorkerForConnector(workerId, connectorId);
+    if (!worker || worker.mode !== 'external') return null;
+    const timestamp = now();
+    this.db.prepare('UPDATE workers SET push_capable = ?, updated_at = ?, last_seen_at = ? WHERE worker_id = ?')
+      .run(attached ? 1 : 0, timestamp, timestamp, workerId);
+    return this.getWorker(workerId);
+  }
+
   insertTask(data, taskId, timestamp) {
     this.db.prepare(`
       INSERT INTO tasks (

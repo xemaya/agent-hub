@@ -1,9 +1,32 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { KimiDriver } from './drivers/kimi.js';
+import { PROJECT_ROOT } from './build-info.js';
+import { CHANNEL_SERVER_NAME, CHANNEL_TOOLS } from './channel.js';
 
 export const SESSION_RUNTIMES = ['claude', 'kimi', 'codex'];
+
+// Writes the MCP config that lets Claude Code spawn the Agent Hub channel for this Session.
+async function writeChannelConfig({ dataDir, sessionId, connectorUrl, nodePath = process.execPath }) {
+  const directory = path.join(dataDir, 'channels');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, `${sessionId}.json`);
+  const args = [path.join(PROJECT_ROOT, 'bin/agent-hub.js'), 'channel', '--data-dir', dataDir];
+  if (connectorUrl) args.push('--connector-url', connectorUrl);
+  const config = {
+    mcpServers: {
+      [CHANNEL_SERVER_NAME]: {
+        command: nodePath,
+        args,
+        env: { AGENT_HUB_RUNTIME: 'claude', AGENT_HUB_SESSION_ID: sessionId },
+      },
+    },
+  };
+  await writeFile(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  return file;
+}
 
 export async function prepareSessionLaunch(options = {}) {
   const runtime = options.runtime;
@@ -19,10 +42,30 @@ export async function prepareSessionLaunch(options = {}) {
   let executable;
   let args;
   let driver = null;
+  if ((options.push || options.resumeSessionId) && runtime !== 'claude') {
+    const error = new Error('--push and --resume are only supported for claude');
+    error.code = 'unsupported_session_option';
+    throw error;
+  }
   if (runtime === 'claude') {
-    sessionId = randomUUID();
+    sessionId = options.resumeSessionId ?? randomUUID();
     executable = 'claude';
-    args = ['--session-id', sessionId, ...runtimeArgs];
+    args = [];
+    if (options.push) {
+      const configFile = await writeChannelConfig({
+        dataDir: path.resolve(options.dataDir),
+        sessionId,
+        connectorUrl: options.connectorUrl,
+        nodePath: options.nodePath,
+      });
+      // Each of these flags is variadic, so every one is closed by the next flag, never by RUNTIME_ARGS.
+      args.push(
+        '--allowedTools', CHANNEL_TOOLS.map((tool) => `mcp__${CHANNEL_SERVER_NAME}__${tool}`).join(','),
+        '--mcp-config', configFile,
+        '--dangerously-load-development-channels', `server:${CHANNEL_SERVER_NAME}`,
+      );
+    }
+    args.push(options.resumeSessionId ? '--resume' : '--session-id', sessionId, ...runtimeArgs);
   } else if (runtime === 'kimi') {
     driver = options.kimiDriver ?? new KimiDriver({ env });
     const prepared = await driver.prepareWorker({ cwd });
@@ -42,6 +85,8 @@ export async function prepareSessionLaunch(options = {}) {
   };
   if (runtime === 'kimi') await close();
   const launchEnv = { ...env, AGENT_HUB_RUNTIME: runtime };
+  // Launched from inside another Claude Code session, the marker would turn off transcripts and break --resume.
+  if (runtime === 'claude' && launchEnv.CLAUDE_CODE_CHILD_SESSION) launchEnv.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1';
   if (sessionId) launchEnv.AGENT_HUB_SESSION_ID = sessionId;
   else delete launchEnv.AGENT_HUB_SESSION_ID;
   return {

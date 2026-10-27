@@ -38,7 +38,7 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - 多 Hub、多主写入、分布式锁和消息队列集群。
 - 双向文件同步、自动解决 Git 冲突、向量数据库。
 - 直接控制任意已经打开的交互式 TUI。
-- Claude Channel、MCP 工具服务和 Codex 桌面端自动化的首版适配。
+- MCP 工具服务和 Codex 桌面端自动化的首版适配。Claude 交互窗口已通过 Channel 接入（见 10.7），Kimi/Codex 的交互推送仍未实现。
 - Tailscale/Headscale 的安装、启动或配置变更。
 - 公网开放、Tailscale Funnel、多租户和细粒度用户权限。
 
@@ -293,6 +293,7 @@ connector.hello { token, build: { version, commit, dirty } }
 Connector → Hub:
   connector.heartbeat
   worker.register
+  worker.channel
   worker.status
   task.create
   task.update
@@ -458,6 +459,15 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 - 当前交互 Session 默认登记为 external，并保存 `interactive: true` 与 `session_origin`。只有用户明确选择且确认交互实例已退出或 Runtime 支持共享时才使用 managed。
 - Claude/Codex 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接，不能用简单 `--session` 替代。
 - `--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。
+
+### 10.7 Claude 交互窗口实时推送（Channel）
+
+- `agent-hub session start --runtime claude --push [--resume <id>]` 在 Connector 数据目录下写入 `channels/<session>.json` MCP 配置，并以 `--allowedTools mcp__agent-hub__agent_hub_ack,mcp__agent-hub__agent_hub_report --mcp-config <file> --dangerously-load-development-channels server:agent-hub` 启动交互式 Claude Code。由于这三个参数都是可变参数，启动器总把它们放在 `--session-id`/`--resume` 之前，保证 `--` 后的 Runtime 参数不被吞掉。从另一个 Claude Code 会话内启动时设置 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`，避免继承的子会话标记关闭转录导致无法 `--resume`。
+- Claude Code 以 stdio 拉起 `agent-hub channel`（不依赖 MCP SDK 的最小 JSON-RPC 实现），它声明 `experimental['claude/channel']` 与 `tools`，并用 Local Token 打开 Connector 的 `GET /local/v1/channel?runtime=&session_id=` SSE 流，Connector 重启后自动重连。
+- Connector 按 `runtime + session_id` 找到 Worker：未注册时保持 `waiting_registration`，注册后立即接通；managed Worker 拒绝接通（无头执行与交互窗口不能共用同一 Session）。接通与断开通过 `worker.channel { worker_id, attached }` 报给 Hub，Hub 仅对 external Worker 切换 `push_capable` 并在接通时重放队列；每次重连后 Connector 重报所有 external Worker 的接通状态。
+- 投递：命令按 Worker 串行，写入 SSE 后 Channel 发出 `notifications/claude/channel`，`meta` 带 `command_id`、`kind`、`task_id`，正文末尾重申须用 `agent_hub_report` 回执。`agent_hub_ack` 只追加进度输出；`agent_hub_report { command_id, status, result }` 结束命令，结果为 `{ text, session_id, delivery: "channel" }`，与 managed Driver 同形，直接问答与编排读取方式不变。重复回执被拒绝。
+- 接通前已为 `waiting_manual` 的命令不自动转推。窗口在执行中关闭时命令记为 `failed` 且 `outcome_unknown=true`。
+- @员工与直接问答对「在线且可推送」的员工开放（含接通的交互窗口）；中央协调者与自动编排步骤仍只选择 managed 员工。权限确认暂未经 Channel 中转到中控。
 
 ### 10.5 Test Driver
 
@@ -744,3 +754,5 @@ MVP 完成必须满足：
 - Worker 软注销正式部署与原 external 撤下：2026-10-27 先创建备份 `.runtime/hub/backups/pre-worker-retirement-2026-10-27T12-37-26-011Z.db`，确认无活动工作后按原地址和凭证重启，数据库迁移到 `user_version=6`。通过 `worker unregister worker_3ea75be5de22474bb16981355eb24a4c` 将原 external“有闲 QA · Codex”软注销，默认列表和 @已移除，原 Worker ID 与历史保留；managed“有闲 QA · Codex 执行”仍在线可调度。正式页面升级为 `v=8` 并重载，未删除任务或重发 Token。第二台 Mac 的自注销需更新仓库后复测。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。
 - Connector 断线自愈、版本握手与常驻服务：2026-10-27 实测 Node 内置 WebSocket 在握手无响应时永久停留 `CONNECTING`、在链路被静默丢弃时永久停留 `OPEN`，均不触发 error/close，与正式 Connector 两次「Hub 可达但不再重连」的现象一致。新增握手超时与应用层 heartbeat 看门狗、断线原因与重连日志、握手交换 git commit、只做 fast-forward 的自更新、launchd 服务安装（`service install|uninstall|status`）和 `agent-hub update`。自动化 68 项全部通过，其中可控 TCP 代理覆盖握手挂起、静默断链、旧 Hub heartbeat 兼容、版本不一致只处理一次和重启等待活动命令；去掉看门狗后两项重连用例按预期失败。自更新用临时 git 仓库覆盖快进、依赖变化安装、脏/分叉跳过和 Hub commit 未发布提示。
+- Claude 交互窗口实时推送：2026-10-27 新增 `session start --push/--resume`、`agent-hub channel` MCP 服务、Connector SSE 接通与投递、`worker.channel` 协议和可推送 external 员工的 @/直接问答。自动化 74 项全部通过，覆盖 MCP 握手与工具、接通前 `waiting_manual` 不转推、投递与回执、重复回执拒绝、执行中关窗为 `outcome_unknown`、先开窗后注册、Connector 重启后重新接通、managed 拒绝接通和启动器参数。真实验证使用隔离 Hub/Connector（18787/18788）与 Claude Code 2.1.311 交互 TUI：启动器打开窗口、开发版 Channel 横幅出现、register-current 后 Hub 显示可推送，Admin 派发的命令以 `← agent-hub:` 送入窗口，Claude 调用 ack 与 report，命令 14 秒内 `succeeded`，结果 `CHANNEL_E2E_OK` 且 `delivery=channel`。首轮未在正文重申回执要求时，模型只在终端作答而未调用 report，因此改为每条消息附带回执提示。`--mcp-config` 提供的服务器会让横幅提示 `no MCP server configured with that name`，但不影响送达。隔离服务已清理，正式 Hub/Connector 未参与。
+

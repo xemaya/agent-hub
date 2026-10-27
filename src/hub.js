@@ -780,6 +780,18 @@ export class Hub {
       this.send(socket, 'worker.unregistered', { worker }, message.id);
       return;
     }
+    if (message.type === 'worker.channel') {
+      const worker = this.store.setWorkerChannel(connectorId, requiredString(payload.worker_id, 'worker_id'), payload.attached === true);
+      if (!worker) throw new Error('Interactive channel requires an external Worker of this connector');
+      this.emit(payload.attached === true ? 'worker.channel_attached' : 'worker.channel_detached', { type: 'worker', id: worker.worker_id }, {
+        connector_id: connectorId,
+        worker_id: worker.worker_id,
+      });
+      this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
+      if (worker.push_capable) this.replay(connectorId);
+      this.send(socket, 'worker.channel', { worker }, message.id);
+      return;
+    }
     if (message.type === 'worker.status') {
       if (payload.work_state !== undefined && !WORK_STATES.has(payload.work_state)) {
         throw new Error('Invalid worker work_state');

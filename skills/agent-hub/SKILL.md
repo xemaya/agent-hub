@@ -57,6 +57,8 @@ agent-hub worker register-current \
 
 Claude/Kimi 的 `register-current` 从 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID` 读取启动器提供的身份；Codex 读取 Codex 注入工具进程的 `CODEX_SESSION_ID`，已有 Codex 窗口也可以登记。不需要用户填写 `--session-id`。当前交互窗口默认登记为 external，不伪装成可主动推送。不要手动编造或设置这些变量，不要另建 Worker 冒充当前窗口。
 
+Claude 窗口若用 `agent-hub session start --runtime claude --push` 打开，注册为 external 后会自动接通中控：窗口开着时 `push_capable=true`，中控的任务以 `<channel source="agent-hub" command_id="...">` 送进本窗口。收到后先调用 `agent_hub_ack`，按普通请求完成工作，再用 `agent_hub_report` 交回完整结果，每个 command_id 只报一次；只写在终端里的内容中控看不到。窗口关闭后自动退回 `waiting_manual`。没有用 `--push` 打开的窗口不会收到推送，不要声称能收到。
+
 只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。Kimi CLI 与 Kimi Web Server 对同一 Session 有排他占用：当前 CLI 窗口打开时不要注册为 managed，也不要启动第二个 Web Server 接管它。Kimi 当前交互 Session 的主动推送需要共享 Web/ACP 桥接，不能用简单的 `--session` 代替。Claude/Codex 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
 
 如果 Claude/Kimi 当前窗口不是通过启动器打开的，或者缺少上述可信环境变量，不要假装它是启动器 Session；按下面的 external 边界处理，或建议用户下次通过启动器打开。Codex 缺少原生 `CODEX_SESSION_ID` 时同样不能注册，不要退回随机 ID 或最近会话。
@@ -89,7 +91,7 @@ agent-hub worker register \
 
 如果无法确认真实 Session ID，停下来说明。不要生成随机 ID 冒充当前 Session，不要猜测 ID，不要使用 Codex `--last` 或“最近会话”。
 
-external Worker 的 `push_capable=false`，命令为 `waiting_manual`。不要声称它能收到主动推送。登记当前 Session 不等于接管它。
+external Worker 默认 `push_capable=false`，命令为 `waiting_manual`；只有通过 `--push` 启动器打开且窗口在线时才变为可推送。以 `worker list` 的实际 `push_capable` 为准，不要凭模式推断。登记当前 Session 不等于接管它。
 
 ### 创建独立可调度 Worker：managed
 

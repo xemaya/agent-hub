@@ -313,6 +313,44 @@ test('Connector cannot create commands or update tasks for another Connector', a
   }
 });
 
+test('Worker activity prioritizes the running command over a newer queued command', async (t) => {
+  const context = await createTestContext(t);
+  let releaseFirst;
+  let announceFirst;
+  const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
+  context.connector.drivers.test = {
+    async prepareWorker(input) {
+      return { runtime_session_id: input.runtime_session_id ?? 'queued-activity-session', driver_state: {} };
+    },
+    async execute({ command, onOutput, onState }) {
+      await onState({ started: true });
+      onOutput(`${command.input}\n`);
+      if (command.input === 'first') {
+        announceFirst();
+        await new Promise((resolve) => { releaseFirst = resolve; });
+      }
+      return { text: command.input };
+    },
+    async close() {},
+  };
+  const worker = await context.registerWorker();
+  const first = await context.admin('/api/v1/commands', {
+    method: 'POST', body: { worker_id: worker.worker_id, input: 'first' },
+  });
+  await firstStarted;
+  const second = await context.admin('/api/v1/commands', {
+    method: 'POST', body: { worker_id: worker.worker_id, input: 'second' },
+  });
+  await waitFor(() => ['accepted', 'queued'].includes(context.hub.store.getCommand(second.payload.command.command_id)?.status));
+  const live = await context.admin(`/api/v1/workers/${worker.worker_id}`);
+  assert.equal(live.payload.worker.activity.command_id, first.payload.command.command_id);
+  assert.equal(live.payload.worker.activity.command_status, 'running');
+  assert.equal(live.payload.worker.activity.phase, 'working');
+  assert.match(live.payload.worker.activity.output_text, /first/);
+  releaseFirst();
+  await waitFor(() => context.hub.store.getCommand(second.payload.command.command_id)?.status === 'succeeded');
+});
+
 test('Worker activity shows live task output and clears to a recent result when finished', async (t) => {
   const context = await createTestContext(t);
   let releaseWork;

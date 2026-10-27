@@ -2,6 +2,8 @@ import { createId } from './ids.js';
 
 const FINAL_COMMAND_STATUSES = new Set(['succeeded', 'failed']);
 const FINISHED_STEP_STATUSES = new Set(['review', 'done']);
+const DEPENDENCY_EVIDENCE_BUDGET = 64000;
+const REFERENCE_EVIDENCE_BUDGET = 24000;
 
 function validateChatResponse(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw coordinatorError('Chat response must be a JSON object');
@@ -159,9 +161,13 @@ function validateReview(value, steps) {
   return { parentPass: value.parent_pass, reason, verdicts };
 }
 
-function resultEvidence(result) {
-  const value = typeof result?.text === 'string' ? result.text : JSON.stringify(result ?? null);
-  return value.slice(0, 12000);
+function resultText(result) {
+  if (typeof result?.text === 'string') return result.text;
+  return result == null ? '' : JSON.stringify(result);
+}
+
+function resultEvidence(result, max = 12000) {
+  return resultText(result).slice(0, max);
 }
 
 export class Coordinator {
@@ -230,6 +236,84 @@ export class Coordinator {
     return this.status();
   }
 
+  resolveMentions(value, coordinatorWorkerId) {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > 8) {
+      throw coordinatorError('Mentions must be an array of at most 8 Worker or Task references', 'mentions_invalid');
+    }
+    const mentions = [];
+    const seen = new Set();
+    for (const item of value) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || !['worker', 'task'].includes(item.type)) {
+        throw coordinatorError('Each mention must identify a Worker or Task', 'mentions_invalid');
+      }
+      const id = text(item.id, 'mention.id', { max: 128 });
+      const key = `${item.type}:${id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (item.type === 'worker') {
+        const worker = this.store.getWorker(id);
+        if (!worker) throw coordinatorError('Mentioned Worker does not exist', 'mention_worker_not_found', 404);
+        if (worker.worker_id === coordinatorWorkerId || worker.mode !== 'managed' || !worker.push_capable || worker.presence !== 'online') {
+          throw coordinatorError('Mentioned Worker must be an online, managed execution Worker', 'mention_worker_unavailable', 409);
+        }
+      } else if (!this.store.getTask(id)) {
+        throw coordinatorError('Mentioned Task does not exist', 'mention_task_not_found', 404);
+      }
+      mentions.push({ type: item.type, id });
+    }
+    return mentions;
+  }
+
+  mentionedWorkerIds(message) {
+    return (message?.mentions ?? []).filter((mention) => mention.type === 'worker').map((mention) => mention.id);
+  }
+
+  orchestrationWorkerIds(orchestration) {
+    const message = orchestration.source_message_id ? this.store.getChatMessage(orchestration.source_message_id) : null;
+    return this.mentionedWorkerIds(message);
+  }
+
+  orchestrationTaskIds(orchestration) {
+    const message = orchestration.source_message_id ? this.store.getChatMessage(orchestration.source_message_id) : null;
+    return (message?.mentions ?? []).filter((mention) => mention.type === 'task').map((mention) => mention.id);
+  }
+
+  taskReference(taskId, { resultBudget = null } = {}) {
+    const task = this.store.getTask(taskId);
+    if (!task) return null;
+    const orchestration = this.store.getOrchestrationByTask(taskId)
+      ?? this.store.listOrchestrations().find((item) => item.steps.some((step) => step.task_id === taskId));
+    const stepCount = orchestration?.steps.length ?? 0;
+    const resultLimit = Math.max(1, Math.floor((resultBudget ?? stepCount * 600) / Math.max(stepCount, 1)));
+    return {
+      task: {
+        ...task,
+        goal: task.goal.slice(0, 4000),
+        context: task.context.slice(0, 4000),
+        acceptance: task.acceptance.slice(0, 8).map((item) => item.slice(0, 300)),
+      },
+      orchestration: orchestration ? {
+        orchestration_id: orchestration.orchestration_id,
+        parent_task_id: orchestration.parent_task_id,
+        status: orchestration.status,
+        auto_start: orchestration.auto_start,
+        summary: orchestration.summary.slice(0, 1000),
+        review_reason: orchestration.review_reason.slice(0, 1000),
+        error: orchestration.error,
+        steps: orchestration.steps.map((step) => ({
+          key: step.key,
+          task_id: step.task_id,
+          title: step.title,
+          status: step.status,
+          worker_id: step.worker_id,
+          result: resultEvidence(step.result, resultLimit),
+          result_truncated: resultText(step.result).length > resultLimit,
+        })),
+      } : null,
+    };
+  }
+
   workerRegistry() {
     return this.store.listWorkers().map((worker) => ({
       worker_id: worker.worker_id,
@@ -249,22 +333,24 @@ export class Coordinator {
     }));
   }
 
-  eligibleRegistry(excludeWorkerId = this.store.getCoordinatorConfig().worker_id) {
+  eligibleRegistry(excludeWorkerId = this.store.getCoordinatorConfig().worker_id, workerIds = []) {
+    const allowed = new Set(workerIds);
     return this.workerRegistry().filter((worker) => (
       worker.worker_id !== excludeWorkerId
       && worker.mode === 'managed'
       && worker.push_capable
       && worker.presence === 'online'
+      && (!allowed.size || allowed.has(worker.worker_id))
     ));
   }
 
-  createOrchestration({ title, goal, context, acceptance: criteria, createdBy, actor, autoStart = true, sourceMessageId = null }) {
+  createOrchestration({ title, goal, context, acceptance: criteria, createdBy, actor, autoStart = true, sourceMessageId = null, workerIds = [] }) {
     if (sourceMessageId) {
       const existing = this.store.getOrchestrationBySourceMessage(sourceMessageId);
       if (existing) return { task: this.store.getTask(existing.parent_task_id), orchestration: existing };
     }
     const { config } = this.configuredWorker();
-    const registry = this.eligibleRegistry(config.worker_id);
+    const registry = this.eligibleRegistry(config.worker_id, workerIds);
     if (!registry.length) throw coordinatorError('No eligible Workers are available for orchestration', 'coordinator_no_workers');
     const created = this.store.createOrchestratedTask({
       title: text(title, 'title', { max: 300 }),
@@ -299,12 +385,14 @@ export class Coordinator {
 
   requestPlan(orchestration, parent, registry) {
     const config = this.store.getCoordinatorConfig();
+    const mentionedWorkerIds = this.orchestrationWorkerIds(orchestration);
     const input = [
       '你是 Agent Hub 的中央协调者。你只负责规划和最终评审，不能调用工具或修改任务。',
       '根据总目标和 Worker 自描述选择最合适的 Worker。一步能完成就不要硬拆，只有确实需要时才拆步骤。',
       '只输出一个 JSON 对象，不要 Markdown、解释或额外文本。schema:',
       '{"summary":"计划摘要","steps":[{"key":"step-1","title":"...","goal":"...","context":"...","acceptance":["可检查的标准"],"worker_id":"worker_...","depends_on":[],"rationale":"选择该 Worker 的原因"}]}',
       `最多 ${config.max_steps} 步；每步至少一条验收标准；depends_on 使用已有 key，不允许环。不要使用协调者自己或列表外的 worker_id。优先能力匹配和空闲 Worker。`,
+      ...(mentionedWorkerIds.length ? [`用户通过 @ 明确限定了执行 Worker：${mentionedWorkerIds.join('、')}。只能从可用列表选择这些 Worker，不得改派他人；不必为了用完人数而拆步骤。`] : []),
       '总任务 JSON:',
       JSON.stringify(parent, null, 2),
       '可用 Worker JSON:',
@@ -334,11 +422,14 @@ export class Coordinator {
       acceptance: step.acceptance,
       status: step.status,
       result: resultEvidence(step.result),
+      result_truncated: resultText(step.result).length > 12000,
+      result_incomplete: Boolean(step.result?.output_gap),
       error: step.error,
     }));
     return [
       '你是 Agent Hub 的中央协调者，现在进行最终证据评审，不要调用工具。',
-      '只根据返回证据判断，不能虚构测试或业务验收。每个子步骤及父任务验收都必须明确通过，才能 parent_pass=true。证据不足或不符合时对应步骤 pass=false，parent_pass=false。',
+      '只根据返回证据判断，不能虚构测试或业务验收。每个子步骤及父任务验收都必须明确通过，才能 parent_pass=true。证据不足或不符合时对应步骤 pass=false，parent_pass=false。result_truncated=true 或 result_incomplete=true 表示证据不完整，无法据此确认的验收不得通过。',
+      'reason 用简洁中文说明实际交付、验收依据和未覆盖事项；修改建议不能写成已经落实。',
       '只输出 JSON：{"parent_pass":true,"reason":"整体结论","steps":[{"key":"step-1","pass":true,"reason":"该步骤的证据结论"}]}',
       '必须包含每个步骤且 key 完全一致，不要增加其他文本。',
       '父任务 JSON:',
@@ -362,7 +453,6 @@ export class Coordinator {
       input: this.reviewPrompt(reviewing),
       push_capable: true,
     });
-    this.recordActivity(reviewing, 'review', '执行结果已返回，我正在核对每一步和整体验收。');
     this.emit('coordinator.review.requested', { type: 'worker', id: orchestration.coordinator_worker_id }, {
       task_id: parent.task_id,
       command_id: command.command_id,
@@ -402,7 +492,11 @@ export class Coordinator {
   acceptPlan(orchestration, result) {
     let plan;
     try {
-      plan = validatePlan(jsonDocument(result?.text), this.eligibleRegistry(orchestration.coordinator_worker_id), this.store.getCoordinatorConfig().max_steps);
+      plan = validatePlan(
+        jsonDocument(result?.text),
+        this.eligibleRegistry(orchestration.coordinator_worker_id, this.orchestrationWorkerIds(orchestration)),
+        this.store.getCoordinatorConfig().max_steps,
+      );
     } catch (error) {
       return this.fail(orchestration, 'coordinator_plan_invalid', error.message);
     }
@@ -425,9 +519,10 @@ export class Coordinator {
       error: null,
     });
     this.store.updateTask(orchestration.parent_task_id, { status });
-    this.recordActivity(updated, 'plan', orchestration.auto_start
-      ? `计划已生成，共 ${steps.length} 步：${plan.summary}`
-      : `计划已生成，共 ${steps.length} 步：${plan.summary}\n尚未执行。你在对话中说“开始执行”，我再按这个计划安排。`);
+    const arrangement = steps.map((step, index) => (
+      `${index + 1}. ${step.title}（${this.store.getWorker(step.worker_id)?.name ?? '等待匹配员工'}）`
+    )).join('\n');
+    this.recordActivity(updated, 'plan', `已安排 ${steps.length} 个步骤：\n${arrangement}${orchestration.auto_start ? '' : '\n尚未执行。'}`);
     this.emit('coordinator.plan.accepted', { type: 'worker', id: orchestration.coordinator_worker_id }, {
       task_id: orchestration.parent_task_id,
       payload: { orchestration_id: orchestration.orchestration_id, summary: plan.summary, step_count: steps.length },
@@ -456,7 +551,10 @@ export class Coordinator {
         reviewReason: review.reason,
       });
       this.store.updateTask(orchestration.parent_task_id, { status: 'done' });
-      this.recordActivity(completed, 'completed', `已完成「${completed.parent_task_id ? this.store.getTask(completed.parent_task_id)?.title : '任务'}」。\n终审结论：${review.reason}`);
+      const parent = this.store.getTask(completed.parent_task_id);
+      const deliverables = steps.filter((step) => resultText(step.result).trim()).length;
+      const acceptanceCount = parent?.acceptance.length ?? 0;
+      this.recordActivity(completed, 'completed', `「${parent?.title ?? '任务'}」已完成。${deliverables} 项交付结果${acceptanceCount ? ` · ${acceptanceCount} 条整体验收通过` : ' · 终审通过'}。`);
       this.emit('coordinator.completed', { type: 'worker', id: orchestration.coordinator_worker_id }, {
         task_id: orchestration.parent_task_id,
         payload: { orchestration_id: orchestration.orchestration_id, reason: review.reason },
@@ -476,13 +574,32 @@ export class Coordinator {
 
   workPrompt(orchestration, step) {
     const parent = this.store.getTask(orchestration.parent_task_id);
+    const dependencies = step.depends_on.map((key) => orchestration.steps.find((item) => item.key === key)).filter(Boolean);
+    const dependencyLimit = Math.max(1, Math.floor(DEPENDENCY_EVIDENCE_BUDGET / Math.max(dependencies.length, 1)));
+    const dependencyResults = dependencies.map((dependency) => ({
+      key: dependency.key,
+      title: dependency.title,
+      status: dependency.status,
+      worker_name: this.store.getWorker(dependency.worker_id)?.name ?? dependency.worker_id,
+      result: resultEvidence(dependency.result, dependencyLimit),
+      result_truncated: resultText(dependency.result).length > dependencyLimit,
+      result_incomplete: Boolean(dependency.result?.output_gap),
+    }));
+    const referenceIds = this.orchestrationTaskIds(orchestration);
+    const referenceLimit = Math.max(1, Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(referenceIds.length, 1)));
+    const references = referenceIds.map((taskId) => this.taskReference(taskId, { resultBudget: referenceLimit })).filter(Boolean);
     return [
       '你正在执行中央大脑分配的一个步骤。只完成当前步骤，不要修改其他任务，不要读取 Admin Token。',
-      '返回简洁、真实的结果报告：完成内容、修改的文件、实际测试及结果。不要虚构证据。',
+      '返回真实结果：完成内容、修改的文件、实际测试及结果。文案交付请直接给出完整正文，不要只给摘要。不要虚构证据。',
+      '依赖和历史任务的实际结果已经附在下面，不需要自行查询 Hub。result_truncated=true 或 result_incomplete=true 表示内容不完整，不能声称已完整阅读；不足以完成当前步骤时如实说明。',
       '父任务背景 JSON:',
       JSON.stringify(parent, null, 2),
       '当前步骤 JSON:',
       JSON.stringify({ ...step, command_id: undefined }, null, 2),
+      '已完成依赖步骤的真实结果 JSON:',
+      JSON.stringify(dependencyResults, null, 2),
+      '对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:',
+      JSON.stringify(references, null, 2),
     ].join('\n\n');
   }
 
@@ -579,8 +696,16 @@ export class Coordinator {
       });
       if (step.status === 'blocked') this.fail(updated, 'coordinator_step_failed', step.error.message);
       else {
-        const evidence = resultEvidence(step.result).slice(0, 2000);
-        this.recordActivity(updated, `step:${step.key}`, `已收到「${step.title}」的执行结果，等待终审。${evidence ? `\n${evidence}` : ''}`);
+        const workerName = this.store.getWorker(command.worker_id)?.name ?? '数字员工';
+        const next = updated.steps.find((candidate) => candidate.status === 'ready' && candidate.depends_on.every((key) => {
+          const dependency = updated.steps.find((item) => item.key === key);
+          return dependency && FINISHED_STEP_STATUSES.has(dependency.status);
+        }));
+        const nextWorker = next ? this.store.getWorker(next.worker_id)?.name ?? '数字员工' : null;
+        const nextStep = next
+          ? `下一步：${nextWorker} 处理「${next.title}」。`
+          : '下一步：中央大脑核对结果和整体验收。';
+        this.recordActivity(updated, `step:${step.key}`, `${workerName} 已返回「${step.title}」，等待验收。\n${nextStep}`);
         this.pump(updated);
       }
       return true;
@@ -589,7 +714,7 @@ export class Coordinator {
   }
 
   chatPrompt(userMessage) {
-    const history = this.store.listChatMessages({ limit: 20 })
+    const history = this.store.listChatMessages({ limit: 20, epoch: this.store.conversationEpoch() })
       .filter((message) => message.message_id !== userMessage.message_id && message.status === 'done')
       .slice(-12)
       .map((message) => ({ role: message.role, content: message.content.slice(0, 2000) }));
@@ -616,35 +741,48 @@ export class Coordinator {
         error: step.error ? String(step.error.message ?? '').slice(0, 500) : null,
       })),
     }));
+    const workerIds = this.mentionedWorkerIds(userMessage);
+    const references = {
+      workers: this.workerRegistry().filter((worker) => workerIds.includes(worker.worker_id)),
+      tasks: (userMessage.mentions ?? [])
+        .filter((mention) => mention.type === 'task')
+        .map((mention) => this.taskReference(mention.id))
+        .filter(Boolean),
+    };
     return [
       '你是 Agent Hub 的中央大脑，正在和管理员对话。你可以回答问题、解释真实进展、规划任务和启动任务。不要调用工具，不要读取凭证。',
       '只能根据提供的对话、任务快照和 Worker 自描述陈述事实。不能虚构执行、测试或完成情况。没有明确要求做事时不要创建任务。',
       '只输出一个 JSON 对象。普通问答或需要澄清时使用：{"reply":"中文回答","action":{"type":"chat"}}。',
       '用户明确要求只记录、只规划、先不要执行时，使用 plan；用户明确要求完成、修复、安排并执行新工作时，使用 orchestrate。两者格式均为：{"reply":"简短确认","action":{"type":"plan|orchestrate","task":{"title":"简短标题","goal":"整体目标","context":"用户已提供的上下文","acceptance":["可检查的整体验收"]}}}。plan 不执行；orchestrate 会开始执行。',
       '用户要启动之前已规划且 status=ready 的任务时，使用：{"reply":"简短确认","action":{"type":"start","orchestration_id":"快照中的真实 ID"}}。start 只用于 ready；不要重试 blocked/review，不要重复启动已完成或正在执行的任务。',
-      '不要指定步骤或 Worker，后续由既有规划器选择和校验。不要把 Markdown 或内部凭证放入回复。',
+      '界面传入的 @ 引用已经由 Hub 核验。用户明确给 @员工 派新工作时使用 plan 或 orchestrate，后续只能在引用的 Worker 中分配，不得改派；只是 @员工 提问或没有明确做事时不要创建任务。@任务 是阅读和讨论的上下文，不代表自动启动、重试或修改该任务。',
+      '用户明确要求根据 @任务 继续、修订或补充工作时，使用 plan 或 orchestrate 创建新工作；执行 Worker 会收到引用任务的结果。不要宣称已修改原任务或自动重试。',
+      '回答进展或结果问题时可以概述真实步骤和实际交付；创建任务的确认不需要复述步骤。不要输出 worker_id、内部凭证或 Markdown。',
       '最近对话 JSON:',
       JSON.stringify(history, null, 2),
       '任务与编排快照 JSON:',
       JSON.stringify(orchestrations, null, 2),
       'Worker 自描述 JSON:',
       JSON.stringify(this.workerRegistry().slice(0, 50), null, 2),
+      '本次结构化 @ 引用 JSON:',
+      JSON.stringify(references, null, 2),
       '用户新消息:',
       userMessage.content,
     ].join('\n\n');
   }
 
-  sendChat({ message, requestId }) {
+  sendChat({ message, requestId, mentions }) {
     const { worker } = this.configuredWorker();
     const content = text(message, 'message', { max: 20000 });
+    const normalizedMentions = this.resolveMentions(mentions, worker.worker_id);
     const normalizedRequestId = requestId == null
       ? createId('request')
       : text(requestId, 'request_id', { max: 128 });
-    const user = this.store.createChatMessage({ role: 'user', content, requestId: normalizedRequestId });
+    const user = this.store.createChatMessage({ role: 'user', content, requestId: normalizedRequestId, mentions: normalizedMentions });
     const sourceKey = `chat-reply:${user.message_id}`;
     const existing = this.store.getChatMessageBySourceKey(sourceKey);
     if (existing) return { user, message: existing };
-    let reply = this.store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey });
+    let reply = this.store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey, mentions: user.mentions });
     try {
       const command = this.store.createCommand({
         task_id: null,
@@ -687,21 +825,25 @@ export class Coordinator {
   }
 
   taskChatReply(action, orchestration, started = false) {
-    const title = this.store.getTask(orchestration.parent_task_id)?.title ?? '任务';
+    const task = this.store.getTask(orchestration.parent_task_id);
+    const title = task?.title ?? '任务';
     if (orchestration.status === 'blocked') {
-      return `「${title}」已停止：${orchestration.error?.message ?? '规划或执行未完成'}。没有标记为完成，也不会自动重试。`;
+      return `「${title}」未完成：${orchestration.error?.message ?? '规划或执行未完成'}。不会自动重试；可以引用任务并说明新的处理要求。`;
     }
-    if (orchestration.status === 'done') return `「${title}」已完成。终审结论：${orchestration.review_reason || '已通过'}`;
+    if (orchestration.status === 'done') {
+      const deliverables = orchestration.steps.filter((step) => resultText(step.result).trim()).length;
+      return `「${title}」已完成。${deliverables} 项交付结果${task?.acceptance.length ? ` · ${task.acceptance.length} 条整体验收通过` : ' · 终审通过'}。`;
+    }
     if (orchestration.status === 'review' && orchestration.error) {
-      return `「${title}」需要复核：${orchestration.error.message}。没有标记为完成。`;
+      return `「${title}」验收未通过：${orchestration.error.message}。任务尚未完成；可以引用任务并提出修改要求。`;
     }
     if (action.type === 'plan') {
       return orchestration.status === 'ready'
-        ? `「${title}」已规划好，尚未执行。你直接说“开始执行”，我就按现有计划安排。`
-        : `已记录「${title}」，尚未执行。计划生成后会在对话中汇报。`;
+        ? `「${title}」已规划好，尚未执行。`
+        : `已记录「${title}」，正在制定计划，尚未执行。`;
     }
     if (action.type === 'start') {
-      const phases = { planning: '正在规划', in_progress: '正在执行', review: '正在评审', ready: '等待启动' };
+      const phases = { planning: '正在规划', in_progress: '正在执行', review: '正在验收', ready: '等待启动' };
       return started
         ? `已按原计划启动「${title}」，不会重新规划。`
         : `「${title}」${phases[orchestration.status] ?? '已有结果'}，没有重复启动。`;
@@ -749,6 +891,7 @@ export class Coordinator {
         actor: { type: 'admin', id: 'admin' },
         autoStart: action.type === 'orchestrate',
         sourceMessageId: message.message_id,
+        workerIds: this.mentionedWorkerIds(message),
       });
       this.completeChat(message, {
         content: this.taskChatReply(action, created.orchestration),
@@ -775,7 +918,7 @@ export class Coordinator {
     if (orchestration.coordinator_worker_id !== config.worker_id) {
       throw coordinatorError('The configured Coordinator has changed', 'coordinator_changed', 409);
     }
-    if (!this.eligibleRegistry(config.worker_id).length) {
+    if (!this.eligibleRegistry(config.worker_id, this.orchestrationWorkerIds(orchestration)).length) {
       throw coordinatorError('No eligible Workers are available for this plan', 'coordinator_no_workers');
     }
     const updated = this.store.updateOrchestration(orchestrationId, { status: 'in_progress', error: null });
@@ -816,7 +959,7 @@ export class Coordinator {
   }
 
   chat() {
-    return this.store.listChatMessages();
+    return this.store.listChatMessages({ epoch: this.store.conversationEpoch() });
   }
 
   listForConnector(connectorId) {

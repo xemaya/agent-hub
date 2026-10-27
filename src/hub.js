@@ -14,6 +14,7 @@ const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const STATIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/markdown.js', ['markdown.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
@@ -23,7 +24,9 @@ const COORDINATOR_COMMAND_KINDS = new Set(['coordinator_plan', 'coordinator_revi
 
 function workerActivity(store, worker) {
   const commands = store.listCommands({ workerId: worker.worker_id });
-  const current = commands.find((command) => ['queued', 'accepted', 'running'].includes(command.status))
+  const current = commands.find((command) => command.status === 'running')
+    ?? commands.find((command) => command.status === 'accepted')
+    ?? commands.find((command) => command.status === 'queued')
     ?? commands.find((command) => command.status === 'waiting_manual')
     ?? null;
   const recent = commands.find((command) => ['succeeded', 'failed'].includes(command.status)) ?? null;
@@ -133,6 +136,7 @@ export class Hub {
   constructor({ host, port, dataDir, credentials, logger = console }) {
     this.host = host;
     this.requestedPort = port;
+    this.dataDir = path.resolve(dataDir);
     this.logger = logger;
     this.store = new HubStore(path.join(dataDir, 'hub.db'));
     this.credentials = credentials;
@@ -222,6 +226,18 @@ export class Hub {
     }
     this.wss.close();
     this.store.close();
+  }
+
+  async clearHistory() {
+    this.store.assertHistoryClearable();
+    const directory = path.join(this.dataDir, 'backups');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
+    const backup = path.join(directory, `history-${timestamp}-${createId('backup')}.db`);
+    this.store.backup(backup);
+    const cleared = this.store.clearHistory();
+    this.broadcast('history.cleared', { cleared });
+    return { backup, cleared };
   }
 
   emit(eventType, actor, refs = {}) {
@@ -323,13 +339,29 @@ export class Hub {
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/coordinator/chat') {
-      sendJson(response, 200, { messages: this.coordinator.chat() });
+      sendJson(response, 200, { messages: this.coordinator.chat(), epoch: this.store.conversationEpoch() });
+      return;
+    }
+    if (request.method === 'DELETE' && pathname === '/api/v1/coordinator/chat') {
+      const epoch = this.store.clearConversation();
+      this.emit('coordinator.chat.cleared', { type: 'admin', id: 'admin' }, { payload: { epoch } });
+      this.broadcast('chat.cleared', { epoch });
+      sendJson(response, 200, { cleared: true, epoch });
       return;
     }
     if (request.method === 'POST' && pathname === '/api/v1/coordinator/chat') {
       const body = await readJsonBody(request);
-      const result = this.coordinator.sendChat({ message: body.message, requestId: body.request_id });
+      const result = this.coordinator.sendChat({ message: body.message, requestId: body.request_id, mentions: body.mentions });
       sendJson(response, result.message.status === 'pending' ? 202 : 200, result);
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/history/clear') {
+      const body = await readJsonBody(request);
+      if (body.confirm !== true) {
+        sendJson(response, 400, { error: 'History clearing requires confirm: true' });
+        return;
+      }
+      sendJson(response, 200, await this.clearHistory());
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/orchestrations') {

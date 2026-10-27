@@ -4,29 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Agent Hub · 中央大脑</title>
-  <link rel="stylesheet" href="/style.css">
+  <title>Agent Hub · 中央工作台</title>
+  <link rel="stylesheet" href="/style.css?v=6">
 </head>
 <body>
   <section id="auth-view" class="auth-shell">
     <div class="auth-manifest">
       <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-      <p class="eyebrow">YOUR AI DUTY ROOM / 01</p>
       <h1>AGENT<br>HUB</h1>
-      <p class="auth-lede">告诉中央大脑要做什么。看它安排合适的人，看每件事真实推进。</p>
-      <div class="manifest-lines" aria-hidden="true">
-        <span>CONVERSE</span><span>COLLABORATE</span><span>COMPLETE</span>
-      </div>
     </div>
     <form id="auth-form" class="auth-form">
-      <p class="section-index">ACCESS / 本地中控</p>
-      <h2>回到工作台</h2>
-      <p>输入中控的 Admin Token，连接你的中央大脑。</p>
+      <h2>连接中控</h2>
       <label for="admin-token">Admin Token</label>
       <input id="admin-token" name="token" type="password" autocomplete="current-password" required autofocus>
-      <button class="button button-primary" type="submit">建立连接</button>
+      <button class="button button-primary" type="submit">连接</button>
       <p id="auth-error" class="form-error" role="alert"></p>
-      <p class="security-note">凭证仅保存在当前浏览器标签页的 sessionStorage，不写入 URL。</p>
+      <p class="security-note">凭证仅保存在当前标签页的 sessionStorage。</p>
     </form>
   </section>
 
@@ -34,7 +27,7 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark small" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-        <div><strong>AGENT HUB</strong><span>YOUR AI DUTY ROOM</span></div>
+        <strong>AGENT HUB</strong>
       </div>
       <div class="topbar-actions">
         <span id="connection" class="connection offline"><i></i>未连接</span>
@@ -43,66 +36,62 @@
       </div>
     </header>
 
-    <nav class="dispatch-nav" aria-label="工作台视图">
-      <button class="nav-item active" data-view="orchestrations" aria-pressed="true">中央大脑 <b data-count="orchestrations">0</b></button>
-      <button class="nav-item" data-view="tasks" aria-pressed="false">任务 <b data-count="tasks">0</b></button>
-      <button class="nav-item" data-view="workers" aria-pressed="false">数字员工 <b data-count="workers">0</b></button>
-    </nav>
-
     <div class="workspace">
-      <main id="main" class="main-content">
-        <section id="view-orchestrations" class="view">
-          <div class="section-heading">
-            <div><p class="section-index">CENTRAL BRAIN / 01</p><h2>一起把事情做好</h2></div>
-            <p>直接说目标、问进展，或者让它先出个计划。<br>不需要填写任务表单。</p>
-          </div>
-          <div class="brain-layout">
-            <section class="conversation-panel" aria-label="与中央大脑对话">
-              <div id="coordinator-status" class="coordinator-status"></div>
-              <div id="chat-messages" class="chat-messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
-              <form id="chat-form" class="chat-composer">
-                <label class="sr-only" for="chat-input">给中央大脑留言</label>
-                <textarea id="chat-input" name="message" rows="3" maxlength="20000" required placeholder="例如：先只规划一次代码审查，不要执行……"></textarea>
-                <div class="composer-footer">
-                  <p>⌘ / Ctrl + Enter 发送<br><span>只说“记录”或“规划”时，不会自动执行。</span></p>
-                  <button id="send-chat" class="button button-accent" type="submit" disabled>发送</button>
-                </div>
-              </form>
-            </section>
-            <aside class="focus-panel" aria-label="当前任务进展">
-              <div class="focus-heading"><span>NOW / 当前工作</span><p>它在做什么，为什么这样做</p></div>
-              <div id="focus-task"></div>
-            </aside>
-          </div>
-        </section>
+      <nav class="workspace-nav" aria-label="工作台视图">
+        <button class="active" type="button" data-view="operations" aria-pressed="true">操作台</button>
+        <button type="button" data-view="tasks" aria-pressed="false">任务看板 <b data-count="tasks">0</b></button>
+      </nav>
 
-        <section id="view-tasks" class="view" hidden>
-          <div class="section-heading">
-            <div><p class="section-index">WORK / 02</p><h2>每件事，进行到哪一步</h2></div>
-            <p>按总目标看进展。子任务、负责人和验收结论，<br>都归在它所属的工作里。</p>
-          </div>
+      <section id="view-operations" aria-label="操作台">
+        <div class="workbench-grid">
+          <main id="main" class="conversation-panel" aria-label="与中央大脑对话">
+            <div id="coordinator-status" class="coordinator-status"></div>
+            <div id="chat-messages" class="chat-messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
+            <form id="chat-form" class="chat-composer">
+              <label class="sr-only" for="chat-input">给中央大脑发消息</label>
+              <div id="mention-picker" class="mention-picker" role="listbox" aria-label="选择员工或任务" hidden></div>
+              <textarea id="chat-input" name="message" rows="3" maxlength="20000" required
+                aria-autocomplete="list" aria-controls="mention-picker" aria-expanded="false"
+                placeholder="给中央大脑发消息"></textarea>
+              <div id="composer-mentions" class="composer-mentions" aria-label="本条消息的引用"></div>
+              <div class="composer-footer">
+                <button id="clear-chat" class="button button-quiet" type="button" disabled>清空对话</button>
+                <button id="send-chat" class="button button-accent" type="submit" disabled>发送</button>
+              </div>
+            </form>
+          </main>
+
+          <aside class="team-panel" aria-label="数字员工">
+            <div class="panel-heading"><h2>数字员工</h2><span id="workforce-summary" class="workforce-summary"></span></div>
+            <div id="workers-list" class="worker-list"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="view-tasks" class="task-board" aria-label="任务看板" hidden>
+        <div class="board-toolbar">
           <div id="task-filters" class="task-filters" role="group" aria-label="按任务状态筛选">
-            <button type="button" data-task-filter="active" class="active" aria-pressed="true">进行中 <b data-filter-count="active">0</b></button>
+            <button type="button" data-task-filter="all" class="active" aria-pressed="true">全部 <b data-filter-count="all">0</b></button>
+            <button type="button" data-task-filter="active" aria-pressed="false">进行中 <b data-filter-count="active">0</b></button>
             <button type="button" data-task-filter="ready" aria-pressed="false">等待开始 <b data-filter-count="ready">0</b></button>
             <button type="button" data-task-filter="attention" aria-pressed="false">需要关注 <b data-filter-count="attention">0</b></button>
             <button type="button" data-task-filter="done" aria-pressed="false">已完成 <b data-filter-count="done">0</b></button>
-            <button type="button" data-task-filter="all" aria-pressed="false">全部 <b data-filter-count="all">0</b></button>
           </div>
-          <div id="tasks-list" class="task-list"></div>
-        </section>
-
-        <section id="view-workers" class="view" hidden>
-          <div class="section-heading">
-            <div><p class="section-index">PEOPLE / 03</p><h2>谁正在做什么</h2></div>
-            <p>每个独立 Session 都是一位数字员工。<br>看当前任务与真实返回，不看命令流水。</p>
-          </div>
-          <div id="workforce-summary" class="workforce-summary"></div>
-          <div id="workers-list" class="worker-grid"></div>
-        </section>
-      </main>
+        </div>
+        <div id="tasks-list" class="task-list"></div>
+      </section>
     </div>
   </div>
+
+  <dialog id="task-dialog" class="task-dialog" aria-labelledby="task-dialog-title">
+    <div class="dialog-heading">
+      <h2 id="task-dialog-title"></h2>
+      <div id="task-dialog-status"></div>
+      <button id="close-task-dialog" class="dialog-close" type="button" aria-label="关闭任务详情">×</button>
+    </div>
+    <div id="task-dialog-content" class="dialog-content"></div>
+  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js?v=6"></script>
 </body>
 </html>

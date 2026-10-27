@@ -454,6 +454,7 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 - 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
 - 一步能完成就不硬拆，默认最多 4 步。Hub 校验 JSON Schema、字段、Worker 可用性、重复 key、未知依赖与环。子 Task 初始不指定负责人，轮到执行时才分配，避免提前占用多个 `current_task_id`；派发前还会检查 Worker 是否忙碌及其当前 Task 是否活跃。
 - 自动编排状态为 `planning → in_progress → review → done`，可进入 `blocked` 或停留在 `review`。只规划对话在计划生成后进入 `ready`，确认后只启动这个已有计划，不重新规划，也不重跑失败、评审或完成任务。子步骤为 `ready / running / review / done / blocked`。命令成功后步骤先进入 `review`，终审通过才进入 `done`。依赖只在前序命令成功后继续，终审仍可拒绝父任务。
+- 步骤 Prompt 直接携带已完成直接依赖的真实结果（总预算 64,000 字符）和来源消息中 `@任务` 的历史结果（总预算 24,000 字符，再按各任务步骤分配），不再要求 Worker 自行查询上游。超出预算标记 `result_truncated`，Runtime 的 `output_gap` 映射为 `result_incomplete`；不完整证据不能被描述为已经完整阅读。终审每个结果最多使用 12,000 字符，并附带同样的不完整标记，无法确认的验收必须拒绝。
 - 每个编排只有一次规划和一次终审，不自动重试或扩写计划。计划失败或无效进入 `blocked`；步骤执行失败进入 `blocked`；评审证据不足、拒绝或无法解析时停留在 `review`，不能伪造完成。终审只根据返回证据，不虚构独立测试。
 - 重启时按持久化的编排和 Command 状态恢复，不重复创建子任务或命令。`orchestration.list` 仅返回当前 Connector 创建的或其 Worker/协调者参与的编排。
 
@@ -490,8 +491,10 @@ GET    /api/v1/coordinator
 PUT    /api/v1/coordinator
 GET    /api/v1/coordinator/chat
 POST   /api/v1/coordinator/chat
+DELETE /api/v1/coordinator/chat
 GET    /api/v1/orchestrations
 GET    /api/v1/orchestrations/:id
+POST   /api/v1/history/clear
 ```
 
 `POST /api/v1/commands` 至少包含 `worker_id` 和 `input`，可关联 `task_id`、`kind`。创建 Task 时可以同时指定负责人；传入 `orchestrate: true` 时不指定初始负责人，由已启用的中央协调器规划。Connector 的 `task.create` 同样支持该字段，`orchestration.list` 用于受限的编排状态读取。
@@ -579,6 +582,7 @@ agent-hub orchestration list --local
 agent-hub coordinator enable --worker-id worker_... --max-steps 4
 agent-hub coordinator status
 agent-hub coordinator disable
+agent-hub history clear --yes
 
 agent-hub list workers
 agent-hub list tasks
@@ -605,17 +609,24 @@ Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start
 
 ### Dashboard
 
-主界面只有三个视图：
+主界面只有“操作台”和“任务看板”两个视图：
 
-- **中央大脑（默认）**：管理员对话、协调者实况和当前计划。可以只读问答、只规划、规划并执行，或启动已有 `ready` 计划；用中文进展解释正在做什么。
-- **任务**：按父任务归组，展示目标、中文阶段、步骤负责人、实际返回和终审结论，支持按状态筛选。
-- **数字员工**：展示职责、能力、在线状态、当前任务、执行阶段、实时文本和最近结果。协调器的内部 JSON 不作为员工动态展示。
+- **操作台**：中央对话与数字员工。关联任务以紧凑进展卡进入对话时间线；员工默认只显示一个状态、名称、一句简介和 `@`，点击条目展开能力、机器/Runtime、当前工作和实际输出。员工栏标题在内部滚动时固定。
+- **任务看板**：按父任务归组，默认显示全部，支持按状态筛选。卡片区分计划待启动、正在验收、验收未通过和已完成。已完成详情优先展示完整交付正文、整体验收结论与复制操作，执行过程默认收起；进行中的详情仍展示目标、步骤和已返回证据。
 
-Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认证，不进入 URL。底层 Command/Event/API 继续用于审计与恢复，但不在主界面设置命令回执、事件流水或调度表单。
+主界面不设置宣传/教学文案、命令回执、事件流水或调度表单。交付使用 `public/markdown.js` 渲染常用 Markdown 结构，不再截断为 6000 字；Agent 原文先转义，原始 HTML 不执行，链接仅允许安全协议。支持单步和全部结果复制，保留完整原始返回。Enter 发送，Cmd/Ctrl+Enter 或 Shift+Enter 换行；每条消息可复制，Clipboard API 不可用时使用兼容复制路径。中央忙碌时待回复消息显示排队，旧版本留下的超长步骤汇报只在显示层收敛，不改写原始记录。
 
-`POST /api/v1/coordinator/chat` 接收 `{message, request_id}`，返回持久化用户消息和协调者回复；`request_id` 用于重试去重。回复处理及任务进展通过 `chat.updated` 主动推送给已认证的 Dashboard。只有 Admin 能读取或发送对话，Local/Connector API 不暴露此能力。
+输入框的 `@` 提供可键盘操作的员工和任务选择器，保存结构化引用而不是把显示名当成身份。`@员工` 对后续计划的可选 Registry 和计划校验施加同一约束，模型不能改派其他 Worker；`@任务` 只补充真实任务/计划快照，仍遵守启动边界。未选择员工时继续按能力自动匹配。external、离线和协调者本人不作为主动派单目标。
+
+Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认证，不进入 URL。底层 Command/Event/API 继续用于审计与恢复。
+
+`POST /api/v1/coordinator/chat` 接收 `{message, request_id, mentions?}`，其中 `mentions` 是最多 8 个 `{type: "worker"|"task", id}` 的去重引用。Hub 验证真实 ID 与 Worker 的可调度状态，持久化到对话（数据库 `user_version=5`），返回用户消息和协调者回复；`request_id` 用于重试去重。回复处理及任务进展通过 `chat.updated` 主动推送给已认证的 Dashboard。只有 Admin 能读取或发送对话，Local/Connector API 不暴露此能力。
+
+`DELETE /api/v1/coordinator/chat` 清空当前对话批次，不删除任务、命令、事件或内部来源关联。每条消息保存 `conversation_epoch`；清空时递增 epoch，API 和 `chat.cleared` 返回新 epoch，页面忽略旧 epoch 的迟到更新。对话历史及新对话上下文只读取当前 epoch，内部按 ID 查询和编排 @Worker 约束仍然有效。整体历史清理会重置 epoch。
 
 对话模型只能提议四类受控动作：`chat`、`plan`、`orchestrate`、`start`。`plan` 在计划生成后保持 `ready`；`start` 只能启动已有 `ready` 计划，不重跑失败、评审或完成任务。模型不能直接写库、选择任意 API 或取得 Admin Token。回复与活动关联真实 Task/Command，重启后可恢复，失败和结果未知不会伪装成功。
+
+管理员明确执行 `agent-hub history clear --yes` 时，Hub 先在数据目录的 `backups/` 创建一致性 SQLite 快照，再在一个事务中删除历史对话、编排、事件、命令和任务。Connector、Worker、协调者和凭证不变，Worker 的历史任务占用被清空。存在未结束 Command、pending 对话、进行中任务或未完成规划/终审时返回 409；已结束的 blocked/done 和带错误的历史 review 可清理。清理通过 `history.cleared` 通知页面刷新，不作为普通 Agent 的日常操作。
 
 ## 13. 安全边界
 
@@ -624,6 +635,8 @@ Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认�
 - 协调者配置只能由 Admin 修改，Worker 自声明不会获得中央权限。协调器接收的 Registry 不包含 Token、Driver 私有状态或任意 metadata；模型输出始终作为不可信输入进行 Schema、Worker 和依赖校验。
 - 每个编排最多 4 步，只有一次规划和一次终审，不自动重试。父任务只有在全部步骤和整体验收都通过后才能完成，执行失败、证据不足和评审拒绝都不能冒充成功。
 - 管理员对话仅支持 `chat`、`plan`、`orchestrate`、`start` 四类受限动作；计划与启动由 Hub 校验，模型不能自行扩权。`request_id` 和来源消息提供重试去重，对话历史仅向 Admin 开放。
+- `@` 引用只接受 Hub 核验的真实 ID。指定 Worker 时同时约束规划器的 Registry 与返回计划的校验，不能只靠提示词防止改派；external 和离线 Worker 不能冒充可推送。
+- 历史清理要求 Admin 和显式确认，先备份再事务删除；有活动工作则拒绝，Connector/Worker 身份与凭证不在清理范围内。
 - Hub 数据目录、Connector 数据目录和凭证文件不作为静态资源暴露。
 - 默认只监听回环地址；绑定 Tailscale IP 是有意的部署操作。
 - Tailscale 提供加密私网传输，但不替代应用层认证。
@@ -676,7 +689,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：40 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；新增管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离。
+- `pnpm test`：53 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -690,4 +703,13 @@ MVP 完成必须满足：
 - 中央大脑：管理员启用独立 managed `kimi-coordinator-01` 后，通过真实 `--orchestrate` 创建两步依赖任务。协调者生成合法计划并选择 Claude 与 Kimi 执行 Worker，第一步返回 `AGENT_HUB_BRAIN_FIRST_OK`，第二步在依赖完成后返回 `AGENT_HUB_BRAIN_SECOND_OK`，终审全部通过，父任务和两个步骤均为 `done`。真实浏览器中的中央大脑视图已验证协调者、依赖、状态和评审原因，截图保存在 `.runtime/central-brain-dashboard.png`。排查并修复了 Kimi 的心跳、`session_event` 解包和持久化 Session 的 `not_found` 订阅问题：每次执行前 `:reload`，ACK 拒绝立即失败；早期失败和卡住记录保留为 `blocked`/`outcome_unknown`，未改写成成功。
 - 中央对话工作台：2026-10-27 使用独立 Hub/Connector、测试凭证与可控执行器，通过真实 Chrome 验证管理员登录、默认中央页、对话只规划且无执行命令、确认后启动、任务归组、员工实时输出、终审展示、刷新后对话保留及 390px 窄屏；最新完成进展在对话视口内可见，无浏览器脚本异常。截图位于 `.runtime/ui-smoke/`，此结果验证页面与 Hub 流程，不代替真实模型验收。
 - 真实 Kimi 对话闭环：2026-10-27 在隔离 Hub/Connector 中注册两个新的 managed Kimi Session，通过真实 Chrome 先请求只规划，确认计划为 `ready` 且没有执行 Command，再通过对话启动同一计划。执行 Worker 实际返回 `AGENT_HUB_CHAT_UI_OK`，单步与父任务终审均为 `done`；随后验证对话终审、任务状态、员工实际返回、刷新保留及窄屏。结果与截图位于 `.runtime/real-chat-smoke/`，未读写业务文件，未混入正式任务，隔离服务已关闭。正式 Hub 随后已按原 Tailscale 地址和原数据目录重启，健康检查通过，原凭证与 Worker 注册保留；尚未进行第二台 Mac 的跨机验收。
+- 单页团队工作台：2026-10-27 使用全新隔离 Hub/Connector 和可控执行器，通过真实 Chrome 验证三个 Tab 合并为单页、@员工选择、键盘名称优先匹配、指定员工派单、员工实时状态、任务详情弹层、@任务引用不新建或执行工作、刷新保留及 390px 移动布局。external 的主动派单按钮不可用，浏览器无脚本异常；结果和截图位于 `.runtime/unified-ui-smoke/`。
+- 真实 @员工闭环：2026-10-27 使用两个全新的隔离 managed Kimi Session，通过真实 Chrome @指定执行员工，实际返回 `AGENT_HUB_MENTION_UI_OK`。所有执行步骤都分配给所选 Worker，父任务与终审均为 `done`，对话刷新后保留，移动端无横向溢出。报告位于 `.runtime/real-mention-smoke/browser-result.json`，未混入正式任务，隔离服务已正常关闭。
+- 单页正式部署与历史清理：2026-10-27 按原 Tailscale 地址和数据目录重启正式 Hub/Connector，迁移到 `user_version=4` 后通过 Admin CLI 创建清理前 SQLite 备份（`.runtime/hub/backups/`），删除 10 个历史 Task、15 个 Command、5 个 Orchestration、4 条对话及旧事件。原 4 位 Worker 均保留并恢复在线、空闲、可推送，协调者配置不变；当前任务、命令、编排和对话均为 0。Dashboard HTTP 200、未认证对话 401、Connector 连接正常，页面已在本机 Chrome 打开，原 Admin Token 未更换。
+- 精简双视图与对话操作：2026-10-27 使用全新隔离 Hub/Connector 和真实 Chrome 验证操作台/任务看板两个视图、员工栏标题固定、紧凑员工与展开详情、Enter 发送、Cmd/Ctrl+Enter 换行、Clipboard API 与兼容复制、清空后旧 epoch 回复不回流、任务保留及 390px 移动布局。浏览器无脚本异常，报告与截图位于 `.runtime/compact-ui-smoke/`，临时服务由子进程启动器正常关闭。
+- 精简工作台正式更新：2026-10-27 按原 Tailscale 地址和数据目录重启，数据库迁移到 `user_version=5`。未再次清空历史，现有对话与任务保留；4 位 Worker 均在线、空闲，协调者配置不变。两个视图、版本化静态资源、固定员工标题和复制功能检查通过，未认证清空对话返回 401，Connector 正常连接，精简页面已在本机 Chrome 打开。
+- 任务过程与交付优化：2026-10-27 在隔离 Hub/Connector 中通过真实 Chrome 验证只规划后按钮启动、两步执行、运行中 Command 优先展示、排队提示、完整交付、单步/全部复制、看板默认全部、@任务返回操作台、清空后旧回复不回流及移动端。详情按任务和阶段重置默认布局，同时保留当前阶段的手动展开状态。报告与截图位于 `.runtime/delivery-ui-smoke/browser-result.json`，无浏览器脚本异常。
+- 万圣节实际任务复盘：核对正式 Codex 方案、Kimi 审核和中央终审，确认两步按依赖顺序完成且父任务为 `done`。将该任务的只读记录复制到隔离环境验证页面，方案全文、改进建议、表格和两份结果原文复制均一致；旧版超长步骤汇报仅在显示层收敛，正式数据未被修改。报告与截图位于 `.runtime/delivery-ui-smoke/fixture-browser-result.json`。
+- 真实双 Runtime 交付闭环：2026-10-27 使用全新隔离 Codex/Kimi managed Session 和真实 Chrome，Codex 先返回《交付闭环》Markdown，Kimi 的后续 Prompt 直接包含完全一致的上游正文并完成审核，中央终审与父任务均为 `done`。验证了顺序、依赖正文逐字一致、`result_truncated=false`、结果页及完整复制；报告位于 `.runtime/real-delivery-smoke/browser-result.json`，未混入正式任务，隔离服务已关闭。
+- 任务交付优化正式上线：2026-10-27 在原 Tailscale 地址和原数据目录重启正式 Hub/Connector，数据库保持 `user_version=5`。3 个 Task、1 个 Orchestration、7 个 Command、11 条对话及 4 位 Worker 均保留，员工在线空闲，协调者配置与凭证不变。Dashboard 和 Markdown 静态资源返回 200，未认证清空对话仍返回 401，Connector 连接正常；已重载现有 Chrome 中控页。未清理历史、未新增正式任务或修改 Worker 注册。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。

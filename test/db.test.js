@@ -46,7 +46,9 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
+  assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'conversation_epoch'));
   const migrated = store.getOrchestration('orch_legacy');
   assert.equal(migrated.summary, 'Legacy plan');
   assert.equal(migrated.auto_start, true);
@@ -68,7 +70,10 @@ test('Chat and orchestration idempotency survive reopening the database', async 
     name: 'db-worker', runtime: 'test', mode: 'managed', runtime_session_id: 'db-session',
     capabilities: ['testing'], cwd: root, metadata: {},
   });
-  const user = store.createChatMessage({ role: 'user', content: '只规划', requestId: 'same-request' });
+  const user = store.createChatMessage({
+    role: 'user', content: '只规划', requestId: 'same-request',
+    mentions: [{ type: 'worker', id: worker.worker_id }],
+  });
   assert.equal(store.createChatMessage({ role: 'user', content: '重复请求', requestId: 'same-request' }).message_id, user.message_id);
   const reply = store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey: `chat-reply:${user.message_id}` });
   assert.equal(store.createChatMessage({ role: 'coordinator', sourceKey: `chat-reply:${user.message_id}` }).message_id, reply.message_id);
@@ -94,7 +99,31 @@ test('Chat and orchestration idempotency survive reopening the database', async 
   assert.equal(restored.source_message_id, reply.message_id);
   const messages = store.listChatMessages();
   assert.equal(messages.length, 2);
+  assert.deepEqual(messages[0].mentions, [{ type: 'worker', id: worker.worker_id }]);
   assert.equal(messages[1].content, '计划已保存');
   assert.equal(messages[1].task_id, created.task.task_id);
   assert.equal(store.createChatMessage({ role: 'user', content: '再试一次', requestId: 'same-request' }).message_id, user.message_id);
+});
+
+test('Conversation epochs filter visible chat without deleting source messages', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  let store = new HubStore(filename);
+  t.after(() => {
+    if (store) store.close();
+  });
+  const first = store.createChatMessage({ role: 'user', content: 'Old epoch', requestId: 'old-epoch' });
+  assert.equal(first.conversation_epoch, 0);
+  assert.equal(store.clearConversation(), 1);
+  const second = store.createChatMessage({ role: 'user', content: 'New epoch', requestId: 'new-epoch' });
+  assert.equal(second.conversation_epoch, 1);
+  assert.deepEqual(store.listChatMessages({ epoch: 1 }).map((message) => message.content), ['New epoch']);
+  assert.equal(store.listChatMessages().length, 2);
+  store.close();
+  store = new HubStore(filename);
+  assert.equal(store.conversationEpoch(), 1);
+  assert.deepEqual(store.listChatMessages({ epoch: 1 }).map((message) => message.content), ['New epoch']);
+  assert.equal(store.getChatMessage(first.message_id).content, 'Old epoch');
+  assert.equal(store.clearConversation(), 2);
+  assert.deepEqual(store.listChatMessages({ epoch: 2 }), []);
 });

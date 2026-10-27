@@ -25,6 +25,7 @@ Usage:
                  [--local] [--wait]
   agent-hub orchestration list [--local]
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
+  agent-hub history clear --yes
   agent-hub list workers|connectors|tasks|commands|events
 
 Environment:
@@ -37,7 +38,7 @@ Environment:
   AGENT_HUB_CODEX_MODEL         Default model for managed Codex Workers
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -324,6 +325,15 @@ async function orchestrationCommand(positionals, flags) {
   print(await request(flags, flags.local ? '/local/v1/orchestrations' : '/api/v1/orchestrations'));
 }
 
+async function historyCommand(positionals, flags) {
+  if (positionals[0] !== 'clear') throw new Error('Usage: agent-hub history clear --yes');
+  if (flags.yes !== true) throw new Error('History clearing requires explicit --yes; a database backup is created first');
+  print(await adminRequest(flags, '/api/v1/history/clear', {
+    method: 'POST',
+    body: { confirm: true },
+  }));
+}
+
 export async function run(argv) {
   const { positionals, flags, passthrough } = parseArgs(argv);
   const command = positionals[0];
@@ -353,6 +363,10 @@ export async function run(argv) {
   }
   if (command === 'orchestration') {
     await orchestrationCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'history') {
+    await historyCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'task') {

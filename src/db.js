@@ -136,6 +136,8 @@ function chatMessageView(row) {
     command_id: row.command_id,
     task_id: row.task_id,
     source_key: row.source_key,
+    mentions: parseJson(row.mentions_json ?? '[]', []),
+    conversation_epoch: Number(row.conversation_epoch ?? 0),
     created_at: row.created_at,
   };
 }
@@ -258,7 +260,13 @@ export class HubStore {
         command_id TEXT UNIQUE REFERENCES commands(command_id),
         task_id TEXT REFERENCES tasks(task_id),
         source_key TEXT UNIQUE,
+        mentions_json TEXT NOT NULL DEFAULT '[]',
+        conversation_epoch INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS coordinator_chat_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        epoch INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_workers_connector ON workers(connector_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_worker_id);
@@ -281,10 +289,17 @@ export class HubStore {
     for (const [name, definition] of Object.entries(additions)) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE coordinator_orchestrations ADD COLUMN ${name} ${definition}`);
     }
+    const chatColumns = new Set(this.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().map((column) => column.name));
+    if (!chatColumns.has('mentions_json')) {
+      this.db.exec("ALTER TABLE coordinator_chat_messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!chatColumns.has('conversation_epoch')) {
+      this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN conversation_epoch INTEGER NOT NULL DEFAULT 0');
+    }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
-      PRAGMA user_version = 3;
+      PRAGMA user_version = 5;
     `);
   }
 
@@ -664,7 +679,7 @@ export class HubStore {
     return this.getOrchestration(orchestrationId);
   }
 
-  createChatMessage({ role, content = '', status = 'done', requestId = null, commandId = null, taskId = null, sourceKey = null }) {
+  createChatMessage({ role, content = '', status = 'done', requestId = null, commandId = null, taskId = null, sourceKey = null, mentions = [] }) {
     const existing = requestId
       ? this.getChatMessageByRequestId(requestId)
       : sourceKey
@@ -672,11 +687,12 @@ export class HubStore {
         : null;
     if (existing) return existing;
     const messageId = createId('chat');
+    const conversationEpoch = this.conversationEpoch();
     this.db.prepare(`
       INSERT INTO coordinator_chat_messages (
-        message_id, role, content, status, request_id, command_id, task_id, source_key, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, role, content, status, requestId, commandId, taskId, sourceKey, now());
+        message_id, role, content, status, request_id, command_id, task_id, source_key, mentions_json, conversation_epoch, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, role, content, status, requestId, commandId, taskId, sourceKey, stringifyJson(mentions), conversationEpoch, now());
     return this.getChatMessage(messageId);
   }
 
@@ -704,11 +720,25 @@ export class HubStore {
     `).get(commandId));
   }
 
-  listChatMessages({ limit = 200 } = {}) {
+  conversationEpoch() {
+    return Number(this.db.prepare('SELECT epoch FROM coordinator_chat_state WHERE singleton = 1').get()?.epoch ?? 0);
+  }
+
+  clearConversation() {
+    return Number(this.db.prepare(`
+      INSERT INTO coordinator_chat_state (singleton, epoch) VALUES (1, 1)
+      ON CONFLICT(singleton) DO UPDATE SET epoch = coordinator_chat_state.epoch + 1
+      RETURNING epoch
+    `).get().epoch);
+  }
+
+  listChatMessages({ limit = 200, epoch = null } = {}) {
+    const where = epoch === null ? '' : 'WHERE conversation_epoch = ?';
+    const values = epoch === null ? [limit] : [epoch, limit];
     return this.db.prepare(`
-      SELECT * FROM coordinator_chat_messages
+      SELECT * FROM coordinator_chat_messages ${where}
       ORDER BY created_at DESC, rowid DESC LIMIT ?
-    `).all(limit).map(chatMessageView).reverse();
+    `).all(...values).map(chatMessageView).reverse();
   }
 
   listPendingChatMessages() {
@@ -732,6 +762,41 @@ export class HubStore {
       WHERE message_id = ?
     `).run(content, status, commandId, taskId, messageId);
     return this.getChatMessage(messageId);
+  }
+
+  assertHistoryClearable() {
+    const active = {
+      commands: this.db.prepare("SELECT COUNT(*) AS count FROM commands WHERE status IN ('queued', 'accepted', 'running', 'waiting_manual')").get().count,
+      tasks: this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE status = 'in_progress'").get().count,
+      orchestrations: this.db.prepare("SELECT COUNT(*) AS count FROM coordinator_orchestrations WHERE status IN ('planning', 'in_progress') OR (status = 'review' AND error_json IS NULL)").get().count,
+      pending_messages: this.db.prepare("SELECT COUNT(*) AS count FROM coordinator_chat_messages WHERE status = 'pending'").get().count,
+    };
+    if (Object.values(active).some((count) => count > 0)) {
+      const error = new Error('Cannot clear history while work is active');
+      error.code = 'history_active';
+      error.statusCode = 409;
+      error.active = active;
+      throw error;
+    }
+  }
+
+  backup(filename) {
+    this.db.prepare('VACUUM INTO ?').run(filename);
+  }
+
+  clearHistory() {
+    this.assertHistoryClearable();
+    const tables = ['coordinator_chat_messages', 'coordinator_orchestrations', 'events', 'commands', 'tasks'];
+    const cleared = Object.fromEntries(tables.map((table) => [
+      table,
+      this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+    ]));
+    this.transaction(() => {
+      for (const table of tables) this.db.exec(`DELETE FROM ${table}`);
+      this.db.exec('DELETE FROM coordinator_chat_state');
+      this.db.prepare("UPDATE workers SET work_state = 'idle', current_task_id = NULL, updated_at = ?").run(now());
+    });
+    return cleared;
   }
 
   latestTaskEvent(taskId, eventType) {

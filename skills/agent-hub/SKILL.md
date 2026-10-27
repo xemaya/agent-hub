@@ -199,7 +199,7 @@ agent-hub task update --local TASK_ID --status done \
 
 未满足时保持真实状态并说明缺口；只有确实存在阻塞时才使用 `blocked`。本机任务更新只允许修改分配给当前 Connector 的任务状态，不能操作其他机器的任务。
 
-最终向用户简要返回：`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。任务视图与数字员工的工作状态会自动更新，不要求用户在网页上补录。
+最终向用户简要返回：`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。同页任务区与数字员工状态会自动更新，不要求用户在网页上补录。
 
 ## 交给中央大脑：全局规划与编排
 
@@ -216,7 +216,7 @@ agent-hub task create --local --orchestrate \
 
 `--orchestrate` 会立即规划并执行，因此只在用户明确要求中央协调执行时使用；仅记录任务仍用普通创建。中央协调者负责选择 Worker、拆步骤和最终评审，不要再用 `send` 给父任务派发普通命令，不要手工关闭父任务。
 
-管理员也可以在中控网页与中央大脑对话：“先只规划，不要执行”会保存 `ready` 计划而不派发步骤，“开始执行”只启动已有的 `ready` 计划。网页对话需要 Admin Token；你持有的 Local Token 不能读取或发送管理员对话，不要尝试绕过。Agent 的 Skill、CLI 和 Local Token 流程不变，不要代替用户在网页中输入。
+管理员也可以在操作台与中央大脑对话：“先只规划，不要执行”会保存 `ready` 计划而不派发步骤，“开始执行”按钮或对话只启动已有的 `ready` 计划。输入 `@` 可点名 managed 员工或引用任务；点击员工旁的 `@` 只带入输入框，发送明确要求后才安排工作。任务看板默认显示全部任务，完成详情优先展示完整交付和验收结论。网页对话需要 Admin Token；你持有的 Local Token 不能读取、发送或清空管理员对话，不要尝试绕过。Agent 的 Skill、CLI 和 Local Token 流程不变，不要代替用户在网页中输入。
 
 需要向用户汇报进度时，按需执行一次：
 
@@ -225,7 +225,7 @@ agent-hub orchestration list --local \
   --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
 ```
 
-返回总任务、编排状态、步骤负责人、依赖和评审原因。不要循环查询。`blocked`、`review` 都不是完成；只有父任务和全部步骤符合终审结果时才报告 `done`。
+返回总任务、编排状态、步骤负责人、依赖和评审原因。不要循环查询。`blocked`、`review` 都不是完成；只有父任务和全部步骤符合终审结果时才报告 `done`。作为编排 Worker 收到步骤时，输入已经携带直接依赖及 `@任务` 引用的真实结果，优先直接使用，不需要自行查询上游；如果标记 `result_truncated` 或 `result_incomplete`，不能声称已完整阅读，证据不足要如实报告。
 
 如果返回 `coordinator_disabled`，说明中央大脑尚未由管理员启用，不要退回到普通派发冒充中央编排，也不要自行获取 Admin Token。只有用户明确要求配置中央大脑时，才先注册一个独立的 managed 协调者 Worker，再由管理员通过 `agent-hub coordinator enable --worker-id ...` 启用；本地 Hub 可显式使用 `--hub-data-dir`，由 CLI 内部读取凭证，不能打印或转交 Token。
 

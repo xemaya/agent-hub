@@ -15,6 +15,7 @@ function scriptedDriver() {
     chat: null,
     chatGate: null,
     workGate: null,
+    work: null,
     failWork: false,
     async prepareWorker(input) {
       sequence += 1;
@@ -32,7 +33,7 @@ function scriptedDriver() {
           ? driver.review
           : command.kind === 'coordinator_chat'
             ? typeof driver.chat === 'function' ? await driver.chat(command) : driver.chat
-            : `completed:${worker.name}`;
+            : typeof driver.work === 'function' ? await driver.work({ worker, command }) : `completed:${worker.name}`;
       onOutput(`${text}\n`);
       return { text, session_id: worker.runtime_session_id };
     },
@@ -138,7 +139,10 @@ test('Coordinator plans, dispatches dependencies and completes final review', as
   );
   assert.match(driver.executions[1].input, /Complete first step/);
   assert.match(driver.executions[2].input, /Complete second step/);
+  assert.match(driver.executions[2].input, /completed:worker-test/);
+  assert.match(driver.executions[2].input, /"result_truncated": false/);
   assert.equal(completed.error, null);
+  assert.equal(completed.source_message_id, null);
   const status = await context.admin('/api/v1/coordinator');
   assert.equal(status.payload.coordinator.active_orchestrations, 0);
   const local = await context.local('/local/v1/orchestrations');
@@ -348,8 +352,9 @@ test('Chat planning stays ready, then starts the same plan and reports real comp
   const activities = messages.filter((message) => message.role === 'activity' && message.task_id === planned.parent_task_id);
   assert.ok(activities.some((message) => message.content.includes('尚未执行')));
   assert.ok(activities.some((message) => message.content.includes('已按现有计划启动')));
-  assert.ok(activities.some((message) => message.content.includes('终审结论：All evidence passes')));
+  assert.ok(activities.some((message) => message.content.includes('已完成') && message.content.includes('2 项交付结果')));
   assert.ok(activities.every((message) => !message.content.includes('"worker_id"')));
+  assert.ok(activities.every((message) => !message.content.includes('completed:worker-test')));
   await waitFor(() => dashboard.messages.some((message) => (
     message.type === 'chat.updated' && message.payload.message.message_id === startedReply.message_id
   )));
@@ -457,4 +462,258 @@ test('Persisted chat resumes once after Hub restart and orphaned pending replies
   assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_chat').length, 0);
   assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_plan').length, 1);
   assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 0);
+});
+
+test('An @Worker mention constrains planning and survives restart without rerouting', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  const other = await context.registerWorker({ name: 'other-worker', runtime_session_id: 'other-mentioned-worker' });
+  driver.chat = JSON.stringify({
+    reply: '交给你指定的员工。',
+    action: {
+      type: 'orchestrate',
+      task: {
+        title: 'Mentioned Worker assignment', goal: 'Only the selected Worker executes',
+        context: 'Browser supplied a structured mention', acceptance: ['Selected Worker returns evidence'],
+      },
+    },
+  });
+  driver.plan = JSON.stringify({
+    summary: 'Use the explicitly selected Worker',
+    steps: [{
+      key: 'assigned', title: 'Assigned work', goal: 'Return evidence', context: '',
+      acceptance: ['Evidence returned'], worker_id: worker.worker_id, depends_on: [], rationale: 'Explicitly mentioned',
+    }],
+  });
+  driver.review = JSON.stringify({
+    parent_pass: true, reason: 'Mentioned assignment passes',
+    steps: [{ key: 'assigned', pass: true, reason: 'Evidence is present' }],
+  });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: {
+      message: '@worker-test 请完成这项工作', request_id: 'mention-worker',
+      mentions: [{ type: 'worker', id: worker.worker_id }, { type: 'worker', id: worker.worker_id }],
+    },
+  });
+  assert.equal(sent.response.status, 202);
+  assert.deepEqual(sent.payload.user.mentions, [{ type: 'worker', id: worker.worker_id }]);
+  const created = await waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/orchestrations');
+    return payload.orchestrations.find((item) => item.source_message_id === sent.payload.message.message_id) ?? null;
+  });
+  const completed = await waitForOrchestration(context, created.orchestration_id, 'done');
+  assert.equal(completed.steps.length, 1);
+  assert.equal(completed.steps[0].worker_id, worker.worker_id);
+  assert.deepEqual(driver.executions.filter((item) => item.kind === 'prompt').map((item) => item.worker), ['worker-test']);
+  const planning = driver.executions.find((item) => item.kind === 'coordinator_plan');
+  assert.match(planning.input, new RegExp(worker.worker_id));
+  assert.doesNotMatch(planning.input, new RegExp(other.worker_id));
+  const callCount = driver.executions.length;
+  await context.restartHub();
+  assert.equal(driver.executions.length, callCount);
+  const restored = context.hub.store.getChatMessage(sent.payload.user.message_id);
+  assert.deepEqual(restored.mentions, [{ type: 'worker', id: worker.worker_id }]);
+  await context.hub.coordinator.resume();
+  assert.equal(driver.executions.length, callCount);
+});
+
+test('A plan that ignores an @Worker mention is blocked before dispatch', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  const other = await context.registerWorker({ name: 'wrong-worker', runtime_session_id: 'wrong-target' });
+  driver.chat = JSON.stringify({
+    reply: '按指定员工安排。',
+    action: {
+      type: 'orchestrate',
+      task: { title: 'Reject rerouting', goal: 'Do not use another Worker', context: '', acceptance: ['No rerouting'] },
+    },
+  });
+  driver.plan = JSON.stringify({
+    summary: 'Invalid rerouting attempt',
+    steps: [{
+      key: 'wrong', title: 'Wrong target', goal: 'Must not run', context: '', acceptance: ['Never runs'],
+      worker_id: other.worker_id, depends_on: [], rationale: 'Deliberately wrong',
+    }],
+  });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: { message: '@worker-test 只能交给你', mentions: [{ type: 'worker', id: worker.worker_id }] },
+  });
+  const created = await waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/orchestrations');
+    return payload.orchestrations.find((item) => item.source_message_id === sent.payload.message.message_id) ?? null;
+  });
+  const blocked = await waitForOrchestration(context, created.orchestration_id, 'blocked');
+  assert.equal(blocked.error.code, 'coordinator_plan_invalid');
+  assert.match(blocked.error.message, /unavailable Worker/);
+  assert.equal(blocked.steps.length, 0);
+  assert.equal(driver.executions.filter((item) => item.kind === 'prompt').length, 0);
+});
+
+test('@Task supplies real context and invalid or manual Worker mentions are rejected', async (t) => {
+  const { context, driver, coordinator, worker } = await setup(t);
+  const referenced = await context.admin('/api/v1/tasks', {
+    method: 'POST',
+    body: {
+      title: 'Referenced existing task', goal: 'CONTEXT_ONLY_FROM_THE_REFERENCED_TASK',
+      context: 'Known historical context', acceptance: ['Existing acceptance'], assignee_worker_id: worker.worker_id,
+    },
+  });
+  const task = referenced.payload.task;
+  driver.chat = JSON.stringify({ reply: '我只读取引用，没有启动或新建任务。', action: { type: 'chat' } });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: { message: '看一下 @Referenced existing task 的验收', mentions: [{ type: 'task', id: task.task_id }] },
+  });
+  const reply = await chatReply(context, sent.payload.message.command_id);
+  assert.equal(reply.status, 'done');
+  const execution = driver.executions.find((item) => item.command_id === sent.payload.message.command_id);
+  assert.match(execution.input, /CONTEXT_ONLY_FROM_THE_REFERENCED_TASK/);
+  assert.match(execution.input, new RegExp(task.task_id));
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 1);
+  assert.equal(driver.executions.filter((item) => item.kind !== 'coordinator_chat').length, 0);
+
+  const external = await context.registerWorker({ name: 'manual-worker', mode: 'external', runtime_session_id: 'manual-target' });
+  for (const [mentions, status] of [
+    [[{ type: 'worker', id: 'worker_missing' }], 404],
+    [[{ type: 'task', id: 'task_missing' }], 404],
+    [[{ type: 'worker', id: external.worker_id }], 409],
+    [[{ type: 'worker', id: coordinator.worker_id }], 409],
+    [[{ type: 'unknown', id: task.task_id }], 400],
+  ]) {
+    const rejected = await context.admin('/api/v1/coordinator/chat', {
+      method: 'POST', body: { message: 'Invalid mention', mentions },
+    });
+    assert.equal(rejected.response.status, status);
+  }
+  assert.equal((await context.admin('/api/v1/coordinator/chat')).payload.messages.length, 2);
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 1);
+});
+
+test('Clearing conversation preserves plans and starts a new visible epoch', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  const dashboard = await context.openDashboard();
+  driver.chat = JSON.stringify({
+    reply: '先保存计划。',
+    action: {
+      type: 'plan',
+      task: {
+        title: 'Conversation clear preserves plan', goal: 'Start after clearing chat',
+        context: 'Keep orchestration and mentions', acceptance: ['Plan survives', 'Worker constraint survives'],
+      },
+    },
+  });
+  const sent = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: {
+      message: '@worker-test 先规划', request_id: 'clear-chat-plan',
+      mentions: [{ type: 'worker', id: worker.worker_id }],
+    },
+  });
+  const plannedReply = await chatReply(context, sent.payload.message.command_id);
+  const planned = await waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/orchestrations');
+    return payload.orchestrations.find((item) => item.source_message_id === plannedReply.message_id && item.status === 'ready');
+  });
+  const internalCount = context.hub.store.listChatMessages().length;
+  const unauthorized = await fetch(`${context.hub.url}/api/v1/coordinator/chat`, { method: 'DELETE' });
+  assert.equal(unauthorized.status, 401);
+  assert.equal((await context.local('/local/v1/coordinator/chat')).response.status, 404);
+  const cleared = await context.admin('/api/v1/coordinator/chat', { method: 'DELETE' });
+  assert.equal(cleared.response.status, 200);
+  assert.equal(cleared.payload.epoch, 1);
+  const visible = await context.admin('/api/v1/coordinator/chat');
+  assert.deepEqual(visible.payload.messages, []);
+  assert.equal(visible.payload.epoch, 1);
+  assert.equal(context.hub.store.listChatMessages().length, internalCount);
+  assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 3);
+  assert.equal(context.hub.store.getOrchestration(planned.orchestration_id).status, 'ready');
+  assert.deepEqual(context.hub.coordinator.orchestrationWorkerIds(planned), [worker.worker_id]);
+  await waitFor(() => dashboard.messages.some((message) => message.type === 'chat.cleared' && message.payload.epoch === 1));
+
+  driver.chat = JSON.stringify({
+    reply: '按原计划启动。',
+    action: { type: 'start', orchestration_id: planned.orchestration_id },
+  });
+  const started = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '开始执行', request_id: 'after-clear-start' },
+  });
+  const completed = await waitForOrchestration(context, planned.orchestration_id, 'done');
+  assert.equal(completed.parent_task.status, 'done');
+  assert.ok(completed.steps.every((step) => step.worker_id === worker.worker_id));
+  await chatReply(context, started.payload.message.command_id);
+  const next = await context.admin('/api/v1/coordinator/chat');
+  assert.equal(next.payload.epoch, 1);
+  assert.ok(next.payload.messages.length > 0);
+  assert.ok(next.payload.messages.every((message) => message.conversation_epoch === 1));
+  assert.ok(next.payload.messages.every((message) => message.request_id !== 'clear-chat-plan'));
+  assert.equal(context.hub.store.listChatMessages().length > internalCount, true);
+});
+
+test('Long dependency evidence is bounded and explicitly marked as truncated', async (t) => {
+  const { context, driver } = await setup(t);
+  driver.work = ({ command }) => command.input.includes('Complete first step')
+    ? `DEPENDENCY_BEGIN:${'上'.repeat(65000)}:DEPENDENCY_END`
+    : 'SECOND_RESULT_OK';
+  const created = await createWithCli(context);
+  const completed = await waitForOrchestration(context, created.orchestration.orchestration_id, 'done');
+  assert.equal(completed.parent_task.status, 'done');
+  const work = driver.executions.filter((execution) => execution.kind === 'prompt');
+  const dependencyJson = work[1].input.split('已完成依赖步骤的真实结果 JSON:\n')[1].split('\n\n对话中引用的历史任务')[0];
+  const [dependency] = JSON.parse(dependencyJson);
+  assert.equal(dependency.result.length, 64000);
+  assert.equal(dependency.result_truncated, true);
+  assert.equal(dependency.result.startsWith('DEPENDENCY_BEGIN:'), true);
+  assert.equal(dependency.result.includes('DEPENDENCY_END'), false);
+  assert.match(driver.executions.find((execution) => execution.kind === 'coordinator_review').input, /"result_truncated": true/);
+  const messages = (await context.admin('/api/v1/coordinator/chat')).payload.messages;
+  assert.ok(messages.filter((message) => message.role === 'activity').every((message) => !message.content.includes('DEPENDENCY_BEGIN')));
+});
+
+test('Follow-up work receives the complete referenced deliverable without rerunning the old task', async (t) => {
+  const { context, driver, worker } = await setup(t);
+  driver.plan = JSON.stringify({
+    summary: 'One deliverable step',
+    steps: [{
+      key: 'only', title: 'Produce deliverable', goal: 'Use the supplied source material', context: '',
+      acceptance: ['Return a complete result'], worker_id: worker.worker_id, depends_on: [], rationale: 'Suitable Worker',
+    }],
+  });
+  driver.review = JSON.stringify({
+    parent_pass: true, reason: 'Evidence passes',
+    steps: [{ key: 'only', pass: true, reason: 'Complete result returned' }],
+  });
+  const artifact = `HISTORICAL_RESULT_${'完整交付'.repeat(400)}_END`;
+  driver.work = () => artifact;
+  const action = (title) => JSON.stringify({
+    reply: '已安排',
+    action: { type: 'orchestrate', task: { title, goal: 'Continue with real evidence', context: '', acceptance: ['Use the complete result'] } },
+  });
+  driver.chat = action('Original deliverable');
+  const original = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST', body: { message: '创建原始交付', request_id: 'reference-original' },
+  });
+  const originalReply = await chatReply(context, original.payload.message.command_id);
+  const first = await waitForOrchestration(context, context.hub.store.getOrchestrationByTask(originalReply.task_id).orchestration_id, 'done');
+  const originalCommandId = first.steps[0].command_id;
+
+  driver.chat = action('Follow-up deliverable');
+  const followUp = await context.admin('/api/v1/coordinator/chat', {
+    method: 'POST',
+    body: {
+      message: '基于旧任务继续完成修订', request_id: 'reference-follow-up',
+      mentions: [{ type: 'task', id: first.parent_task_id }],
+    },
+  });
+  const followUpReply = await chatReply(context, followUp.payload.message.command_id);
+  await waitForOrchestration(context, context.hub.store.getOrchestrationByTask(followUpReply.task_id).orchestration_id, 'done');
+  const work = driver.executions.filter((execution) => execution.kind === 'prompt');
+  assert.equal(work.length, 2);
+  const referenceJson = work[1].input.split('对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:\n')[1];
+  const [reference] = JSON.parse(referenceJson);
+  assert.equal(reference.orchestration.steps[0].result, artifact);
+  assert.equal(reference.orchestration.steps[0].result_truncated, false);
+  assert.ok(artifact.length > 600);
+  const preserved = context.hub.store.getOrchestration(first.orchestration_id);
+  assert.equal(preserved.status, 'done');
+  assert.equal(preserved.steps[0].command_id, originalCommandId);
 });

@@ -9,6 +9,7 @@ import { bearerToken, hashToken, tokensEqual } from './auth.js';
 import { loadHubCredentials } from './credentials.js';
 import { createId, createToken } from './ids.js';
 import { readJsonBody, sendJson, sendText } from './json.js';
+import { readBuildInfo, shortCommit } from './build-info.js';
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
 const STATIC_FILES = new Map([
@@ -134,8 +135,10 @@ function workerInput(payload) {
 }
 
 export class Hub {
-  constructor({ host, port, dataDir, credentials, logger = console }) {
+  constructor({ host, port, dataDir, credentials, logger = console, build = null }) {
     this.host = host;
+    this.build = build ?? { version: null, commit: null, dirty: false };
+    this.connectorBuilds = new Map();
     this.requestedPort = port;
     this.dataDir = path.resolve(dataDir);
     this.logger = logger;
@@ -188,8 +191,10 @@ export class Hub {
     const dataDir = path.resolve(options.dataDir ?? '.runtime/hub');
     await mkdir(dataDir, { recursive: true, mode: 0o700 });
     const credentials = options.credentials ?? await loadHubCredentials(dataDir, options.env);
+    const build = options.build ?? await readBuildInfo();
     return new Hub({
       ...options,
+      build,
       host: options.host ?? '127.0.0.1',
       port: options.port ?? 8787,
       dataDir,
@@ -303,7 +308,7 @@ export class Hub {
     const url = new URL(request.url, 'http://localhost');
     const pathname = url.pathname;
     if (request.method === 'GET' && pathname === '/healthz') {
-      sendJson(response, 200, { ok: true, service: 'agent-hub' });
+      sendJson(response, 200, { ok: true, service: 'agent-hub', version: this.build.version, commit: this.build.commit });
       return;
     }
     if (request.method === 'GET' && STATIC_FILES.has(pathname)) {
@@ -399,7 +404,12 @@ export class Hub {
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/connectors') {
-      sendJson(response, 200, { connectors: this.store.listConnectors() });
+      sendJson(response, 200, {
+        connectors: this.store.listConnectors().map((connector) => ({
+          ...connector,
+          build: this.connectorBuilds.get(connector.connector_id) ?? null,
+        })),
+      });
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/workers') {
@@ -608,8 +618,9 @@ export class Hub {
           if (previous && previous !== socket) previous.close(1008, 'Replaced by newer connection');
           this.connectors.set(connectorId, socket);
           this.store.setConnectorOnline(connectorId, true);
+          this.recordConnectorBuild(connectorId, message.payload.build);
           this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
-          this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId) });
+          this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId), hub: this.build });
           this.replay(connectorId);
           this.coordinator.resume().catch((error) => this.logger.error?.(error));
         }
@@ -644,8 +655,21 @@ export class Hub {
     return worker ? command : null;
   }
 
+  recordConnectorBuild(connectorId, build) {
+    const commit = typeof build?.commit === 'string' ? build.commit : null;
+    this.connectorBuilds.set(connectorId, { version: build?.version ?? null, commit, dirty: Boolean(build?.dirty) });
+    if (commit && this.build.commit && commit !== this.build.commit) {
+      this.logger.error?.(`Connector ${connectorId} runs ${shortCommit(commit)}, Hub runs ${shortCommit(this.build.commit)}`);
+    }
+  }
+
   async handleConnectorMessage(socket, connectorId, message) {
     const payload = message.payload ?? {};
+    if (message.type === 'connector.heartbeat') {
+      this.store.touchConnector(connectorId);
+      this.send(socket, 'connector.heartbeat', { ts: new Date().toISOString() }, message.id);
+      return;
+    }
     if (message.type === 'orchestration.list') {
       this.send(socket, 'orchestration.list', {
         orchestrations: this.coordinator.listForConnector(connectorId),

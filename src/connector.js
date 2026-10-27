@@ -6,15 +6,21 @@ import { bearerToken, tokensEqual } from './auth.js';
 import { createId } from './ids.js';
 import { readJsonBody, sendJson } from './json.js';
 import { createDefaultDrivers } from './drivers/index.js';
+import { readBuildInfo, shortCommit } from './build-info.js';
 
 function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
+  const state = { settled: false };
+  state.promise = new Promise((resolve, reject) => {
+    state.resolve = (value) => {
+      state.settled = true;
+      resolve(value);
+    };
+    state.reject = (error) => {
+      state.settled = true;
+      reject(error);
+    };
   });
-  return { promise, resolve, reject };
+  return state;
 }
 
 function localError(message, statusCode = 400) {
@@ -50,6 +56,20 @@ export class Connector {
     this.commandWaiters = new Map();
     this.commandWaitTimeoutMs = options.commandWaitTimeoutMs ?? 600000;
     this.activeWorkers = new Set();
+    this.build = options.build ?? { version: null, commit: null, dirty: false };
+    this.hubBuild = null;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 20000;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15000;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 10000;
+    this.watchdogTimer = null;
+    this.heartbeatInFlight = false;
+    this.lastHeartbeatAt = 0;
+    this.socketStartedAt = 0;
+    this.everReady = false;
+    this.onVersionMismatch = options.onVersionMismatch ?? null;
+    this.checkedHubCommits = new Set();
+    this.onRestartRequested = options.onRestartRequested ?? null;
+    this.restartRequested = false;
     this.localServer = createServer((request, response) => {
       this.handleLocalRequest(request, response).catch((error) => {
         sendJson(response, error.statusCode ?? 500, { error: error.message ?? 'Internal server error' });
@@ -65,7 +85,8 @@ export class Connector {
       hostname: options.hostname ?? os.hostname(),
     });
     const drivers = options.drivers ?? createDefaultDrivers(options);
-    return new Connector(options, store, drivers);
+    const build = options.build ?? await readBuildInfo();
+    return new Connector({ ...options, build }, store, drivers);
   }
 
   async start() {
@@ -75,6 +96,7 @@ export class Connector {
     await this.store.recoverInterruptedCommands();
     await this.listenLocal();
     this.connect();
+    this.startWatchdog();
     return this;
   }
 
@@ -137,11 +159,12 @@ export class Connector {
   connect() {
     if (this.stopping) return;
     this.ready = false;
-    this.readyState = deferred();
+    if (this.readyState.settled) this.readyState = deferred();
     const socket = new WebSocket(this.connectorWebSocketUrl());
     this.ws = socket;
+    this.socketStartedAt = Date.now();
     socket.addEventListener('open', () => {
-      this.send('connector.hello', { token: this.store.credentials.token });
+      this.send('connector.hello', { token: this.store.credentials.token, build: this.build });
     });
     socket.addEventListener('message', (event) => {
       let message;
@@ -156,30 +179,80 @@ export class Connector {
         this.send('error', { error: error.message }, message.id);
       });
     });
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (event) => {
       if (this.ws !== socket) return;
-      this.ws = null;
-      this.ready = false;
-      for (const { reject, timer } of this.pendingRequests.values()) {
-        clearTimeout(timer);
-        reject(new Error('Hub connection closed'));
-      }
-      this.pendingRequests.clear();
-      this.scheduleReconnect();
+      this.detachSocket(`closed (${event.code}${event.reason ? ` ${event.reason}` : ''})`);
     });
     socket.addEventListener('error', () => {
       if (!this.stopping) this.logger.error?.('Hub WebSocket connection error');
     });
   }
 
+  detachSocket(reason) {
+    const socket = this.ws;
+    this.ws = null;
+    this.ready = false;
+    this.heartbeatInFlight = false;
+    for (const { reject, timer } of this.pendingRequests.values()) {
+      clearTimeout(timer);
+      reject(new Error('Hub connection closed'));
+    }
+    this.pendingRequests.clear();
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      try {
+        socket.close(4000, reason.slice(0, 120));
+      } catch {}
+    }
+    if (this.stopping) return;
+    const delay = this.scheduleReconnect();
+    if (delay !== null) this.logger.error?.(`Hub WebSocket ${reason}; reconnecting in ${delay}ms`);
+  }
+
   scheduleReconnect() {
-    if (this.stopping || this.reconnectTimer) return;
+    if (this.stopping || this.reconnectTimer) return null;
     const delay = Math.min(30000, 500 * (2 ** this.reconnectAttempts++));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
     this.reconnectTimer.unref();
+    return delay;
+  }
+
+  // Node's WebSocket has no handshake timeout and never notices a silently dropped
+  // connection, so close/error alone cannot be trusted to trigger a reconnect.
+  startWatchdog() {
+    if (this.watchdogTimer) return;
+    const interval = Math.max(50, Math.min(this.heartbeatIntervalMs, this.connectTimeoutMs) / 2);
+    this.watchdogTimer = setInterval(() => this.watchdogTick(), interval);
+    this.watchdogTimer.unref();
+  }
+
+  watchdogTick() {
+    if (this.stopping) return;
+    if (!this.ws) {
+      if (!this.reconnectTimer) this.scheduleReconnect();
+      return;
+    }
+    if (!this.ready) {
+      if (Date.now() - this.socketStartedAt > this.connectTimeoutMs) {
+        this.detachSocket(`handshake not completed within ${this.connectTimeoutMs}ms`);
+      }
+      return;
+    }
+    if (this.heartbeatInFlight || Date.now() - this.lastHeartbeatAt < this.heartbeatIntervalMs) return;
+    this.heartbeatInFlight = true;
+    this.lastHeartbeatAt = Date.now();
+    const socket = this.ws;
+    this.request('connector.heartbeat', {}, this.heartbeatTimeoutMs)
+      .catch((error) => {
+        // Any reply, including an error from a Hub that predates heartbeats, proves the link is alive.
+        if (error.code || this.ws !== socket) return;
+        this.detachSocket(`heartbeat not answered within ${this.heartbeatTimeoutMs}ms`);
+      })
+      .finally(() => {
+        if (this.ws === socket) this.heartbeatInFlight = false;
+      });
   }
 
   async whenReady(timeoutMs = 15000) {
@@ -238,7 +311,12 @@ export class Connector {
     if (message.type === 'connector.ready') {
       this.ready = true;
       this.reconnectAttempts = 0;
+      this.lastHeartbeatAt = Date.now();
+      if (this.everReady) this.logger.error?.('Hub WebSocket reconnected');
+      this.everReady = true;
+      this.hubBuild = message.payload?.hub ?? null;
       this.readyState.resolve(message.payload);
+      this.checkHubVersion();
       await this.syncAndPump();
       return;
     }
@@ -253,6 +331,30 @@ export class Connector {
     if (message.type === 'error') {
       throw new Error(message.payload?.error ?? 'Hub error');
     }
+  }
+
+  checkHubVersion() {
+    const hubCommit = this.hubBuild?.commit;
+    const ownCommit = this.build.commit;
+    if (!hubCommit || !ownCommit || hubCommit === ownCommit) return;
+    if (this.checkedHubCommits.has(hubCommit)) return;
+    this.checkedHubCommits.add(hubCommit);
+    this.logger.error?.(`Version mismatch: Connector ${shortCommit(ownCommit)}, Hub ${shortCommit(hubCommit)}`);
+    if (!this.onVersionMismatch) return;
+    Promise.resolve(this.onVersionMismatch({ connector: this.build, hub: this.hubBuild }))
+      .catch((error) => this.logger.error?.(`Self-update failed: ${error.message}`));
+  }
+
+  // Defers a supervised restart until no managed command is executing.
+  requestRestart() {
+    this.restartRequested = true;
+    this.maybeRestart();
+  }
+
+  maybeRestart() {
+    if (!this.restartRequested || this.stopping || this.activeWorkers.size > 0) return;
+    this.restartRequested = false;
+    this.onRestartRequested?.();
   }
 
   async syncAndPump() {
@@ -342,6 +444,7 @@ export class Connector {
     } finally {
       this.activeWorkers.delete(workerId);
       if (!this.stopping && this.store.nextAcceptedCommand(workerId)) this.scheduleWorker(workerId);
+      this.maybeRestart();
     }
   }
 
@@ -478,6 +581,8 @@ export class Connector {
         connector_id: this.connectorId,
         hub_url: this.hubUrl,
         hub_connected: this.ready,
+        build: this.build,
+        hub_build: this.hubBuild,
       });
       return;
     }
@@ -577,6 +682,8 @@ export class Connector {
     this.stopping = true;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    clearInterval(this.watchdogTimer);
+    this.watchdogTimer = null;
     await this.store.failRunningCommands();
     if (this.ws) this.ws.close(1000, 'Connector shutting down');
     for (const { reject, timer } of this.pendingRequests.values()) {

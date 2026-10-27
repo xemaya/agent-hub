@@ -65,6 +65,8 @@ curl --fail --silent --max-time 10 "http://<中控TailscaleIPv4>:8787/healthz"
 
 只有 Hub 健康检查成功后才继续。已有非默认 Tailscale 设置时，按 CLI 提示显式保留；不要使用 Funnel 暴露 Agent Hub。
 
+同时开着 Clash Verge 等 TUN 代理（fake-ip DNS）时，Tailscale 默认的「Use Tailscale DNS settings」会接管系统 DNS，导致境外站点解析失败。这种机器执行 `tailscale set --accept-dns=false`（或在菜单中取消该项）；Agent Hub 只用私网 IP，不依赖 MagicDNS。
+
 ### 2. 克隆并安装依赖
 
 ```bash
@@ -92,6 +94,28 @@ node bin/agent-hub.js connector \
 首次注册后，Connector Token 会保存在本机权限为 `0600` 的状态文件中；以后重启不需要 Enrollment Token。保持该终端运行，另开终端继续。需要清理临时环境变量时，在对应 shell 中执行 `unset AGENT_HUB_ENROLLMENT_TOKEN`。
 
 Connector 的本地 API 默认只监听 `127.0.0.1:8788`，其他机器不需要开放入站 Connector 端口。
+
+#### 改为常驻服务（推荐）
+
+首次注册成功后，先 `Ctrl+C` 停掉上面的前台 Connector，再安装为 launchd 服务：
+
+```bash
+node bin/agent-hub.js service install \
+  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --name "<这台Mac的名称>" \
+  --data-dir "$HOME/.agent-hub/connector"
+agent-hub service status
+```
+
+服务开机自启、异常退出自动拉起，日志写入 `~/.agent-hub/connector.log`；plist 只记录地址与数据目录，不含任何 Token。安装时会记下当前 shell 的 `PATH`，保证 managed Worker 能找到 `claude`、`kimi`、`codex`；这些 CLI 换了安装位置后重新执行一次 `service install`。卸载用 `agent-hub service uninstall`。
+
+Connector 会自己维持连接：握手 20 秒内未完成、或已连接时 heartbeat 10 秒无应答，都会主动断开重连，不再依赖系统上报断线。
+
+#### 版本握手与自动更新
+
+Hub 与 Connector 在握手时交换各自的 git commit（`/healthz` 和 Admin `GET /api/v1/connectors` 也能看到）。发现与 Hub 不一致时，Connector 会 `git fetch` 并把自己的检出快进到上游；`package.json` 或 `pnpm-lock.yaml` 有变化时执行 `pnpm install --frozen-lockfile`。作为服务运行时，等正在执行的 managed 命令结束后自动重启加载新代码；前台运行时只提示手动重启。
+
+只做 fast-forward：本地有未提交修改、领先或分叉于上游时不动代码，只在日志中说明原因。如果 Hub 运行的是尚未推送到 GitHub 的 commit，日志会提示先更新 Hub 机器。关闭自动更新：启动参数 `--no-auto-update` 或环境变量 `AGENT_HUB_AUTO_UPDATE=0`。任何机器都可以手动执行 `agent-hub update`，Hub 更新后需重启 Hub 进程。
 
 ### 4. 安装 Skill 和全局 CLI
 

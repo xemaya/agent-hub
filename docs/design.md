@@ -281,16 +281,17 @@ external Worker: queued → waiting_manual
 首条消息必须认证：
 
 ```text
-connector.hello { token }
-→ connector.ready { connector_id }
+connector.hello { token, build: { version, commit, dirty } }
+→ connector.ready { connector, hub: { version, commit, dirty } }
 ```
 
-认证前不接受其他消息，认证失败立即关闭。令牌不放在 URL 查询参数中。
+认证前不接受其他消息，认证失败立即关闭。令牌不放在 URL 查询参数中。`build` 是可选字段，旧 Connector 不带也能认证。
 
 主要消息：
 
 ```text
 Connector → Hub:
+  connector.heartbeat
   worker.register
   worker.status
   task.create
@@ -328,6 +329,7 @@ Dashboard 的新增、修改操作仍使用带 `Authorization: Bearer` 的 REST 
 - Connector 重连认证成功后，Hub 主动重放未确认命令。
 - Connector 断线重连使用定时退避，这只是连接恢复，不是定时查询收件箱。
 - WebSocket ping/pong 仅用于连接健康，不承担业务查询。
+- Node 内置 WebSocket 没有握手超时，也察觉不到被静默丢弃的连接（实测：TCP 已接受但不回升级响应时一直停在 `CONNECTING`；中间链路不再转发时一直停在 `OPEN`，两者都不触发 error/close）。因此 Connector 自带看门狗：握手超过 `connectTimeoutMs`（默认 20 秒）未完成即断开重连；已就绪时每 15 秒发应用层 `connector.heartbeat`，10 秒无应答即断开重连。旧 Hub 对未知消息返回 `error`，同样视为链路存活。
 
 ## 8. 可靠性与一致性
 
@@ -347,6 +349,13 @@ Dashboard 的新增、修改操作仍使用带 `Authorization: Bearer` 的 REST 
 - 崩溃前已经 running 的命令标记为 `failed`，并注明 `outcome_unknown=true`，不自动重跑可能已有副作用的工作。
 - Hub 或 Connector 离线不删除 Task/Worker。
 - 所有时间使用 UTC ISO-8601；数据库关联使用稳定 ID。
+
+### 8.3 版本一致与自更新
+
+- 版本标识是检出目录的 git commit（另带 `package.json` 版本和是否有未提交修改），Hub 与 Connector 在握手时交换，并通过 `/healthz`、`GET /api/v1/connectors` 暴露。
+- Connector 每遇到一个新的 Hub commit 只处理一次：`git fetch` 后仅在工作区干净、本地是上游祖先时 fast-forward，依赖文件变化时执行 `pnpm install --frozen-lockfile`。脏、领先或分叉的检出一律跳过并记录原因；Hub commit 不在上游时提示更新 Hub。
+- 以 launchd 服务运行（`AGENT_HUB_SUPERVISED=1`）时，更新后等所有正在执行的 managed 命令结束再退出，由 launchd 拉起新代码；前台运行只提示手动重启，避免中断执行中的命令被标记为 `outcome_unknown`。
+- Hub 不自更新，只记录与 Connector 的版本差异；Hub 机器手动 `agent-hub update` 后重启。
 
 ## 9. 持久化设计
 
@@ -734,3 +743,4 @@ MVP 完成必须满足：
 - Worker 软注销与恢复：2026-10-27 新增 `retired_at`、管理员撤下、Codex 原生自注销、活动工作保护和显式重注册恢复。自动化覆盖旧库迁移、重复撤下、协调者与活动工作保护、新命令/@拒绝、历史保留和身份恢复；真实 Chrome 验证员工立即消失、未发送 @清除、同 ID 恢复、刷新隐藏与撤下记录查询，报告位于 `.runtime/worker-retirement-smoke/browser-result.json`。第二台 Mac 的自注销与本地状态同步需更新后验证，不以管理员撤下代替跨机自注销验收。
 - Worker 软注销正式部署与原 external 撤下：2026-10-27 先创建备份 `.runtime/hub/backups/pre-worker-retirement-2026-10-27T12-37-26-011Z.db`，确认无活动工作后按原地址和凭证重启，数据库迁移到 `user_version=6`。通过 `worker unregister worker_3ea75be5de22474bb16981355eb24a4c` 将原 external“有闲 QA · Codex”软注销，默认列表和 @已移除，原 Worker ID 与历史保留；managed“有闲 QA · Codex 执行”仍在线可调度。正式页面升级为 `v=8` 并重载，未删除任务或重发 Token。第二台 Mac 的自注销需更新仓库后复测。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。
+- Connector 断线自愈、版本握手与常驻服务：2026-10-27 实测 Node 内置 WebSocket 在握手无响应时永久停留 `CONNECTING`、在链路被静默丢弃时永久停留 `OPEN`，均不触发 error/close，与正式 Connector 两次「Hub 可达但不再重连」的现象一致。新增握手超时与应用层 heartbeat 看门狗、断线原因与重连日志、握手交换 git commit、只做 fast-forward 的自更新、launchd 服务安装（`service install|uninstall|status`）和 `agent-hub update`。自动化 68 项全部通过，其中可控 TCP 代理覆盖握手挂起、静默断链、旧 Hub heartbeat 兼容、版本不一致只处理一次和重启等待活动命令；去掉看门狗后两项重连用例按预期失败。自更新用临时 git 仓库覆盖快进、依赖变化安装、脏/分叉跳过和 Hub commit 未发布提示。

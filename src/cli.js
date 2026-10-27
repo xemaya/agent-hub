@@ -3,6 +3,9 @@ import path from 'node:path';
 import { Hub } from './hub.js';
 import { Connector } from './connector.js';
 import { SESSION_RUNTIMES, startSession } from './session-launcher.js';
+import { readBuildInfo, shortCommit } from './build-info.js';
+import { selfUpdate } from './updater.js';
+import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
 
 const HELP = `Agent Hub
 
@@ -10,6 +13,10 @@ Usage:
   agent-hub hub [--host 127.0.0.1] [--port 8787] [--data-dir .runtime/hub]
   agent-hub connector --hub-url URL [--name NAME] [--data-dir .runtime/connector]
                       [--enroll-token TOKEN] [--local-port 8788] [--allow-test-driver]
+                      [--no-auto-update]
+  agent-hub service install --hub-url URL [--name NAME] [--data-dir ~/.agent-hub/connector]
+  agent-hub service uninstall|status
+  agent-hub update
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
@@ -38,9 +45,10 @@ Environment:
   AGENT_HUB_LOCAL_TOKEN         Local Connector token; otherwise read from data-dir
   AGENT_HUB_KIMI_MODEL          Default model for managed Kimi Workers
   AGENT_HUB_CODEX_MODEL         Default model for managed Codex Workers
+  AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -168,7 +176,7 @@ async function startHub(flags) {
     dataDir: flags['data-dir'] ?? '.runtime/hub',
   });
   await hub.listen();
-  console.log(`Agent Hub listening on ${hub.url}`);
+  console.log(`Agent Hub ${shortCommit(hub.build.commit)}${hub.build.dirty ? ' (modified)' : ''} listening on ${hub.url}`);
   console.log(`Dashboard: ${hub.url}/`);
   if (hub.credentials.generated.includes('adminToken')) {
     console.log(`Admin token: ${hub.credentials.adminToken}`);
@@ -180,7 +188,17 @@ async function startHub(flags) {
   await waitForSignal(() => hub.close());
 }
 
+function describeUpdate(result) {
+  if (result.action === 'updated') {
+    return `Updated ${shortCommit(result.from)} -> ${shortCommit(result.to)}${result.dependencies_installed ? ' (dependencies installed)' : ''}`;
+  }
+  if (result.action === 'current') return `Already at upstream ${shortCommit(result.to)}`;
+  return `Update skipped: ${result.reason}`;
+}
+
 async function startConnector(flags) {
+  const supervised = process.env.AGENT_HUB_SUPERVISED === '1';
+  const autoUpdate = flags['no-auto-update'] !== true && process.env.AGENT_HUB_AUTO_UPDATE !== '0';
   const connector = await Connector.create({
     hubUrl: flags['hub-url'] ?? process.env.AGENT_HUB_URL,
     name: flags.name,
@@ -190,18 +208,61 @@ async function startConnector(flags) {
     localPort: port(flags['local-port'], 8788),
     enrollToken: flags['enroll-token'] ?? process.env.AGENT_HUB_ENROLLMENT_TOKEN,
     allowTestDriver: flags['allow-test-driver'] === true || process.env.AGENT_HUB_ALLOW_TEST_DRIVER === '1',
+    onVersionMismatch: autoUpdate
+      ? async ({ hub }) => {
+          const result = await selfUpdate({ peerCommit: hub.commit });
+          console.error(describeUpdate(result));
+          if (result.reason && result.action !== 'skipped') console.error(`Note: ${result.reason}; update the Hub machine`);
+          if (result.action !== 'updated') return;
+          if (supervised) connector.requestRestart();
+          else console.error('Restart the Connector to load the update');
+        }
+      : null,
+    onRestartRequested: () => {
+      console.error('Restarting to load the update');
+      connector.close().finally(() => process.exit(75));
+    },
   });
   await connector.start();
-  console.log(`Connector ${connector.connectorId} listening locally on ${connector.localUrl}`);
+  console.log(`Connector ${connector.connectorId} (${shortCommit(connector.build.commit)}${connector.build.dirty ? ', modified' : ''}) listening locally on ${connector.localUrl}`);
   console.log(`Hub: ${connector.hubUrl}`);
   try {
     await connector.whenReady();
+    console.log('Hub WebSocket connected');
   } catch (error) {
-    await connector.close();
-    throw error;
+    // Under launchd, keep the local API up and let the watchdog keep reconnecting.
+    if (!supervised) {
+      await connector.close();
+      throw error;
+    }
+    console.error(`${error.message}; will keep retrying`);
   }
-  console.log('Hub WebSocket connected');
   await waitForSignal(() => connector.close());
+}
+
+async function serviceCommand(positionals, flags) {
+  const action = positionals[0];
+  if (action === 'status') {
+    print(await connectorServiceStatus());
+    return;
+  }
+  if (action === 'uninstall') {
+    print(await uninstallConnectorService());
+    return;
+  }
+  if (action !== 'install') throw new Error('Usage: agent-hub service install|uninstall|status');
+  const status = await connectorServiceStatus();
+  if (!status.loaded) {
+    const running = await fetch(`http://127.0.0.1:${port(flags['local-port'], 8788)}/local/v1/health`)
+      .then((response) => response.ok)
+      .catch(() => false);
+    if (running) throw new Error('A Connector is already running outside the service; stop it first, then rerun');
+  }
+  print(await installConnectorService({
+    hubUrl: flags['hub-url'] ?? process.env.AGENT_HUB_URL,
+    name: flags.name,
+    dataDir: path.resolve(flags['data-dir'] ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector')),
+  }));
 }
 
 function currentSessionIdentity({ runtime = null, sessionId = null, operation = 'register-current' } = {}) {
@@ -387,6 +448,16 @@ export async function run(argv) {
   }
   if (command === 'connector') {
     await startConnector(flags);
+    return;
+  }
+  if (command === 'service') {
+    await serviceCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'update') {
+    const result = await selfUpdate();
+    print({ ...result, build: await readBuildInfo() });
+    if (result.action === 'updated') console.error('Restart the Hub or Connector to load the update');
     return;
   }
   if (command === 'session') {

@@ -114,7 +114,7 @@ else
   fi
 fi
 
-node "$REPO_DIR/scripts/install-local.js" --connector-data-dir "$DATA_DIR" --connector-url "$LOCAL_URL"
+node "$REPO_DIR/scripts/install-local.js" --connector-data-dir "$DATA_DIR"
 node "$REPO_DIR/bin/agent-hub.js" service status
 node "$REPO_DIR/bin/agent-hub.js" worker list --data-dir "$DATA_DIR"
 printf '\nConnector、CLI 与 Skill 已就绪。重新打开 Agent Session 后，通过 agent-hub Skill 注册数字员工。\n'

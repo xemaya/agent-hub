@@ -185,19 +185,7 @@ agent-hub session start --runtime codex --push --resume <thread-id> --cwd /path/
 
 这是轻量 app-server 交互窗口，不是桌面 App 或原生全屏 TUI。窗口启动后，告诉 Codex 职责并让它执行 `worker register-current`；启动器不会自动登记员工。原生线程 ID 来自 app-server，用户输入与 Hub 命令在同一个进程、同一个线程中串行执行，完成后自动回传结果；`/exit` 或进程退出会撤销推送能力。默认只读沙箱，权限询问需要本地选择，不自动批准。`--push` 不接受 `--` 后的任意 Runtime 参数。
 
-普通 stdio 桌面聊天可以登记 external；仅登记不能让它接收推送。桌面版现在另有实验性共享后端适配：
-
-```bash
-# 安装一个可双击的桌面启动图标；不会退出或重启桌面 App：
-agent-hub desktop install-launcher --output "$HOME/Applications/Codex Hub.app" \
-  --data-dir "$HOME/.agent-hub/connector"
-# 完成现有工作并完全退出桌面 App 后，双击 Codex Hub。后续也通过该图标启动。
-# 在重新打开的实际桌面聊天里，让 Codex 执行：
-agent-hub desktop attach --push --data-dir "$HOME/.agent-hub/connector" \
-  --name "Codex 桌面开发者" --cwd /path/to/project --capabilities coding,review,analysis
-```
-
-这条路径不打开 console：桌面 App 和后台桥接连接同一个本机 WebSocket app-server，Hub 命令进入该线程的原生队列，桥接按原生用户消息与 turn 关联回执。默认仍是 external，只有实际通道接通后才有推送能力。桥接不改模型与权限，不替人审批，也不会在另一运行时恢复桌面线程。`CODEX_APP_SERVER_WS_URL` 是在当前安装版源码中核实的客户端接口，桌面迁移和视觉验收仍需完成，详见 [桌面版接入与验收](docs/codex-desktop-push.md)。
+已有桌面聊天可以登记 external，但该登记不能给运行中的桌面聊天补上推送通道。不要另起 app-server 恢复一个仍在桌面运行的线程，也不要把新窗口当成原桌面聊天。详见 [Codex 适配边界与验收](docs/codex-push.md)。
 
 未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 

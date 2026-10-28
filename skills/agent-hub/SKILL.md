@@ -44,7 +44,7 @@ CLI 自行读取 Local Token，不要直接读取或打印凭证文件。
 
 ### 当前窗口
 
-Kimi/Claude 必须使用启动器重新打开，已运行的普通窗口不能事后补发可信身份。已有 Codex 窗口可使用自身注入的原生身份。需要中控主动推送时，在启动命令中增加 `--push`：Kimi 使用 ACP 交互窗口，Codex 使用 app-server 交互窗口，均不是原生 TUI。已有 Codex 桌面聊天可直接登记 external；桌面推送另走共享后端适配，见 workers.md 的桌面步骤。不能另起进程恢复仍在桌面运行的同一线程。
+Kimi/Claude 必须使用启动器重新打开，已运行的普通窗口不能事后补发可信身份。已有 Codex 窗口可使用自身注入的原生身份。需要中控主动推送时，在启动命令中增加 `--push`：Kimi 使用 ACP 交互窗口，Codex 使用 app-server 交互窗口，均不是原生 TUI。已有 Codex 桌面聊天只能直接登记 external；推送需要启动器窗口，不能另起进程恢复仍在桌面运行的同一线程。
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project

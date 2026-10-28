@@ -61,9 +61,16 @@ after a disconnect does not replay old delivery records.
   a fast final callback before the queue subprocess returns.
 - The actual originating desktop chat was attached without restart. Its native
   Worker was read back as external with `push_capable: true`.
-- A single live current-session command/receipt probe remains to be completed
-  after the current turn ends. Do not treat bridge attachment or accepted queue
-  output as proof that the model received or completed it.
+- The single live probe `cmd_47fddba7be534e89a0d4f55af2279bfc` arrived as a
+  user message in the existing desktop chat. Before reporting, the receiving
+  process verified its native `CODEX_SESSION_ID`. Its one in-session CLI report
+  returned `{ "ok": true }`.
+- The original local command waiter then returned `status: succeeded`,
+  `result.text: HUB_CODEX_NATIVE_QUEUE_OK`, the same native session ID, and
+  `delivery: channel`; `outcome_unknown` was false. This verifies receipt and
+  completion in the actual existing desktop session, beyond queue acceptance.
+- No App restart, new App, second model session or second probe was used for
+  this live acceptance. See [sanitized evidence](codex-desktop-queue-evidence.json).
 
 The existing Feishu listener was not enabled, and no Feishu message was sent.
 The existing macOS bootstrap test fixture now works on a feature branch and

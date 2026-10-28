@@ -1,0 +1,18 @@
+{
+  "verified_at": "2026-10-28T09:53:44Z",
+  "command_id": "cmd_47fddba7be534e89a0d4f55af2279bfc",
+  "status": "succeeded",
+  "result": {
+    "text": "HUB_CODEX_NATIVE_QUEUE_OK",
+    "session_id": "01a18178-5dce-7d22-8d4b-39a15884df1d",
+    "delivery": "channel"
+  },
+  "outcome_unknown": false,
+  "existing_desktop_session": true,
+  "desktop_restarted": false,
+  "separate_app_started": false,
+  "second_probe_sent": false,
+  "native_session_verified_before_report": true,
+  "report_cli_exit_code": 0,
+  "connector_report_ok": true
+}

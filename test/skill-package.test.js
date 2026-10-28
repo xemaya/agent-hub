@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { Hub } from '../src/hub.js';
@@ -91,7 +91,7 @@ test('public Skill is a complete, deterministic ZIP without exposing admin APIs'
   assert.deepEqual(await createSkillArchive(), await readFile(archive));
 });
 
-test('downloaded bootstrap completes enrollment and local Skill installation without replacing existing work', { timeout: 90000 }, async (t) => {
+test('downloaded macOS bootstrap completes enrollment and local Skill installation without replacing existing work', { skip: process.platform !== 'darwin', timeout: 90000 }, async (t) => {
   const directory = await temporaryDirectory(t, 'skill-bootstrap-');
   const home = path.join(directory, 'home');
   const repoDir = path.join(directory, 'runtime', 'agent-hub');
@@ -99,9 +99,6 @@ test('downloaded bootstrap completes enrollment and local Skill installation wit
   const mockBin = path.join(directory, 'mock-bin');
   await mkdir(mockBin, { recursive: true });
   await execute('git', ['clone', '--quiet', '--no-hardlinks', PROJECT_ROOT, source]);
-  await cp(path.join(PROJECT_ROOT, 'skills'), path.join(source, 'skills'), { recursive: true });
-  await execute('git', ['-C', source, 'add', 'skills']);
-  await execute('git', ['-C', source, '-c', 'user.name=Skill Test', '-c', 'user.email=skill-test@localhost', 'commit', '--quiet', '-m', 'Package current Skill']);
   const hub = await Hub.create({
     host: '127.0.0.1', port: 0, dataDir: path.join(directory, 'hub'),
     credentials: { adminToken: 'test-admin', enrollmentToken: 'test-enroll', generated: [], file: path.join(directory, 'credentials.json') },

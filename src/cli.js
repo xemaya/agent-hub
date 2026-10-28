@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hub } from './hub.js';
 import { Connector } from './connector.js';
@@ -7,6 +7,7 @@ import { readBuildInfo, shortCommit } from './build-info.js';
 import { selfUpdate } from './updater.js';
 import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
 import { ChannelServer } from './channel.js';
+import { CodexQueueChannel, bridgeLock, checkNativeQueue, commandRecord, currentDesktopPid, startQueueBridge } from './codex-queue-channel.js';
 
 const HELP = `Agent Hub
 
@@ -21,6 +22,8 @@ Usage:
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
   agent-hub session start --runtime claude|kimi --push [--resume SESSION_ID] [--data-dir DIR]
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
+  agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
+  agent-hub desktop report --command-id ID --status succeeded|failed [--data-dir DIR] < result.txt
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
                             [--capabilities a,b] [--metadata JSON]
@@ -51,7 +54,7 @@ Environment:
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -331,7 +334,15 @@ async function workerCommand(positionals, flags) {
         session_origin: identity.origin,
       });
     }
-    print(await localRequest(flags, '/local/v1/workers/register', {
+    let desktop = null;
+    const dataDir = path.resolve(flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'));
+    if (flags.desktop || (flags.push && action === 'register-current' && runtime === 'codex')) {
+      if (action !== 'register-current' || runtime !== 'codex' || flags.push !== true || (flags.mode && flags.mode !== 'external')) throw new Error('Use desktop attach --push inside the actual Codex desktop chat');
+      desktop = { pid: await currentDesktopPid(), executable: flags.executable ?? 'codex' };
+      await checkNativeQueue(desktop.executable);
+      Object.assign(metadata, { desktop: true, desktop_delivery: 'codex-queue' });
+    }
+    const payload = await localRequest(desktop ? { ...flags, 'data-dir': dataDir } : flags, '/local/v1/workers/register', {
       method: 'POST',
       body: {
         name: flags.name,
@@ -342,7 +353,15 @@ async function workerCommand(positionals, flags) {
         cwd: flags.cwd ?? process.cwd(),
         metadata,
       },
-    }));
+    });
+    if (desktop) {
+      const bridge = await startQueueBridge({ dataDir, sessionId, cwd: path.resolve(flags.cwd ?? process.cwd()),
+        desktopPid: desktop.pid, executable: desktop.executable,
+        connectorUrl: flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL,
+      });
+      const { workers } = await localRequest({ ...flags, 'data-dir': dataDir }, '/local/v1/workers');
+      print({ ...payload, worker: workers.find(worker => worker.worker_id === payload.worker.worker_id), desktop_bridge: bridge });
+    } else print(payload);
     return;
   }
   if (action === 'list') {
@@ -380,6 +399,48 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
     },
   });
   process.exitCode = result.exitCode;
+}
+
+async function desktopCommand(positionals, flags) {
+  const dataDir = path.resolve(flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'));
+  if (positionals[0] === 'attach') return workerCommand(['register-current'], { ...flags, 'data-dir': dataDir, desktop: true });
+  if (positionals[0] === 'report') {
+    const identity = currentSessionIdentity();
+    if (identity.runtime !== 'codex') throw new Error('A Codex desktop receipt must originate in its native session');
+    if (!['succeeded', 'failed'].includes(flags.status)) throw new Error('status must be succeeded or failed');
+    const recordFile = commandRecord(dataDir, identity.sessionId, flags['command-id']);
+    const record = JSON.parse(await readFile(recordFile, 'utf8'));
+    if (record.session_id !== identity.sessionId || record.command_id !== flags['command-id']) throw new Error('Receipt does not belong to this native session');
+    let result = '';
+    for await (const chunk of process.stdin) { result += chunk; if (Buffer.byteLength(result) > 512 * 1024) throw new Error('Result exceeds 512 KiB'); }
+    if (!result.trim()) throw new Error('Report result must be provided through stdin');
+    const lock = await open(`${recordFile}.report`, 'wx', 0o600);
+    try {
+      await lock.writeFile(JSON.stringify({ state: 'reporting' }));
+      const response = await localRequest({ ...flags, 'data-dir': dataDir, 'connector-url': record.connector_url },
+        `/local/v1/channel/commands/${encodeURIComponent(record.command_id)}/report`,
+        { method: 'POST', body: { status: flags.status, result } });
+      await lock.truncate(0); await lock.write(JSON.stringify({ state: 'reported' }), 0, 'utf8');
+      print(response);
+    } finally { await lock.close(); }
+    return;
+  }
+  if (positionals[0] === 'bridge') {
+    if (typeof flags['session-id'] !== 'string' || !Number.isInteger(Number(flags['desktop-pid']))) throw new Error('Queue bridge requires verified native identity and desktop PID');
+    const local = await localOptions({ ...flags, 'data-dir': dataDir });
+    const release = await bridgeLock(dataDir, flags['session-id']);
+    const channel = new CodexQueueChannel({ dataDir, sessionId: flags['session-id'], cwd: flags.cwd ?? process.cwd(),
+      connectorUrl: local.baseUrl, token: local.token, desktopPid: Number(flags['desktop-pid']), executable: flags.executable ?? 'codex',
+      onReady: event => { if (process.connected) process.send({ type: 'ready', worker_id: event.worker_id, session_id: flags['session-id'], pid: process.pid }); },
+    });
+    const stop = () => channel.stop();
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    try { await channel.start(); }
+    catch (error) { if (process.connected) process.send({ type: 'failed', message: error.message }); throw error; }
+    finally { channel.stop(); await release(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+    return;
+  }
+  throw new Error('Usage: agent-hub desktop attach|report');
 }
 
 // stdout carries MCP JSON-RPC, so everything human-readable goes to stderr.
@@ -488,6 +549,10 @@ export async function run(argv) {
   }
   if (command === 'channel') {
     await channelCommand(flags);
+    return;
+  }
+  if (command === 'desktop') {
+    await desktopCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'service') {

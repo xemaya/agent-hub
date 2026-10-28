@@ -30,7 +30,9 @@ agent-hub session start --runtime kimi --push --cwd /path/to/project
 agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/to/project
 ```
 
-这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。Codex 交互推送仍需 app-server 适配，不能声称已支持。
+这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。Codex 桌面版在当前聊天中使用 `worker register-current --push`（或 `desktop attach --push`）。桥接直接调用现有 `codex queue --thread <CODEX_SESSION_ID> --message ...`，不启动另一个 App，不重启桌面，不在另一进程 resume 当前模型线程。
+
+收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执会核对原生会话并保护重复调用。桌面进程退出后通道会关闭。
 
 只有用户明确要求主动执行，且交互实例已退出或 Runtime 支持共享，才可把当前窗口设为 managed。不要同时向同一 Session 发另一条 Prompt。
 

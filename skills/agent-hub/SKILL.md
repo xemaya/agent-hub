@@ -44,7 +44,7 @@ CLI 自行读取 Local Token，不要直接读取或打印凭证文件。
 
 ### 当前窗口
 
-Kimi/Claude 必须使用启动器重新打开，已运行的普通窗口不能事后补发可信身份。已有 Codex 窗口可使用自身注入的原生身份。需要中控主动推送到当前 Kimi/Claude 窗口时，在启动命令中增加 `--push`；Kimi 此时打开 ACP 交互窗口，不是原生 TUI。
+Kimi/Claude 必须使用启动器重新打开，已运行的普通窗口不能事后补发可信身份。已有 Codex 窗口可使用自身注入的原生身份；当前桌面聊天需要推送时，在下面的 register-current 命令增加 `--push`，使用原生 codex queue，不需要新 App 或重启。需要中控主动推送到当前 Kimi/Claude 窗口时，在启动命令中增加 `--push`；Kimi 此时打开 ACP 交互窗口，不是原生 TUI。
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project
@@ -62,7 +62,7 @@ agent-hub worker register-current \
   --metadata '{"description":"<用户定义的职责与真实限制>"}'
 ```
 
-当前窗口默认是 external，不虚报主动推送。Claude/Kimi 使用启动器注入的可信身份，Codex 使用自身注入的 `CODEX_SESSION_ID`。缺少可信身份时停止并说明，**不能随机生成、选择最近会话、手工伪造身份或新建 managed Worker 冒充当前窗口**。Claude/Kimi 交互推送的 `--push` 用法和身份细节见 [references/workers.md](references/workers.md)。
+当前窗口默认是 external。Codex 桌面可通过 `register-current --push` 接通后台队列通道；只有实际连接成功才报告可推送，入队成功不等于任务完成。Claude/Kimi 使用启动器注入的可信身份，Codex 使用自身注入的 `CODEX_SESSION_ID`。缺少可信身份时停止并说明，**不能随机生成、选择最近会话、手工伪造身份或新建 managed Worker 冒充当前窗口**。Claude/Kimi 交互推送的 `--push` 用法和身份细节见 [references/workers.md](references/workers.md)。
 
 ### 独立可调度员工
 

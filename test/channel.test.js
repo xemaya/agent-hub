@@ -69,7 +69,7 @@ test('Channel speaks MCP with the channel capability and its two tools', async (
 
 test('An attached interactive Session receives Hub commands and reports results back', async (t) => {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ name: 'live-claude', runtime: 'claude', mode: 'external', runtime_session_id: 'live-1' });
+  const worker = await context.registerWorker({ name: 'live-claude', runtime: 'claude', attach: false, runtime_session_id: 'live-1' });
   assert.equal(worker.push_capable, false);
   const queuedWhileManual = await context.admin('/api/v1/commands', { method: 'POST', body: { worker_id: worker.worker_id, input: 'before attach' } });
   assert.equal(queuedWhileManual.payload.command.status, 'waiting_manual');
@@ -114,7 +114,7 @@ test('An attached interactive Session receives Hub commands and reports results 
 
 test('Closing the window mid-command leaves an unknown outcome and stops further pushes', async (t) => {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ name: 'closing', runtime: 'claude', mode: 'external', runtime_session_id: 'live-close' });
+  const worker = await context.registerWorker({ name: 'closing', runtime: 'claude', attach: false, runtime_session_id: 'live-close' });
   const channel = openChannel(context, 'live-close');
   await channel.server.start();
   await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === true);
@@ -138,7 +138,7 @@ test('A channel opened before registration attaches once the Session registers, 
   t.after(() => channel.close());
   await channel.server.start();
   await waitFor(() => channel.server.state === 'waiting_registration');
-  const worker = await context.registerWorker({ name: 'late', runtime: 'claude', mode: 'external', runtime_session_id: 'live-late' });
+  const worker = await context.registerWorker({ name: 'late', runtime: 'claude', attach: false, runtime_session_id: 'live-late' });
   assert.equal(worker.push_capable, true);
   assert.equal(context.connector.store.getWorker(worker.worker_id).push_capable, true);
   await waitFor(() => channel.server.state === 'attached');
@@ -150,19 +150,24 @@ test('A channel opened before registration attaches once the Session registers, 
   await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === true);
 });
 
-test('Managed Workers cannot be driven through an interactive channel', async (t) => {
+test('Legacy managed registration is rejected instead of starting background execution', async (t) => {
   const context = await createTestContext(t);
-  await context.registerWorker({ name: 'headless', runtime: 'test', mode: 'managed', runtime_session_id: 'headless-1' });
-  const channel = openChannel(context, 'headless-1');
-  channel.server.runtime = 'test';
-  t.after(() => channel.close());
-  await channel.server.start();
-  await waitFor(() => channel.server.state === 'rejected');
+  await assert.rejects(
+    context.registerWorker({ name: 'headless', runtime: 'test', mode: 'managed', runtime_session_id: 'headless-1' }),
+    /Only interactive external Workers are supported/,
+  );
+  assert.equal(context.hub.store.listWorkers().length, 0);
+  const missingIdentity = await context.local('/local/v1/workers/register', {
+    method: 'POST',
+    body: { name: 'missing-session', runtime: 'kimi', mode: 'external', cwd: context.root },
+  });
+  assert.equal(missingIdentity.response.status, 400);
+  assert.match(missingIdentity.payload.error, /runtime_session_id is required/);
 });
 
 test('Kimi Channel drives the same external Session and preserves output gaps', async (t) => {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ name: 'live-kimi', runtime: 'kimi', mode: 'external', runtime_session_id: 'live-kimi-1' });
+  const worker = await context.registerWorker({ name: 'live-kimi', runtime: 'kimi', attach: false, runtime_session_id: 'live-kimi-1' });
   const executions = [];
   const driver = {
     async execute(input) {
@@ -205,7 +210,7 @@ test('Kimi Channel drives the same external Session and preserves output gaps', 
 
 test('Kimi Channel reports occupied or failed execution without a takeover', async (t) => {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ name: 'busy-kimi', runtime: 'kimi', mode: 'external', runtime_session_id: 'live-kimi-busy' });
+  const worker = await context.registerWorker({ name: 'busy-kimi', runtime: 'kimi', attach: false, runtime_session_id: 'live-kimi-busy' });
   const driver = {
     async execute() {
       throw Object.assign(new Error('Session is occupied by another client'), { code: 40931 });

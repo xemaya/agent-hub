@@ -38,8 +38,8 @@ test('Kimi launcher attaches the created native session and closes its server', 
   const prepared = [];
   let closed = 0;
   let closedAtSpawn = -1;
-  const kimiDriver = {
-    async prepareWorker(input) {
+  const kimiSessions = {
+    async prepareSession(input) {
       prepared.push(input);
       return { runtime_session_id: 'session-current-kimi', driver_state: {} };
     },
@@ -49,7 +49,7 @@ test('Kimi launcher attaches the created native session and closes its server', 
     runtime: 'kimi',
     cwd: process.cwd(),
     runtimeArgs: ['-p', 'hello'],
-    kimiDriver,
+    kimiSessions,
     spawn(executable, args, options) {
       closedAtSpawn = closed;
       calls.push({ executable, args, options });
@@ -68,15 +68,15 @@ test('Kimi launcher attaches the created native session and closes its server', 
 
 test('Kimi launcher closes its server when the client cannot start', async () => {
   let closed = 0;
-  const kimiDriver = {
-    async prepareWorker() {
+  const kimiSessions = {
+    async prepareSession() {
       return { runtime_session_id: 'session-current-kimi', driver_state: {} };
     },
     async close() { closed += 1; },
   };
   await assert.rejects(startSession({
     runtime: 'kimi',
-    kimiDriver,
+    kimiSessions,
     spawn() { throw new Error('client unavailable'); },
   }), /client unavailable/);
   assert.equal(closed, 1);
@@ -89,8 +89,8 @@ test('Kimi push launcher shares one ACP Session until the interactive window exi
   let channelStarted = 0;
   let channelStopped = 0;
   let temporaryDriverClosedAtStart = -1;
-  const kimiDriver = {
-    async prepareWorker(input) {
+  const kimiSessions = {
+    async prepareSession(input) {
       prepared.push(input);
       return { runtime_session_id: input.runtime_session_id, driver_state: {} };
     },
@@ -112,7 +112,7 @@ test('Kimi push launcher shares one ACP Session until the interactive window exi
     cwd: process.cwd(),
     push: true,
     resumeSessionId: 'session-resume-kimi',
-    kimiDriver,
+    kimiSessions,
     kimiAcpDriver,
     kimiChannel,
     spawn() { throw new Error('Kimi push must not spawn a second TUI client'); },
@@ -159,8 +159,8 @@ test('Kimi native TUI launcher opens the real client with a local Channel', asyn
   let nativeDriverClosed = 0;
   let channelStarted = 0;
   let channelStopped = 0;
-  const kimiDriver = {
-    async prepareWorker(input) {
+  const kimiSessions = {
+    async prepareSession(input) {
       return { runtime_session_id: input.runtime_session_id, driver_state: {} };
     },
     async close() {},
@@ -182,7 +182,7 @@ test('Kimi native TUI launcher opens the real client with a local Channel', asyn
     runtimeArgs: ['--model', 'kimi-code/kimi-for-coding'],
     nativeChannelPath: socketPath,
     env: { AGENT_HUB_KIMI_EXECUTABLE: '/opt/kimi-dev' },
-    kimiDriver,
+    kimiSessions,
     kimiNativeDriver,
     kimiChannel,
     spawn(executable, args, options) {

@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { Connector } from '../src/connector.js';
-import { TestDriver } from '../src/drivers/test.js';
 import { createTestContext, waitFor } from './helpers.js';
 
 test('public health and private Admin API', async (t) => {
@@ -20,7 +19,7 @@ test('public health and private Admin API', async (t) => {
   assert.equal('token_hash' in payload.connectors[0], false);
 });
 
-test('managed Worker self-registration, task dispatch and dashboard events', async (t) => {
+test('interactive Worker self-registration, task dispatch and dashboard events', async (t) => {
   const context = await createTestContext(t);
   const worker = await context.registerWorker({ runtime_session_id: 'session-stable' });
   const again = await context.registerWorker({ runtime_session_id: 'session-stable' });
@@ -50,7 +49,8 @@ test('managed Worker self-registration, task dispatch and dashboard events', asy
     const { payload } = await context.admin(`/api/v1/commands/${commandId}`);
     return payload.command.status === 'succeeded' ? payload.command : null;
   });
-  assert.equal(completed.result.text, 'test-worker: run the task');
+  assert.match(completed.result.text, /^test-worker: Agent Hub task context/);
+  assert.match(completed.result.text, /Agent Hub command \(prompt\):\nrun the task$/);
   assert.deepEqual(context.driver.executions, [commandId]);
   const stored = context.connector.store.getCommand(commandId);
   assert.equal(stored.task_snapshot.title, 'Verify dispatch');
@@ -63,29 +63,24 @@ test('managed Worker self-registration, task dispatch and dashboard events', asy
   assert.equal(currentTask.payload.task.status, 'in_progress');
 });
 
-test('managed Codex self-registers and receives pushed commands', async (t) => {
+test('interactive Codex self-registers and receives commands through its Channel', async (t) => {
   const context = await createTestContext(t);
   const executions = [];
-  context.connector.drivers.codex = {
-    async prepareWorker() {
-      return {
-        runtime_session_id: 'codex-registration',
-        driver_state: { started: false, session_id: null },
-      };
-    },
+  const driver = {
     async execute({ command, onOutput, onState }) {
       executions.push(command.command_id);
-      await onState({ started: true, session_id: 'codex-native-thread' });
+      await onState({ started: true });
       onOutput('codex-ok\n');
-      return { text: 'codex-ok', session_id: 'codex-native-thread' };
+      return { text: 'codex-ok', session_id: 'codex-registration' };
     },
   };
-  const worker = await context.registerWorker({ runtime: 'codex' });
+  const worker = await context.registerWorker({ runtime: 'codex', runtime_session_id: 'codex-registration', driver });
   assert.equal(worker.push_capable, true);
+  assert.equal(worker.mode, 'external');
   assert.equal(worker.runtime_session_id, 'codex-registration');
   const created = await context.admin('/api/v1/tasks', {
     method: 'POST',
-    body: { title: 'Codex dispatch', goal: 'Verify managed Codex', assignee_worker_id: worker.worker_id },
+    body: { title: 'Codex dispatch', goal: 'Verify interactive Codex', assignee_worker_id: worker.worker_id },
   });
   const dispatched = await context.admin('/api/v1/commands', {
     method: 'POST',
@@ -97,12 +92,9 @@ test('managed Codex self-registers and receives pushed commands', async (t) => {
     return payload.command.status === 'succeeded' ? payload.command : null;
   });
   assert.equal(completed.result.text, 'codex-ok');
-  assert.equal(completed.result.session_id, 'codex-native-thread');
+  assert.equal(completed.result.session_id, 'codex-registration');
+  assert.equal(completed.result.delivery, 'channel');
   assert.deepEqual(executions, [commandId]);
-  assert.equal(
-    context.connector.store.getWorker(worker.worker_id).driver_state.session_id,
-    'codex-native-thread',
-  );
 });
 
 test('external Worker remains waiting_manual instead of fake push', async (t) => {
@@ -110,7 +102,7 @@ test('external Worker remains waiting_manual instead of fake push', async (t) =>
   const worker = await context.registerWorker({
     name: 'desktop-codex',
     runtime: 'codex',
-    mode: 'external',
+    attach: false,
     runtime_session_id: 'external-session',
   });
   assert.equal(worker.push_capable, false);
@@ -129,18 +121,16 @@ test('external Worker remains waiting_manual instead of fake push', async (t) =>
   assert.equal(context.driver.executions.length, 0);
 });
 
-test('offline commands replay after Connector reconnect without duplicate execution', async (t) => {
+test('accepted interactive commands replay after Connector reconnect without duplicate execution', async (t) => {
   const context = await createTestContext(t);
   const worker = await context.registerWorker({ runtime_session_id: 'offline-session' });
-  await context.restartConnector();
-  await context.connector.close();
-  await waitFor(() => !context.hub.store.getConnector(context.connector.connectorId).online);
-  const { payload } = await context.admin('/api/v1/commands', {
-    method: 'POST',
-    body: { worker_id: worker.worker_id, input: 'queued while offline' },
+  const command = context.hub.store.createCommand({
+    worker_id: worker.worker_id,
+    kind: 'prompt',
+    input: 'accepted before offline',
+    push_capable: true,
   });
-  const command = payload.command;
-  assert.equal(command.status, 'queued');
+  await context.connector.store.acceptCommand(command);
   await context.restartConnector();
   await waitFor(async () => (
     await context.admin(`/api/v1/commands/${command.command_id}`)
@@ -222,7 +212,8 @@ test('local Agent creates, waits for and completes a task without Admin Token', 
   assert.equal(dispatched.response.status, 200);
   const command = dispatched.payload.command;
   assert.equal(command.status, 'succeeded');
-  assert.equal(command.result.text, 'test-worker: finish local task');
+  assert.match(command.result.text, /^test-worker: Agent Hub task context/);
+  assert.match(command.result.text, /Agent Hub command \(prompt\):\nfinish local task$/);
   assert.ok(command.finished_at);
   assert.deepEqual(context.driver.executions, [command.command_id]);
   assert.equal(context.connector.store.getCommand(command.command_id).task_snapshot.title, task.title);
@@ -279,7 +270,6 @@ test('Connector cannot create commands or update tasks for another Connector', a
     dataDir: path.join(context.root, 'other-connector'),
     localPort: 0,
     enrollToken: 'test-enroll',
-    drivers: { test: new TestDriver() },
     logger: { error() {} },
   });
   await other.start();
@@ -318,13 +308,9 @@ test('Worker activity prioritizes the running command over a newer queued comman
   let releaseFirst;
   let announceFirst;
   const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
-  context.connector.drivers.test = {
-    async prepareWorker(input) {
-      return { runtime_session_id: input.runtime_session_id ?? 'queued-activity-session', driver_state: {} };
-    },
-    async execute({ command, onOutput, onState }) {
+  context.driver = {
+    async execute({ command, onState }) {
       await onState({ started: true });
-      onOutput(`${command.input}\n`);
       if (command.input === 'first') {
         announceFirst();
         await new Promise((resolve) => { releaseFirst = resolve; });
@@ -346,27 +332,21 @@ test('Worker activity prioritizes the running command over a newer queued comman
   assert.equal(live.payload.worker.activity.command_id, first.payload.command.command_id);
   assert.equal(live.payload.worker.activity.command_status, 'running');
   assert.equal(live.payload.worker.activity.phase, 'working');
-  assert.match(live.payload.worker.activity.output_text, /first/);
+  assert.match(live.payload.worker.activity.output_text, /delivered to the interactive session/);
   releaseFirst();
   await waitFor(() => context.hub.store.getCommand(second.payload.command.command_id)?.status === 'succeeded');
 });
 
-test('Worker activity shows live task output and clears to a recent result when finished', async (t) => {
+test('Worker activity shows interactive delivery and clears to a recent result when finished', async (t) => {
   const context = await createTestContext(t);
   let releaseWork;
   let announceOutput;
   const outputStarted = new Promise((resolve) => { announceOutput = resolve; });
-  context.connector.drivers.test = {
-    async prepareWorker() {
-      return { runtime_session_id: 'activity-session', driver_state: {} };
-    },
-    async execute({ command, onOutput }) {
-      onOutput('正在分析任务上下文\n');
+  context.driver = {
+    async execute() {
       announceOutput();
       await new Promise((resolve) => { releaseWork = resolve; });
-      const text = '实际结果 AGENT_HUB_ACTIVITY_OK';
-      onOutput(`${text}\n`);
-      return { text };
+      return { text: '实际结果 AGENT_HUB_ACTIVITY_OK' };
     },
     async close() {},
   };
@@ -390,10 +370,10 @@ test('Worker activity shows live task output and clears to a recent result when 
   assert.equal(working.activity.task_id, created.payload.task.task_id);
   assert.equal(working.activity.task_title, '可见的员工工作');
   assert.equal(working.activity.command_status, 'running');
-  assert.match(working.activity.output_text, /正在分析任务上下文/);
+  assert.match(working.activity.output_text, /delivered to the interactive session/);
   await waitFor(() => dashboard.messages.some((message) => (
     message.type === 'worker.updated'
-    && message.payload.worker.activity?.output_text.includes('正在分析任务上下文')
+    && message.payload.worker.activity?.output_text.includes('delivered to the interactive session')
   )));
   releaseWork();
   await waitFor(async () => (
@@ -417,7 +397,6 @@ test('Another Connector cannot read Admin chat through local or WebSocket APIs',
     dataDir: path.join(context.root, 'other-connector'),
     localPort: 0,
     enrollToken: 'test-enroll',
-    drivers: { test: new TestDriver() },
     logger: { error() {} },
   });
   await other.start();

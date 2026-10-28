@@ -167,7 +167,7 @@ function validateReview(value, steps) {
   return { parentPass: value.parent_pass, reason, verdicts };
 }
 
-// managed Workers, or external ones while their interactive channel is attached.
+// Only online Workers with a live interactive Channel can receive pushed work.
 function canReceivePush(worker) {
   return Boolean(worker && !worker.retired_at && worker.push_capable && worker.presence === 'online');
 }
@@ -194,8 +194,8 @@ export class Coordinator {
     const config = this.store.getCoordinatorConfig();
     const worker = config.worker_id ? this.store.getWorker(config.worker_id) : null;
     if (!config.enabled || !worker) throw coordinatorError('Coordinator is not configured', 'coordinator_disabled');
-    if (worker.retired_at || worker.mode !== 'managed' || !worker.push_capable) {
-      throw coordinatorError('Coordinator must be a managed, push-capable Worker', 'coordinator_worker_invalid');
+    if (!canReceivePush(worker)) {
+      throw coordinatorError('Coordinator must be online with an attached interactive Channel', 'coordinator_worker_invalid');
     }
     return { config, worker };
   }
@@ -226,8 +226,8 @@ export class Coordinator {
   configure({ workerId, enabled = true, maxSteps }) {
     if (enabled) {
       const worker = workerId ? this.store.getWorker(workerId) : null;
-      if (!worker || worker.retired_at || worker.mode !== 'managed' || !worker.push_capable) {
-        throw coordinatorError('Coordinator must be a managed, push-capable Worker', 'coordinator_worker_invalid');
+      if (!canReceivePush(worker)) {
+        throw coordinatorError('Coordinator must be online with an attached interactive Channel', 'coordinator_worker_invalid');
       }
     }
     const config = this.store.getCoordinatorConfig();
@@ -333,7 +333,6 @@ export class Coordinator {
       connector_id: worker.connector_id,
       connector_name: worker.connector_name,
       runtime: worker.runtime,
-      mode: worker.mode,
       push_capable: worker.push_capable,
       capabilities: worker.capabilities,
       description: typeof worker.metadata?.description === 'string' ? worker.metadata.description : '',
@@ -349,9 +348,7 @@ export class Coordinator {
     const allowed = new Set(workerIds);
     return this.workerRegistry().filter((worker) => (
       worker.worker_id !== excludeWorkerId
-      && worker.mode === 'managed'
-      && worker.push_capable
-      && worker.presence === 'online'
+      && canReceivePush(worker)
       && (!allowed.size || allowed.has(worker.worker_id))
     ));
   }

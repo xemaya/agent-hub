@@ -12,7 +12,7 @@ const cli = path.resolve('bin/agent-hub.js');
 
 async function setup(t, queue) {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ runtime: 'codex', mode: 'external', runtime_session_id: 'native-queue-session' });
+  const worker = await context.registerWorker({ runtime: 'codex', attach: false, runtime_session_id: 'native-queue-session' });
   const attempts = [];
   const channel = new CodexQueueChannel({ connectorUrl: context.connector.localUrl, token: context.connector.store.credentials.localToken,
     dataDir: path.join(context.root, 'connector'), sessionId: 'native-queue-session', cwd: context.root,

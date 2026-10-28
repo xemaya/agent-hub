@@ -38,6 +38,11 @@ export class ConnectorStore {
     state.hostname = hostname ?? state.hostname;
     state.localToken ??= createToken('ah_local');
     state.workers ??= [];
+    state.workers = state.workers.map((worker) => (
+      worker.mode === 'external'
+        ? worker
+        : { ...worker, mode: 'external', push_capable: false, driver_state: {} }
+    ));
     state.commands ??= [];
     const store = new ConnectorStore(dataDir, state);
     await store.save();

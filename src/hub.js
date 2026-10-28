@@ -117,15 +117,15 @@ function stringArray(value) {
 }
 
 function workerInput(payload) {
-  if (!['managed', 'external'].includes(payload.mode)) {
-    const error = new Error('mode must be managed or external');
+  if (payload.mode !== undefined && payload.mode !== 'external') {
+    const error = new Error('Only interactive external Workers are supported');
     error.statusCode = 400;
     throw error;
   }
   return {
     name: requiredString(payload.name, 'name', { max: 120 }),
     runtime: requiredString(payload.runtime, 'runtime', { max: 40 }),
-    mode: payload.mode,
+    mode: 'external',
     runtime_session_id: requiredString(payload.runtime_session_id, 'runtime_session_id', { max: 300 }),
     capabilities: stringArray(payload.capabilities),
     cwd: requiredString(payload.cwd, 'cwd', { max: 4096 }),
@@ -819,7 +819,7 @@ export class Hub {
     }
     if (message.type === 'worker.channel') {
       const worker = this.store.setWorkerChannel(connectorId, requiredString(payload.worker_id, 'worker_id'), payload.attached === true);
-      if (!worker) throw new Error('Interactive channel requires an external Worker of this connector');
+      if (!worker) throw new Error('Interactive Channel requires a Worker of this Connector');
       this.emit(payload.attached === true ? 'worker.channel_attached' : 'worker.channel_detached', { type: 'worker', id: worker.worker_id }, {
         connector_id: connectorId,
         worker_id: worker.worker_id,

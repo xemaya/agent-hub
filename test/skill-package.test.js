@@ -61,7 +61,7 @@ test('public Skill is a complete, deterministic ZIP without exposing admin APIs'
   assert.match(html, /https:\/\/hub\.findu\.work\/skill\/agent-hub\.zip/);
   assert.doesNotMatch(html, /test-admin|test-enroll/);
   assert.match(html, /不要把当前已打开的 Kimi\/Claude 窗口登记为 Worker/);
-  assert.match(html, /新建独立 managed Worker 不需要/);
+  assert.match(html, /所有 Worker 都是可见交互 Session/);
   const raw = await fetch(`${hub.url}/skill/SKILL.md`);
   assert.equal(raw.status, 200);
   assert.match(await raw.text(), /首次接入一台新 Mac/);

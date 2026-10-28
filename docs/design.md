@@ -56,25 +56,15 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 
 一个 Host 可以有多个 Worker；一个 Worker 同一时间最多有一个主任务；一个任务同一时间只有一个主负责人。
 
-### 3.1 Worker 模式
+### 3.1 Worker 交付能力
 
-Worker 必须明确区分交付能力。
+所有 Worker 都是 `external`，对应一个用户可见的交互 Session。`mode` 仅保留为数据与协议兼容字段，不再提供后台执行模式。
 
-**managed**
-
-- Connector 能主动触发 Runtime。
-- `push_capable=true`。
-- Claude 通过创建/恢复 Session 的非交互进程执行。
-- Kimi 通过本机 Kimi Server API 创建 Session、提交 Prompt。
-- Codex 通过 `codex exec` 创建/恢复线程的非交互进程执行。
-- 命令通过 WebSocket 推送，Worker 不轮询 Hub。
-
-**external**
-
-- 已经存在的 Session 或人工操作的客户端登记到 Hub。
-- 首版 `push_capable=false`。
-- 可以分配任务、记录上下文和状态，但命令显示为 `waiting_manual`，不能伪装成已主动送达。
-- 已有交互式客户端后续可通过专用桥接升级为可推送模式。
+- 注册必须携带已核实的 `runtime_session_id`，Connector 不创建后台 Runtime。
+- `push_capable` 只由真实交互 Channel 的接通状态决定，不能由注册参数直接声明。
+- 在线且 Channel 已接通的 Worker 可接收直接命令、担任中央协调者或参与自动编排。
+- 未接通时可以分配任务、记录上下文和状态，但命令显示为 `waiting_manual`，不能伪装成已主动送达。
+- 实际模型执行、工具审批和用户干预都发生在对应交互窗口中。
 
 ### 3.2 状态维度
 
@@ -112,11 +102,11 @@ work_state: idle | working | waiting | blocked
                     │                     │
         ┌───────────┼───────────┐         │
         │           │           │         │
-   Claude Driver  Kimi Driver  Manual     │
+  Claude Channel Kimi Channel Codex queue │
         │           │           │         │
-   Claude CLI    kimi web     外部 Session │
+        └───────────┴───────────┘         │
                      │                     │
-                Kimi Sessions              │
+              用户可见的交互 Sessions       │
 ```
 
 网络原则：
@@ -124,7 +114,7 @@ work_state: idle | working | waiting | blocked
 - Connector 主动连接 Hub，Worker Mac 不开放入站端口。
 - 正式 Hub 只监听 `127.0.0.1:8787`，由 Caddy 在 443 提供 HTTPS/WSS。
 - Connector 本地 API 默认只监听 `127.0.0.1:8788`。
-- Kimi API 只监听回环地址，令牌不写入日志。
+- Kimi 临时 Session 准备 API 只监听回环地址，令牌不写入日志。
 - Headscale 仅作为管理或可选私网通道，不是公网接入的依赖。
 
 ## 5. 自注册与身份
@@ -159,8 +149,8 @@ Local CLI/Session
 {
   "name": "backend-claude-01",
   "runtime": "claude",
-  "mode": "managed",
-  "runtime_session_id": "可选；managed Claude 缺省时生成",
+  "mode": "external",
+  "runtime_session_id": "必填；来自已核实的交互 Session",
   "capabilities": ["backend", "testing"],
   "cwd": "/path/to/project",
   "metadata": {}
@@ -367,8 +357,8 @@ Dashboard 的新增、修改操作仍使用带 `Authorization: Bearer` 的 REST 
 - 版本标识是检出目录的 git commit（另带 `package.json` 版本和是否有未提交修改），Hub 与 Connector 在握手时交换，并通过 `/healthz`、`GET /api/v1/connectors` 暴露。
 - Connector 每遇到一个新的 Hub commit 只处理一次：`git fetch` 后仅在工作区干净、本地是上游祖先时 fast-forward，依赖文件变化时执行 `pnpm install --frozen-lockfile`。脏、领先或分叉的检出一律跳过并记录原因；Hub commit 不在上游时提示更新 Hub。
 - Hub 只触发更新检查，实际代码来自 Connector 本机配置的 Git upstream。该 upstream 属于代码执行信任边界；开发检出或不允许自动变更的机器用 `--no-auto-update` 或 `AGENT_HUB_AUTO_UPDATE=0` 关闭。
-- 以 launchd 服务运行（`AGENT_HUB_SUPERVISED=1`）时，更新后等所有正在执行的 managed 命令结束再退出，由 launchd 拉起新代码；前台运行只提示手动重启，避免中断执行中的命令被标记为 `outcome_unknown`。
-- 服务安装保留 `PATH`、`HOME` 和已设置的 `AGENT_HUB_KIMI_MODEL`、`AGENT_HUB_CODEX_MODEL`、`AGENT_HUB_AUTO_UPDATE`，并透传显式 `--local-port`；任何 Token 都不写入 plist。
+- 以 launchd 服务运行（`AGENT_HUB_SUPERVISED=1`）时，更新后等所有正在执行的交互命令结束再退出，由 launchd 拉起新代码；前台运行只提示手动重启，避免中断执行中的命令被标记为 `outcome_unknown`。
+- 服务安装保留 `PATH`、`HOME` 和已设置的 `AGENT_HUB_AUTO_UPDATE`，并透传显式 `--local-port`；任何 Token 都不写入 plist。
 - Hub 不自更新，只记录与 Connector 的版本差异；Hub 机器手动 `agent-hub update` 后重启。
 
 ## 9. 持久化设计
@@ -418,87 +408,60 @@ payload_json, created_at
 Connector 使用本地 JSON 状态文件和原子重命名保存：
 
 - Connector ID/Token、Local Token。
-- Worker 映射和 Driver 状态。
+- Worker 映射和真实 push 能力。
 - 已接受 Command 及执行状态。
 
 MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 
 ## 10. Runtime 适配器
 
-### 10.1 Claude managed
+### 10.1 当前执行边界
 
-- 注册时生成稳定 UUID 作为 `runtime_session_id`，记录是否已执行过首轮。
-- 首轮在命令事件到达时启动 `claude -p`，使用 `--session-id <uuid>`。
-- 后续使用 `claude -p --resume <uuid>` 恢复同一 Session。
-- 使用 `--output-format stream-json --verbose` 解析状态、Session ID 和结果。
-- 使用 `--permission-prompts none`，避免无人值守时永久等待权限问题。
-- 不使用 `--dangerously-skip-permissions`，不默认放开额外工具权限。
-- 同一 Worker 的进程串行运行；进程退出后保存最终状态。
+- Connector 不创建 Claude print 进程、Codex exec 进程，也不通过 Kimi Web Server 提交后台 Prompt。
+- 所有实际模型执行都在用户可见的交互 Session 中发生，工具权限由该 Session 的原生界面处理。
+- Connector 只维护命令队列和交互 Channel；没有已接通 Channel 时没有执行 fallback。
+- Claude 使用原生 Channel，Kimi 使用 ACP 或原生 TUI Channel，Codex 桌面使用原生 queue 加当前会话回执。
 
-这属于“事件到达后创建/恢复 Session”，不是向任意已打开 TUI 注入消息。
+### 10.2 Kimi Session 准备
 
-### 10.2 Kimi managed
+`KimiSessionManager` 只服务于启动器：通过临时 `kimi web --no-open --host 127.0.0.1` 创建或核对真实原生 Session ID，然后关闭临时 Server，再打开 ACP 或原生 TUI。它不包含 Prompt 执行、事件订阅或模型配置路径，令牌只保留在内存且不会写入日志。
 
-- Connector 首次需要 Kimi Driver 时启动专用 `kimi web --no-open --host 127.0.0.1`。
-- 从启动输出取得实际监听地址和令牌；端口被占用时允许 Kimi 顺延端口。
-- 通过 REST 创建 Session，保存返回的 `runtime_session_id`。
-- 每次执行前通过官方 `:reload` 恢复持久化 Session 的活动状态，再订阅事件，避免 REST 接受 Prompt 但 ACK 为 `not_found` 后永久等待。
-- 通过本机 WebSocket 订阅 Session 事件并等待订阅 ACK，再提交 Prompt；ACK 明确拒绝或 `not_found` 时立即失败。
-- 解包 `session_event`，将 `turn.started`、工具事件、`turn.ended`、`prompt.completed` 等映射为 Command 状态与输出。
-- 回复服务端应用层 `ping`，`pong` 使用相同 `nonce`；连接关闭时记录关闭码和原因。`AGENT_HUB_KIMI_DEBUG=1` 可输出事件类型与 ACK 诊断，默认关闭且不输出 Token。
-- Worker `metadata.kimi_model` 可为 Prompt 显式指定模型；也可用 Connector 的 `AGENT_HUB_KIMI_MODEL` 作为默认值。Kimi 配置没有默认模型时必须设置其中一种，否则会返回 `Model not set`。
-- Worker `metadata.kimi_permission_mode` 可显式选择 `manual` / `yolo` / `auto`，`metadata.kimi_disabled_tools` 可限制工具；默认沿用本机 Kimi 配置，不擅自放开权限。
-- Connector 退出时关闭自己启动的 Kimi Server。
-- Kimi REST/WebSocket API 当前为实验性，以运行版本的 `/openapi.json`、`/asyncapi.json` 为准。
-- 令牌仅保存在内存，不写日志、不发送给其他机器。
+### 10.3 历史后台适配器
 
-### 10.3 Codex managed
-
-- 注册时生成稳定 UUID 作为 Worker 的 `runtime_session_id` 注册标识。Codex 不支持预先指定原生线程 ID，首次执行后从 `thread.started` 读取 `thread_id`，保存到 Connector 的 `driver_state.session_id`。Worker 注册 ID 不随原生线程 ID 改写，显式登记已有线程时两者相同。
-- 首轮在命令事件到达时启动 `codex exec --json`；后续使用 `codex exec resume <driver_state.session_id> --json` 恢复同一线程，绝不使用 `--last` 选择最近会话。
-- 解析 `agent_message`、错误事件和进程退出状态，将最终文本与原生线程 ID 保存到 Command 结果。
-- 默认使用 `read-only` 沙箱；Worker `metadata.codex_sandbox` 可显式选择 `workspace-write`，不支持 `danger-full-access` 或绕过审批与沙箱的选项。
-- Worker `metadata.codex_model` 可显式指定模型；也可用 Connector 的 `AGENT_HUB_CODEX_MODEL` 设置默认值。缺省时沿用本机 Codex 配置。
-- 同一 Worker 的进程串行运行；Connector 退出时关闭自己创建的 Codex 子进程。
-
-这属于“事件到达后创建/恢复 Codex 线程”，不是控制 Codex 桌面端或向已打开的 TUI 注入消息。
+旧版 Claude、Kimi、Codex 后台 Driver 已从产品代码移除。历史验证记录仅用于审计，不能作为当前接入方式。旧 Worker 升级后统一为 `external` 且 `push_capable=false`，必须重新接通可见交互 Channel。
 
 ### 10.4 当前交互 Session 启动器
 
 - `agent-hub session start --runtime claude|kimi|codex` 只建立当前原生身份并打开客户端，不注册 Worker、不创建任务。
-- Claude 生成 UUID，以 `claude --session-id <uuid>` 启动；普通 Kimi 通过现有 Server API 创建原生 Session，关闭临时 Server 后以 `kimi --session <id>` 启动，避免 Web/CLI 对同一 Session 的排他占用。Kimi `--push` 只用临时 Server 取得真实 ID，随后改用 ACP（见 10.8）。
-- Codex 没有新会话 `--session-id` 参数。启动器直接打开新 Codex 客户端并只注入 `AGENT_HUB_RUNTIME`，不预创建空 Thread、不选择最近会话。Codex 自身向工具进程注入 `CODEX_SESSION_ID`，`worker register-current` 读取这个真实原生 ID；因此未通过启动器打开的现有 Codex 窗口也可以登记。若同时存在启动器 ID，必须与原生 ID 一致。
-- Claude/Kimi 由启动器注入 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`；Codex 以原生 `CODEX_SESSION_ID` 为身份来源。`worker register-current` 校验 Runtime 一致性，缺失时失败，不生成随机 ID、不选择最近会话，并记录实际身份来源。
-- 当前交互 Session 默认登记为 external，并保存 `interactive: true` 与 `session_origin`。只有用户明确选择且确认交互实例已退出或 Runtime 支持共享时才使用 managed。
-- Claude/Codex 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。普通 Kimi TUI 不能由另一个 Web Server 实时接管；需要交互推送时通过 `--push` 改用 ACP 窗口，不能用简单 `--session` 或 `:takeover` 冒充。
-- 非 Kimi `--push` 时，`--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。Kimi `--push` 不接受 Runtime 参数。
+- Claude 生成 UUID；Kimi 通过 `KimiSessionManager` 创建或核对真实 ID；Codex 由自身向工具进程注入 `CODEX_SESSION_ID`。启动器不选择最近会话，不伪造身份。
+- 当前交互 Session 统一登记为 `external`，保存 `interactive: true` 与 `session_origin`。`worker register-current` 校验 Runtime 和真实 ID 的一致性。
+- 非 Kimi `--push` 时，`--` 后的参数原样传给 Runtime。Kimi ACP 不接受 Runtime 参数；支持 `tui_channel` 的构建可用 `--native-tui` 并转发原生参数。
 
 ### 10.7 Claude 交互窗口实时推送（Channel）
 
-- `agent-hub session start --runtime claude --push [--resume <id>]` 在 Connector 数据目录下写入 `channels/<session>.json` MCP 配置，并以 `--allowedTools mcp__agent-hub__agent_hub_ack,mcp__agent-hub__agent_hub_report --mcp-config <file> --dangerously-load-development-channels server:agent-hub` 启动交互式 Claude Code。由于这三个参数都是可变参数，启动器总把它们放在 `--session-id`/`--resume` 之前，保证 `--` 后的 Runtime 参数不被吞掉。从另一个 Claude Code 会话内启动时设置 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`，避免继承的子会话标记关闭转录导致无法 `--resume`。
-- Claude Code 以 stdio 拉起 `agent-hub channel`（不依赖 MCP SDK 的最小 JSON-RPC 实现），它声明 `experimental['claude/channel']` 与 `tools`，并用 Local Token 打开 Connector 的 `GET /local/v1/channel?runtime=&session_id=` SSE 流，Connector 重启后自动重连。
-- Connector 按 `runtime + session_id` 找到 Worker：未注册时保持 `waiting_registration`，注册后立即接通；managed Worker 拒绝接通（无头执行与交互窗口不能共用同一 Session）。接通与断开通过 `worker.channel { worker_id, attached }` 报给 Hub，Hub 仅对 external Worker 切换 `push_capable` 并在接通时重放队列；每次重连后 Connector 重报所有 external Worker 的接通状态。
-- 投递：命令按 Worker 串行，写入 SSE 后 Channel 发出 `notifications/claude/channel`，`meta` 带 `command_id`、`kind`、`task_id`，正文末尾重申须用 `agent_hub_report` 回执。`agent_hub_ack` 只追加进度输出；`agent_hub_report { command_id, status, result }` 结束命令，结果为 `{ text, session_id, delivery: "channel" }`，与 managed Driver 同形，直接问答与编排读取方式不变。重复回执被拒绝。报告还可携带 `output_gap=true`，不完整证据不能被中央评审当作完整结果。
+- 启动器写入当前 Session 的 MCP 配置，以原生开发 Channel、`agent_hub_ack` 和 `agent_hub_report` 打开交互式 Claude Code。
+- Channel 使用 Local Token 打开 Connector 的 SSE 流，Connector 重启后自动重连。Connector 按 `runtime + session_id` 找到 Worker，未注册时保持 `waiting_registration`，注册后接通。
+- 接通与断开通过 `worker.channel { worker_id, attached }` 报给 Hub。Hub 只根据这个真实状态切换 `push_capable` 并在接通时重放已接受队列；每次重连后 Connector 重报所有 Worker 的 Channel 状态。
+- 命令按 Worker 串行。`agent_hub_report { command_id, status, result }` 结束命令，结果为 `{ text, session_id, delivery: "channel" }`，直接问答与编排读取方式不变。重复回执被拒绝，`output_gap=true` 表示证据不完整。
 - 接通前已为 `waiting_manual` 的命令不自动转推。窗口在执行中关闭时命令记为 `failed` 且 `outcome_unknown=true`。
-- @员工与直接问答对「在线且可推送」的员工开放（含接通的交互窗口）；中央协调者与自动编排步骤仍只选择 managed 员工。权限确认暂未经 Channel 中转到中控。
+- @员工、中央协调者与自动编排步骤都只对在线且 Channel 已接通的 Worker 开放。权限确认仍留在交互窗口。
 
-### 10.8 Kimi ACP 交互窗口实时推送
+### 10.8 Kimi ACP 与原生 TUI 实时推送
 
-- `agent-hub session start --runtime kimi --push [--resume <id>]` 通过临时 Web Server 创建或核对真实 Session ID后立即关闭它，再以 `kimi acp` 建立单条 ACP 连接。`KimiAcpDriver` 完成 `initialize` 与 `session/load`，在 ACP 子进程环境中注入启动器身份，用户和 Hub 共用这个原生 Session，不生成替代 ID。
-- 启动器提供轻量交互输入，不是 Kimi 原生全屏 TUI。用户输入与 `KimiChannel` 收到的 Hub 命令进入同一个串行队列，`session/prompt` 只在同一 ACP 连接上发送；`agent_message_chunk` 同时用于窗口显示和 Hub 结果收集。`session/request_permission` 在同一窗口由用户选择，不能响应时明确失败。
-- `KimiChannel` 复用 Connector 的 SSE 接通、注册、重连和 external Worker 语义：prompt 开始时 `/ack`，结束时 `/report`，结果为 `{ text, session_id, delivery: "channel" }` 并传递 `output_gap`。模型不需要调用 Claude 专用 MCP 回执工具；停止原因、API 错误、关闭和未知结果均按真实状态报告。
-- 不关闭 Session 锁、不调用 `:takeover`、不保留共享 Web Server、不模拟键盘或修改 wire.jsonl。`--resume` 通过 `session/load` 恢复原上下文，`/exit` 关闭 ACP 和 Channel，Worker 自动退回 `waiting_manual`。
-- 自动编排仍只选择 managed Worker；显式 @ 和直接命令可发给已接通的 external Kimi。Kimi `--push` 已在 2.3.3 验证。
+- ACP 启动器通过临时 Web Server 取得真实 ID 后立即关闭它，再以 `kimi acp` 建立单条连接。用户和 Hub 共用原生 Session，输入与命令串行，权限在同一窗口处理。
+- 支持 `tui_channel` 的构建可用 `--native-tui`，通过本机 Unix Socket 进入原生发送队列和审批面板，不启动 ACP 或第二个 Runtime。
+- `KimiChannel` 复用 Connector 的 SSE 接通、注册和重连：prompt 开始时 `/ack`，结束时 `/report`，结果为 `{ text, session_id, delivery: "channel" }` 并传递 `output_gap`。
+- 不关闭 Session 锁、不调用 `:takeover`、不保留共享 Web Server、不模拟键盘或修改 wire.jsonl。退出后 Worker 自动退回 `waiting_manual`。
+- 已接通的 Kimi 可担任中央协调者或参与自动编排，未接通时不能转为后台执行。
 
-### 10.5 Test Driver
+### 10.5 测试交互 Driver
 
-- 仅在显式测试开关下启用。
-- 用于可控地验证推送、串行、断线和重放，不代表真实 Agent 验证。
+测试 Driver 只存在于测试代码，通过真实 SSE Channel 驱动可控交互结果，用于验证推送、串行、断线和重放，不代表真实 Agent 验证，也不作为 Connector 的生产 fallback。
 
 ### 10.6 中央协调器
 
-- 管理员通过 `PUT /api/v1/coordinator` 指定一个 managed、可推送 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Dashboard 的“指定/更换”对话框复用该接口，候选仅为未注销的 managed、可推送 Worker；中央大脑仍显示在员工列表并标注角色。注册员工不要求先配置中央大脑，但未启用时不能进行中央对话或自动编排，`orchestrate` 请求返回 `coordinator_disabled`。Worker 自声明协调者身份不会获得权限。
-- 协调者生成受限对话动作、规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含 Driver 私有状态、任意 metadata 或 Token。
+- 管理员通过 `PUT /api/v1/coordinator` 指定一个在线且 Channel 已接通的 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Dashboard 候选使用同一条件；Worker 自声明协调者身份不会获得权限。
+- 协调者生成受限对话动作、规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含会话私有状态、任意 metadata 或 Token。
 - `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误、`auto_start`、来源消息、终审理由、`recovery_count`、`review_command_id` 和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由；修正前的结果和评审归档在 `previous_attempts`。`coordinator_chat_messages` 保存用户、协调者和任务活动消息，通过 request/source 去重键及 Command/Task 关联支持恢复。
 - 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。终审 Command ID 与编排关联，迟到的上一轮回执不能再次触发评审或修正。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
 - 单独 `@员工` 的 `action=chat` 是转交问答，不采用中央代答。Hub 从回复的来源键找回原用户消息，向目标 Worker 发出 `worker_chat` Command，附带必要的 @任务上下文，`task_id=null`，不创建 Orchestration。创建 Command 与更新回复关联在同一事务提交，最终回复和 Hub 重启恢复按 Command 幂等完成，不重复转交。Worker 的纯文本结果才是最终回复；失败、空结果和未知结果明确失败，不伪造验收。
@@ -585,17 +548,8 @@ agent-hub connector \
   --enroll-token <token>
 
 agent-hub worker register \
-  --runtime claude --mode managed \
+  --runtime claude --session-id <已核实的真实ID> \
   --name backend-01 --cwd /path/to/project
-
-agent-hub worker register \
-  --runtime kimi --mode managed \
-  --name kimi-01 --cwd /path/to/project \
-  --metadata '{"kimi_model":"kimi-code/kimi-for-coding"}'
-
-agent-hub worker register \
-  --runtime codex --mode managed \
-  --name codex-01 --cwd /path/to/project
 
 agent-hub session start --runtime kimi --cwd /path/to/project
 agent-hub session start --runtime claude --cwd /path/to/project
@@ -647,7 +601,7 @@ agent-hub list tasks
 agent-hub list commands
 ```
 
-Admin CLI 从 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 获取 Hub 地址与凭证；Worker CLI 和 `--local` 任务/命令操作从本地 Connector 数据目录获取 Local Token。`--wait` 只能与 `--local` 一起使用，由完成事件唤醒，默认最长等待 10 分钟；`waiting_manual` 和 `wait_timed_out` 都不是成功。`task update --local` 只允许修改状态，且任务必须分配给当前 Connector。Kimi 的默认模型也可在启动 Connector 前通过 `AGENT_HUB_KIMI_MODEL` 设置，Worker 的 `metadata.kimi_model` 优先于该全局默认值。
+Admin CLI 从 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 获取 Hub 地址与凭证；Worker CLI 和 `--local` 任务/命令操作从本地 Connector 数据目录获取 Local Token。`--wait` 只能与 `--local` 一起使用，由完成事件唤醒，默认最长等待 10 分钟；`waiting_manual` 和 `wait_timed_out` 都不是成功。`task update --local` 只允许修改状态，且任务必须分配给当前 Connector。模型与工具权限在对应交互 Session 中设置，Connector 不提供后台模型默认值。
 
 ### Agent Skill（公网分发与本机配套）
 
@@ -663,7 +617,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
-Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude|codex` 打开客户端后，Claude/Kimi 使用启动器提供的 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，Codex 使用自身注入工具进程的 `CODEX_SESSION_ID`，因此已有 Codex 窗口也能通过 `worker register-current` 登记本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。普通 Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；Kimi `--push` 改用单连接 ACP 交互窗口，由桥接自动回执，普通 TUI 不能用另一个 Web Server 实时接管。Claude/Codex 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。缺少可信原生身份时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
+Skill 只登记可见交互 Session：通过 `agent-hub session start --runtime kimi|claude|codex` 打开客户端后，Claude/Kimi 使用启动器提供的 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，Codex 使用自身注入工具进程的 `CODEX_SESSION_ID`，因此已有 Codex 窗口也能通过 `worker register-current` 登记本人，不需要手工填写 ID。所有 Worker 统一为 external；需要主动推送时必须接通 Runtime 对应 Channel。普通 Kimi 启动器会在打开 CLI 前关闭临时 Web Server；Kimi `--push` 使用单连接 ACP 或支持 `tui_channel` 的原生 TUI。缺少可信原生身份时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
 用户可以直接说“添加任务”“添加并执行”或“交给中央大脑”。普通任务由 Agent 从自然语言整理字段并选择本机 Worker；中央编排由管理员指定的协调者生成计划、Hub 校验后跨 Connector 调度。Worker 仍不能自主跨机互派。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页不提供任务编辑或调度表单；管理员通过中央对话安排工作，Agent 原有 Local Token 和 CLI 流程不变。
 
@@ -676,7 +630,7 @@ Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start
 
 主界面不设置宣传/教学文案、命令回执、事件流水或调度表单。交付使用 `public/markdown.js` 渲染常用 Markdown 结构，不再截断为 6000 字；Agent 原文先转义，原始 HTML 不执行，链接仅允许安全协议。支持单步和全部结果复制，保留完整原始返回。Enter 发送，Cmd/Ctrl+Enter 或 Shift+Enter 换行；每条消息可复制，Clipboard API 不可用时使用兼容复制路径。中央忙碌时待回复消息显示排队，旧版本留下的超长步骤汇报只在显示层收敛，不改写原始记录。
 
-输入框的 `@` 提供可键盘操作的员工和任务选择器，保存结构化引用而不是把显示名当成身份。单独 `@员工` 提问或讨论时转交该员工本人回答，不创建任务；回复通过关联的 `worker_chat` Command 计算 `speaker`，页面和 `chat.updated` 显示真实员工名，并区分回复等待与忙碌排队。`@员工` 派活仍对后续计划的可选 Registry 和计划校验施加同一约束，模型不能改派其他 Worker；`@任务` 只补充真实任务/计划快照，仍遵守启动边界。未选择员工时继续按能力自动匹配。external、离线和协调者本人不作为主动派单目标。
+输入框的 `@` 提供可键盘操作的员工和任务选择器，保存结构化引用而不是把显示名当成身份。单独 `@员工` 提问或讨论时转交该员工本人回答，不创建任务；回复通过关联的 `worker_chat` Command 计算 `speaker`，页面和 `chat.updated` 显示真实员工名，并区分回复等待与忙碌排队。`@员工` 派活仍对后续计划的可选 Registry 和计划校验施加同一约束，模型不能改派其他 Worker；`@任务` 只补充真实任务/计划快照，仍遵守启动边界。未选择员工时继续按能力自动匹配。未接通、离线和协调者本人不作为主动派单目标。
 
 Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认证，不进入 URL。底层 Command/Event/API 继续用于审计与恢复。
 
@@ -692,10 +646,10 @@ Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认�
 
 - 首次启动生成随机 Admin Token 和 Enrollment Token，写入 0600 凭证文件；也允许通过环境变量显式提供。
 - Connector Token 和 Local Token 都是独立随机凭证。
-- 协调者配置只能由 Admin 修改，Worker 自声明不会获得中央权限。协调器接收的 Registry 不包含 Token、Driver 私有状态或任意 metadata；模型输出始终作为不可信输入进行 Schema、Worker 和依赖校验。
+- 协调者配置只能由 Admin 修改，Worker 自声明不会获得中央权限。协调器接收的 Registry 不包含 Token、会话私有状态或任意 metadata；模型输出始终作为不可信输入进行 Schema、Worker 和依赖校验。
 - 每个编排最多 4 步，只有一次初始规划；终审拒绝后的自动修正最多两轮，且必须有明确失败步骤，下游随依赖失效并保留历史证据。父任务只有在全部步骤和整体验收都通过后才能完成，执行失败、证据不足和评审拒绝都不能冒充成功。
 - 管理员对话仅支持 `chat`、`plan`、`orchestrate`、`start` 四类受限动作；计划与启动由 Hub 校验，模型不能自行扩权。`request_id` 和来源消息提供重试去重，对话历史仅向 Admin 开放。
-- `@` 引用只接受 Hub 核验的真实 ID。指定 Worker 时同时约束规划器的 Registry 与返回计划的校验，不能只靠提示词防止改派；external 和离线 Worker 不能冒充可推送。
+- `@` 引用只接受 Hub 核验的真实 ID。指定 Worker 时同时约束规划器的 Registry 与返回计划的校验，不能只靠提示词防止改派；未接通和离线 Worker 不能冒充可推送。
 - 历史清理要求 Admin 和显式确认，先备份再事务删除；有活动工作则拒绝，Connector/Worker 身份与凭证不在清理范围内。
 - Hub 数据目录、Connector 数据目录和凭证文件不作为静态资源暴露。
 - 正式公网 Hub 只监听服务器回环地址，由 Caddy 提供 HTTPS/WSS；不得直接开放 8787。公网安全组只需 80/443。
@@ -717,7 +671,7 @@ Mac Connector ──────────────┘
 Mac Connector ──────────────┘
 ```
 
-服务器使用 Amazon Linux 2023、隔离的 Node 24 LTS 和 `agent-hub-hub.service`。服务以无登录权限的 `agent-hub` 账户运行，代码在 `/opt/agent-hub/app`，正式数据在 `/var/lib/agent-hub/hub`。Hub 不保存模型账号；中央大脑仍是某台 Mac 上通过 Connector 接入的 managed Worker，Hub 内置协调器负责状态机、权限和持久化。
+服务器使用 Amazon Linux 2023、隔离的 Node 24 LTS 和 `agent-hub-hub.service`。服务以无登录权限的 `agent-hub` 账户运行，代码在 `/opt/agent-hub/app`，正式数据在 `/var/lib/agent-hub/hub`。Hub 不保存模型账号；中央大脑是某台 Mac 上通过 Connector 接通交互 Channel 的 Worker，Hub 内置协调器负责状态机、权限和持久化。
 
 Caddy 站点配置：
 
@@ -759,6 +713,9 @@ MVP 完成必须满足：
 7. 真实模型 smoke 不启动 Tailscale、不访问其他机器、不接管或修改已有 Agent Session 作为副作用，只使用全新的隔离 Session。Tailscale 部署验证单独进行，不以本机绑定代替跨机验收。
 
 ## 16. 当前实现验证记录
+
+- 当前交互-only 架构：Connector 已删除后台 Runtime 执行路径，注册统一为 `external`；旧后台身份迁移后撤销 push 能力。中央协调者与自动编排员工均要求在线且 Channel 已接通。自动化通过真实 Hub、Connector、WebSocket 与 SSE 验证 external 大脑规划、依赖执行和终审，以及旧库/本地状态迁移、未接通等待、断线未知结果保护和注销恢复后的 Connector 关闭清理。关闭时会拒绝新 Channel 并清理残余本地连接，避免交互客户端重连竞态导致永久等待。
+- 以下记录包含已退役后台架构的历史实测，仅用于审计和协议参考，不能作为当前接入指引。
 
 - `pnpm test`：97 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。

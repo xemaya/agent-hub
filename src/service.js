@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 
 export const SERVICE_LABEL = 'com.agent-hub.connector';
 
-const INHERITED_ENV = ['AGENT_HUB_KIMI_MODEL', 'AGENT_HUB_CODEX_MODEL', 'AGENT_HUB_AUTO_UPDATE'];
+const INHERITED_ENV = ['AGENT_HUB_AUTO_UPDATE'];
 
 function escapeXml(value) {
   return String(value)
@@ -58,7 +58,7 @@ export function connectorServiceSpec({
     ProgramArguments: args,
     WorkingDirectory: rootDir,
     EnvironmentVariables: {
-      // Managed drivers spawn claude/kimi/codex, which launchd's default PATH would not find.
+      // Self-update needs the same git, node and pnpm PATH as the installing shell.
       PATH: env.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin',
       HOME: env.HOME ?? os.homedir(),
       AGENT_HUB_SUPERVISED: '1',

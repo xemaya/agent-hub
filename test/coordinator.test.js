@@ -2,12 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { Connector } from '../src/connector.js';
-import { TestDriver } from '../src/drivers/test.js';
 import { run } from '../src/cli.js';
 import { createTestContext, waitFor } from './helpers.js';
 
 function scriptedDriver() {
-  let sequence = 0;
   const driver = {
     executions: [],
     plan: null,
@@ -19,10 +17,6 @@ function scriptedDriver() {
     work: null,
     failWork: false,
     failWorkerChat: false,
-    async prepareWorker(input) {
-      sequence += 1;
-      return { runtime_session_id: input.runtime_session_id ?? `session-${sequence}`, driver_state: {} };
-    },
     async execute({ worker, command, onOutput, onState }) {
       driver.executions.push({ worker: worker.name, kind: command.kind, input: command.input, command_id: command.command_id });
       await onState({ started: true });
@@ -49,7 +43,7 @@ function scriptedDriver() {
 async function setup(t, { plan, reviewPass = true, failWork = false, maxSteps = 4 } = {}) {
   const context = await createTestContext(t);
   const driver = scriptedDriver();
-  context.connector.drivers.test = driver;
+  context.driver = driver;
   const coordinator = await context.registerWorker({ name: 'coordinator-test' });
   const worker = await context.registerWorker({ name: 'worker-test' });
   driver.plan = plan ?? JSON.stringify({
@@ -163,7 +157,6 @@ test('Coordinator plans, dispatches dependencies and completes final review', as
     dataDir: path.join(context.root, 'other-connector'),
     localPort: 0,
     enrollToken: 'test-enroll',
-    drivers: { test: new TestDriver() },
     logger: { error() {} },
   });
   await other.start();
@@ -327,19 +320,28 @@ test('Hub resume adopts a legacy rejected review and ignores its late review aft
   assert.equal(driver.executions.length, executionCount);
 });
 
-test('Coordinator configuration requires Admin and a managed Worker', async (t) => {
+test('Coordinator configuration requires Admin and an attached interactive Worker', async (t) => {
   const context = await createTestContext(t);
-  const worker = await context.registerWorker({ mode: 'external', runtime_session_id: 'external-coordinator' });
+  const worker = await context.registerWorker({ attach: false, runtime_session_id: 'external-coordinator' });
   const unauthorized = await fetch(`${context.hub.url}/api/v1/coordinator`);
   assert.equal(unauthorized.status, 401);
+  const rejected = await context.admin('/api/v1/coordinator', {
+    method: 'PUT',
+    body: { worker_id: worker.worker_id, enabled: true },
+  });
+  assert.equal(rejected.response.status, 400);
+  const status = await context.admin('/api/v1/coordinator');
+  assert.equal(status.payload.coordinator.enabled, false);
+  assert.equal(status.payload.coordinator.worker, null);
+
+  await context.attachWorker(worker);
   const configured = await context.admin('/api/v1/coordinator', {
     method: 'PUT',
     body: { worker_id: worker.worker_id, enabled: true },
   });
-  assert.equal(configured.response.status, 400);
-  const status = await context.admin('/api/v1/coordinator');
-  assert.equal(status.payload.coordinator.enabled, false);
-  assert.equal(status.payload.coordinator.worker, null);
+  assert.equal(configured.response.status, 200);
+  assert.equal(configured.payload.coordinator.worker.mode, 'external');
+  assert.equal(configured.payload.coordinator.worker.push_capable, true);
 });
 
 async function chatReply(context, commandId) {
@@ -788,7 +790,7 @@ test('@Task supplies real context and invalid or manual Worker mentions are reje
   assert.equal((await context.admin('/api/v1/tasks')).payload.tasks.length, 1);
   assert.equal(driver.executions.filter((item) => item.kind !== 'coordinator_chat').length, 0);
 
-  const external = await context.registerWorker({ name: 'manual-worker', mode: 'external', runtime_session_id: 'manual-target' });
+  const external = await context.registerWorker({ name: 'manual-worker', attach: false, runtime_session_id: 'manual-target' });
   for (const [mentions, status] of [
     [[{ type: 'worker', id: 'worker_missing' }], 404],
     [[{ type: 'task', id: 'task_missing' }], 404],

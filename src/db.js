@@ -181,7 +181,7 @@ export class HubStore {
         connector_id TEXT NOT NULL REFERENCES connectors(connector_id),
         name TEXT NOT NULL,
         runtime TEXT NOT NULL,
-        mode TEXT NOT NULL CHECK(mode IN ('managed', 'external')),
+        mode TEXT NOT NULL DEFAULT 'external' CHECK(mode = 'external'),
         runtime_session_id TEXT NOT NULL,
         capabilities_json TEXT NOT NULL,
         cwd TEXT NOT NULL,
@@ -330,7 +330,8 @@ export class HubStore {
         next_number = MAX(task_number_sequence.next_number, excluded.next_number);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
-      PRAGMA user_version = 8;
+      UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
+      PRAGMA user_version = 9;
     `);
   }
 
@@ -412,12 +413,12 @@ export class HubStore {
       connectorId,
       data.name,
       data.runtime,
-      data.mode,
+      'external',
       data.runtime_session_id,
       stringifyJson(data.capabilities ?? []),
       data.cwd,
       stringifyJson(data.metadata ?? {}),
-      data.mode === 'managed' ? 1 : 0,
+      0,
       timestamp,
       timestamp,
       timestamp,
@@ -497,10 +498,10 @@ export class HubStore {
     return this.getWorker(workerId);
   }
 
-  // Only external Workers toggle: they can receive pushes while an interactive channel is attached.
+  // Push capability always follows the attached interactive Channel.
   setWorkerChannel(connectorId, workerId, attached) {
     const worker = this.getWorkerForConnector(workerId, connectorId);
-    if (!worker || worker.mode !== 'external') return null;
+    if (!worker) return null;
     const timestamp = now();
     this.db.prepare('UPDATE workers SET push_capable = ?, updated_at = ?, last_seen_at = ? WHERE worker_id = ?')
       .run(attached ? 1 : 0, timestamp, timestamp, workerId);

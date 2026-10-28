@@ -8,6 +8,7 @@ export class KimiChannel {
     token,
     sessionId,
     driver,
+    runtime = 'kimi',
     cwd = process.cwd(),
     logger = {},
     retryMs = 2000,
@@ -15,8 +16,9 @@ export class KimiChannel {
     this.connectorUrl = connectorUrl.replace(/\/$/, '');
     this.token = token;
     this.sessionId = sessionId;
+    this.runtime = runtime;
     this.driver = driver;
-    this.worker = { runtime_session_id: sessionId, cwd, metadata: {} };
+    this.worker = { runtime, runtime_session_id: sessionId, cwd, metadata: {} };
     this.logger = logger;
     this.retryMs = retryMs;
     this.state = 'connecting';
@@ -91,6 +93,7 @@ export class KimiChannel {
   async handleEvent(event) {
     if (['attached', 'waiting_registration', 'rejected'].includes(event.type)) {
       this.state = event.type;
+      if (event.type === 'attached') this.worker.name = event.name;
       this.logger.error?.(`Agent Hub channel: ${event.type}${event.reason ? ` (${event.reason})` : ''}`);
       return;
     }
@@ -98,7 +101,7 @@ export class KimiChannel {
   }
 
   async streamLoop() {
-    const query = new URLSearchParams({ runtime: 'kimi', session_id: this.sessionId });
+    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId });
     while (!this.stopped) {
       this.abort = new AbortController();
       try {

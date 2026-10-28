@@ -24,8 +24,8 @@ unzip agent-hub.zip
 bash agent-hub/scripts/bootstrap.sh</code></pre>
       <p class="security-note">脚本会检查 Node.js 22.5+、pnpm 和 Git，安装常驻 Connector、CLI 和 Skill。输入提示出现时，填写管理员另行提供的 Enrollment Token。Token 不要发送到聊天中。无需 Tailscale。</p>
       <h3>发给其他 Mac 的 Agent</h3>
-      <pre class="skill-prompt">请从 https://hub.findu.work/skill 下载 Agent Hub Skill，按其中的 SKILL.md 完成这台 Mac 的 Connector、CLI 和 Skill 接入。需要输入 Enrollment Token 时停下来，让我在本机终端安全输入，不要索取或打印 Admin Token。此次只完成接入，不要把当前已打开的 Kimi/Claude 窗口登记为 Worker，也不要索取 Session ID。接入后只报告 Connector 状态和本机 Worker 列表；我会另行明确是新建独立 managed Worker，还是通过 agent-hub 启动器登记当前窗口。</pre>
-      <p class="security-note">只有登记当前 Kimi/Claude 窗口才需要用 agent-hub session start 重新打开；新建独立 managed Worker 不需要。</p>
+      <pre class="skill-prompt">请从 https://hub.findu.work/skill 下载 Agent Hub Skill，按其中的 SKILL.md 完成这台 Mac 的 Connector、CLI 和 Skill 接入。需要输入 Enrollment Token 时停下来，让我在本机终端安全输入，不要索取或打印 Admin Token。此次只完成接入，不要把当前已打开的 Kimi/Claude 窗口登记为 Worker，也不要索取 Session ID。接入后只报告 Connector 状态和本机 Worker 列表；我会另行明确是否通过 agent-hub 启动器登记当前窗口。</pre>
+      <p class="security-note">所有 Worker 都是可见交互 Session；登记当前 Kimi/Claude 窗口时用 agent-hub session start 打开，需要主动推送时接通对应 Channel。</p>
       <a class="text-button" href="/">管理员登录 →</a>
     </section>
   </main>

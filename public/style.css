@@ -219,7 +219,7 @@ button:disabled { cursor: wait; }
 
 .status { display: inline-flex; flex-shrink: 0; align-items: center; gap: 5px; width: fit-content; padding: 3px 6px; border: 1px solid var(--line); color: #4f594f; background: var(--paper); font: 600 9px var(--body); white-space: nowrap; }
 .status::before { content: ""; width: 5px; height: 5px; background: #858d86; }
-.status-online::before, .status-succeeded::before, .status-done::before, .status-managed::before, .status-idle::before { background: var(--green); }
+.status-online::before, .status-succeeded::before, .status-done::before, .status-idle::before { background: var(--green); }
 .status-working::before, .status-running::before, .status-in_progress::before, .status-planning::before, .status-chatting::before, .status-reviewing::before { background: var(--blue); }
 .status-blocked::before, .status-failed::before, .status-offline::before, .status-cancelled::before { background: var(--signal); }
 .status-waiting_manual::before, .status-waiting::before, .status-review::before, .status-queued::before, .status-ready::before { background: var(--amber); }

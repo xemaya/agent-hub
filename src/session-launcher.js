@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { KimiDriver } from './drivers/kimi.js';
+import { KimiSessionManager } from './kimi-session-manager.js';
 import { KimiAcpDriver } from './drivers/kimi-acp.js';
 import { KimiNativeChannelDriver } from './drivers/kimi-native-channel.js';
 import { KimiChannel } from './kimi-channel.js';
@@ -79,8 +79,8 @@ export async function prepareSessionLaunch(options = {}) {
       throw new Error('Kimi push requires Connector connection details');
     }
     if (options.push && !nativeTui && runtimeArgs.length) throw new Error('Kimi --push does not accept runtime arguments');
-    driver = options.kimiDriver ?? new KimiDriver({ env });
-    const prepared = await driver.prepareWorker({
+    driver = options.kimiSessions ?? new KimiSessionManager({ env });
+    const prepared = await driver.prepareSession({
       cwd,
       ...(options.resumeSessionId ? { runtime_session_id: options.resumeSessionId } : {}),
     });

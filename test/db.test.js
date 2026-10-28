@@ -46,7 +46,7 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 8);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 9);
   assert.ok(store.db.prepare('PRAGMA table_info(tasks)').all().some((column) => column.name === 'deleted_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
@@ -69,7 +69,7 @@ test('Chat and orchestration idempotency survive reopening the database', async 
   });
   const connector = store.createConnector({ name: 'db-test', tokenHash: 'test-hash' });
   const worker = store.registerWorker(connector.connector_id, {
-    name: 'db-worker', runtime: 'test', mode: 'managed', runtime_session_id: 'db-session',
+    name: 'db-worker', runtime: 'test', mode: 'external', runtime_session_id: 'db-session',
     capabilities: ['testing'], cwd: root, metadata: {},
   });
   const user = store.createChatMessage({
@@ -164,4 +164,36 @@ test('Task numbers migrate in order and are not reused after restart or history 
   store = new HubStore(filename);
   store.clearHistory();
   assert.equal(store.createTask({ title: 'After clear' }).task_number, 4);
+});
+
+test('interactive-only migration preserves Worker identity, work history and Coordinator config', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  let store = new HubStore(filename);
+  t.after(() => {
+    if (store) store.close();
+  });
+  const connector = store.createConnector({ name: 'legacy-mac', tokenHash: 'legacy-hash' });
+  const worker = store.registerWorker(connector.connector_id, {
+    name: 'legacy-worker', runtime: 'codex', mode: 'external', runtime_session_id: 'legacy-session',
+    capabilities: ['coding'], cwd: root, metadata: {},
+  });
+  const task = store.createTask({ title: 'Legacy work', assignee_worker_id: worker.worker_id });
+  const command = store.createCommand({ worker_id: worker.worker_id, task_id: task.task_id, input: 'Preserve me', push_capable: true });
+  store.setCoordinatorConfig({ workerId: worker.worker_id, enabled: true, maxSteps: 4 });
+  store.db.exec(`PRAGMA ignore_check_constraints = ON;
+    UPDATE workers SET mode = 'managed', push_capable = 1 WHERE worker_id = '${worker.worker_id}';
+    PRAGMA user_version = 8;
+  `);
+  store.close();
+
+  store = new HubStore(filename);
+  const migrated = store.getWorker(worker.worker_id);
+  assert.equal(migrated.worker_id, worker.worker_id);
+  assert.equal(migrated.mode, 'external');
+  assert.equal(migrated.push_capable, false);
+  assert.equal(store.getTask(task.task_id).title, 'Legacy work');
+  assert.equal(store.getCommand(command.command_id).input, 'Preserve me');
+  assert.equal(store.getCoordinatorConfig().worker_id, worker.worker_id);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 9);
 });

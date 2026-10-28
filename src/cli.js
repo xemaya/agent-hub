@@ -14,8 +14,7 @@ const HELP = `Agent Hub
 Usage:
   agent-hub hub [--host 127.0.0.1] [--port 8787] [--data-dir .runtime/hub]
   agent-hub connector --hub-url URL [--name NAME] [--data-dir .runtime/connector]
-                      [--enroll-token TOKEN] [--local-port 8788] [--allow-test-driver]
-                      [--no-auto-update]
+                      [--enroll-token TOKEN] [--local-port 8788] [--no-auto-update]
   agent-hub service install --hub-url URL [--name NAME] [--data-dir ~/.agent-hub/connector]
   agent-hub service uninstall|status
   agent-hub update
@@ -25,10 +24,10 @@ Usage:
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
   agent-hub desktop report --command-id ID --status succeeded|failed [--data-dir DIR] < result.txt
-  agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
-                            [--name NAME] [--cwd DIR] [--session-id ID]
+  agent-hub worker register --runtime claude|kimi|codex|other --session-id ID
+                            [--name NAME] [--cwd DIR]
                             [--capabilities a,b] [--metadata JSON]
-  agent-hub worker register-current [--name NAME] [--cwd DIR] [--mode managed|external]
+  agent-hub worker register-current [--name NAME] [--cwd DIR]
                                     [--capabilities a,b] [--metadata JSON]
   agent-hub worker unregister WORKER_ID
   agent-hub worker unregister-current
@@ -50,12 +49,10 @@ Environment:
   AGENT_HUB_ENROLLMENT_TOKEN    First Connector enrollment token
   AGENT_HUB_CONNECTOR_URL       Local Connector URL (default http://127.0.0.1:8788)
   AGENT_HUB_LOCAL_TOKEN         Local Connector token; otherwise read from data-dir
-  AGENT_HUB_KIMI_MODEL          Default model for managed Kimi Workers
-  AGENT_HUB_CODEX_MODEL         Default model for managed Codex Workers
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -214,7 +211,6 @@ async function startConnector(flags) {
     localHost: '127.0.0.1',
     localPort: port(flags['local-port'], 8788),
     enrollToken: flags['enroll-token'] ?? process.env.AGENT_HUB_ENROLLMENT_TOKEN,
-    allowTestDriver: flags['allow-test-driver'] === true || process.env.AGENT_HUB_ALLOW_TEST_DRIVER === '1',
     onVersionMismatch: autoUpdate
       ? async ({ hub }) => {
           const result = await selfUpdate({ peerCommit: hub.commit });
@@ -323,6 +319,7 @@ async function workerCommand(positionals, flags) {
     return;
   }
   if (['register', 'register-current'].includes(action)) {
+    if (flags.mode !== undefined && flags.mode !== 'external') throw new Error('Only interactive external Workers are supported');
     const metadata = flags.metadata ? JSON.parse(flags.metadata) : {};
     let runtime = flags.runtime;
     let sessionId = flags['session-id'];
@@ -348,7 +345,7 @@ async function workerCommand(positionals, flags) {
       body: {
         name: flags.name,
         runtime,
-        mode: flags.mode ?? (action === 'register-current' ? 'external' : 'managed'),
+        mode: 'external',
         runtime_session_id: sessionId,
         capabilities: flags.capabilities ? flags.capabilities.split(',').map((item) => item.trim()).filter(Boolean) : [],
         cwd: flags.cwd ?? process.cwd(),

@@ -53,7 +53,7 @@ test('Admin retirement hides Workers, rejects new work and restores the same ide
 test('Codex native Session can unregister itself idempotently and explicitly rejoin', async (t) => {
   const context = await createTestContext(t);
   const worker = await context.registerWorker({
-    name: 'codex-self', runtime: 'codex', mode: 'external', runtime_session_id: 'codex-self-native',
+    name: 'codex-self', runtime: 'codex', attach: false, runtime_session_id: 'codex-self-native',
   });
   const originalLog = console.log;
   const originalRuntime = process.env.AGENT_HUB_RUNTIME;
@@ -98,7 +98,7 @@ test('Retirement protects active work and the Coordinator while preserving comma
   const context = await createTestContext(t);
   const coordinator = await context.registerWorker({ name: 'coordinator-protected', runtime_session_id: 'coordinator-protected' });
   const worker = await context.registerWorker({ name: 'active-worker', runtime_session_id: 'active-worker' });
-  const external = await context.registerWorker({ name: 'manual-worker', runtime: 'codex', mode: 'external', runtime_session_id: 'manual-worker' });
+  const external = await context.registerWorker({ name: 'manual-worker', runtime: 'codex', attach: false, runtime_session_id: 'manual-worker' });
   context.hub.coordinator.configure({ workerId: coordinator.worker_id });
   const coordinatorRejected = await context.admin(`/api/v1/workers/${coordinator.worker_id}`, { method: 'DELETE' });
   assert.equal(coordinatorRejected.response.status, 409);

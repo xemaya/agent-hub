@@ -2,7 +2,7 @@
 
 ## 当前交互 Session
 
-先在一个目标项目目录打开：
+在目标项目目录打开：
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project
@@ -12,48 +12,43 @@ agent-hub session start --runtime codex --cwd /path/to/project
 
 在打开的窗口中说明职责，再用 `worker register-current`。启动器不提前注册或创建任务。Kimi 使用原生 Session ID，Claude 使用启动器 UUID，Codex 使用原生工具环境中的 `CODEX_SESSION_ID`；已有 Codex 窗口也可直接登记。Runtime 原生参数可放在启动命令 `--` 后。
 
-登记当前窗口默认 `--mode external`，不能声称它已经被中控接管。若缺少启动器变量或 Codex 原生变量，不能使用随机 ID、最近会话或 managed Worker 冒充。只有可信 Runtime 或用户明确提供的真实 ID 才能通过 `worker register --mode external --session-id ...` 登记旧窗口。不要手工伪造环境变量。
+当前窗口统一登记为 external。缺少启动器变量或 Codex 原生变量时，不能使用随机 ID、最近会话或另一个 Session 冒充。只有可信 Runtime 或用户明确提供的真实 ID 才能通过以下方式登记旧窗口：
 
-Claude 可主动推送的交互窗口：
+```bash
+agent-hub worker register --runtime kimi --session-id "<真实ID>" \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --name "<职责名称>" --cwd "$PWD"
+```
+
+登记不等于可推送；必须接通对应的交互 Channel。
+
+## Claude Channel
 
 ```bash
 agent-hub session start --runtime claude --push --cwd /path/to/project
 agent-hub session start --runtime claude --push --resume <session-id> --cwd /path/to/project
 ```
 
-在窗口中按 external 注册。Channel 接通后，命令以 `<channel source="agent-hub" command_id="...">` 到达；先调用 `agent_hub_ack`，完成工作后调用 `agent_hub_report` 返回完整结果，每个 command_id 一次。终端文字不会自动回传。首次启动选择“本地开发”，权限确认仍在终端处理。关闭窗口会退回人工协作。
+在窗口中执行 `register-current`。Channel 接通后，命令以 `<channel source="agent-hub" command_id="...">` 到达；先调用 `agent_hub_ack`，完成工作后调用 `agent_hub_report` 返回完整结果，每个 command_id 一次。终端文字不会自动回传。首次启动选择“本地开发”，权限确认仍在终端处理。关闭窗口会退回 `waiting_manual`。
 
-Kimi 使用：
+## Kimi ACP 或原生 TUI
 
 ```bash
 agent-hub session start --runtime kimi --push --cwd /path/to/project
 agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/to/project
 ```
 
-这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。Codex 桌面版在当前聊天中使用 `worker register-current --push`（或 `desktop attach --push`）。桥接直接调用现有 `codex queue --thread <CODEX_SESSION_ID> --message ...`，不启动另一个 App，不重启桌面，不在另一进程 resume 当前模型线程。
+ACP 是轻量交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。
 
-收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执会核对原生会话并保护重复调用。桌面进程退出后通道会关闭。
+如果当前 Kimi 构建明确支持实验性 `tui_channel`，可增加 `--native-tui` 打开真正的原生 TUI。Hub 通过本机 Unix Socket 进入原生发送队列和审批面板，不启动 ACP；启动器自动开启实验开关。不要用未支持该能力的版本强行尝试，也不要与 ACP 同时启动。自定义构建通过 `AGENT_HUB_KIMI_EXECUTABLE` 指定，不替换用户已有二进制。
 
-这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。
+## Codex 桌面原生队列
 
-如果当前 Kimi 构建明确支持实验性 `tui_channel`，可在上述命令中增加 `--native-tui` 打开真正的原生 TUI。此时 Hub 通过本机 Unix Socket 进入原生发送队列和审批面板，不启动 ACP；启动器自动开启实验开关。不要用官方未支持该 flag 的版本强行尝试，也不要把它与 ACP 同时启动。需要自定义构建时通过 `AGENT_HUB_KIMI_EXECUTABLE` 指定，不替换用户已有二进制。
+在当前聊天中使用 `worker register-current --push`（或 `desktop attach --push`）。桥接调用现有 `codex queue --thread <CODEX_SESSION_ID> --message ...`，不启动另一个 App，不重启桌面，不在另一进程恢复当前模型线程。
 
-只有用户明确要求主动执行，且交互实例已退出或 Runtime 支持共享，才可把当前窗口设为 managed。不要同时向同一 Session 发另一条 Prompt。
+收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执核对原生会话并保护重复调用。桌面进程退出后通道关闭。
 
-## 独立 managed Worker
-
-```bash
-agent-hub worker register \
-  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
-  --runtime codex --mode managed \
-  --name "<有意义的-worker-名称>" --cwd "$PWD" \
-  --capabilities "coding,review,analysis" \
-  --metadata '{"description":"<真实职责、模型与权限限制>"}'
-```
-
-可替换 Runtime 为 `claude` 或 `kimi`。不要传 `--session-id`。Kimi 在注册时创建独立原生 Session；Claude/Codex 在第一条命令到达时创建或恢复 Session。managed Worker 不是发起注册的当前窗口。
-
-Codex 未指定模型时沿用本机配置，默认 `codex_sandbox:"read-only"`；只有明确允许工作区写入才设置 `"workspace-write"`。Kimi 可在 metadata 设置已验证的 `kimi_model`，例如本机已确认的配置；不确定时不要虚构。
+## 状态与恢复
 
 注册前核实：名称体现角色，`cwd` 是真实工作目录，能力和简介反映实际范围。同一 `runtime + runtime_session_id` 重复注册幂等，不要把同一身份分给多个员工。
 
@@ -61,16 +56,16 @@ Codex 未指定模型时沿用本机配置，默认 `codex_sandbox:"read-only"`�
 agent-hub worker list --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
 ```
 
-保存返回的 `worker_id`，不展示凭证。以实际 `presence`、`push_capable` 和 `work_state` 判断可调度性，不仅看 Connector 在线或 external/managed 标签。
+保存返回的 `worker_id`，不展示凭证。以实际 `presence`、`push_capable` 和 `work_state` 判断可调度性，不只看 Connector 在线。
 
-external 状态真实变化时：
+状态真实变化时：
 
 ```bash
 agent-hub worker status WORKER_ID working --task-id TASK_ID --data-dir "$HOME/.agent-hub/connector"
 agent-hub worker status WORKER_ID idle --data-dir "$HOME/.agent-hub/connector"
 ```
 
-也可使用 `waiting` 或 `blocked`，不能虚报。managed 的状态主要由 Connector 回报。
+也可使用 `waiting` 或 `blocked`，不能虚报。
 
 只有用户明确要求撤下自己时才执行：
 

@@ -5,7 +5,6 @@ import { ConnectorStore } from './connector-store.js';
 import { bearerToken, tokensEqual } from './auth.js';
 import { createId } from './ids.js';
 import { readJsonBody, sendJson } from './json.js';
-import { createDefaultDrivers } from './drivers/index.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
 import { commandPrompt } from './drivers/prompt.js';
 
@@ -38,13 +37,11 @@ function normalizeError(error) {
 }
 
 export class Connector {
-  constructor(options, store, drivers) {
+  constructor(options, store) {
     this.options = options;
     this.store = store;
-    this.drivers = drivers;
     this.logger = options.logger ?? console;
     this.enrollToken = options.enrollToken;
-    this.allowTestDriver = Boolean(options.allowTestDriver);
     this.localHost = options.localHost ?? '127.0.0.1';
     this.requestedLocalPort = options.localPort ?? 8788;
     this.ws = null;
@@ -89,9 +86,8 @@ export class Connector {
       name: options.name ?? os.hostname(),
       hostname: options.hostname ?? os.hostname(),
     });
-    const drivers = options.drivers ?? createDefaultDrivers(options);
     const build = options.build ?? await readBuildInfo();
-    return new Connector({ ...options, build }, store, drivers);
+    return new Connector({ ...options, build }, store);
   }
 
   async start() {
@@ -351,7 +347,7 @@ export class Connector {
       .catch((error) => this.logger.error?.(`Self-update failed: ${error.message}`));
   }
 
-  // Defers a supervised restart until no managed command is executing.
+  // Defers a supervised restart until no interactive command is executing.
   requestRestart() {
     this.restartRequested = true;
     this.maybeRestart();
@@ -368,6 +364,7 @@ export class Connector {
   }
 
   openChannel(request, response, { runtime, sessionId }) {
+    if (this.stopping) throw localError('Connector is shutting down', 503);
     if (!runtime || !sessionId) throw localError('runtime and session_id are required');
     response.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -390,12 +387,6 @@ export class Connector {
     for (const channel of this.pendingChannels) {
       const worker = this.store.getWorkerBySession(channel.runtime, channel.sessionId);
       if (!worker || worker.retired_at) continue;
-      if (worker.mode !== 'external') {
-        this.pendingChannels.delete(channel);
-        this.writeChannelEvent(channel, { type: 'rejected', reason: 'managed Workers run headless; register this Session as external' });
-        channel.response.end();
-        continue;
-      }
       this.pendingChannels.delete(channel);
       const previous = this.channels.get(worker.worker_id);
       if (previous && previous !== channel) previous.response.end();
@@ -430,10 +421,9 @@ export class Connector {
     });
   }
 
-  // Tells the Hub which external Workers are live after every (re)connect.
+  // Tells the Hub which interactive Workers are live after every (re)connect.
   async syncChannels() {
     for (const worker of this.store.listWorkers()) {
-      if (worker.mode !== 'external') continue;
       const attached = this.channels.has(worker.worker_id);
       this.store.setWorkerPushCapability(worker.worker_id, attached);
       await this.announceChannel(worker.worker_id, attached);
@@ -518,7 +508,7 @@ export class Connector {
   }
 
   canRun(worker) {
-    return Boolean(worker && (this.channels.has(worker.worker_id) || (worker.mode === 'managed' && this.drivers[worker.runtime])));
+    return Boolean(worker && this.channels.has(worker.worker_id));
   }
 
   async pumpWorker(workerId) {
@@ -526,8 +516,8 @@ export class Connector {
       const command = this.store.nextAcceptedCommand(workerId);
       if (!command || this.stopping) return;
       const worker = this.store.getWorker(workerId);
-      // An external Worker's commands wait here until its interactive channel attaches.
-      if (worker && worker.mode === 'external' && !this.channels.has(workerId)) return;
+      // Commands wait until the Worker's interactive Channel attaches.
+      if (worker && !this.channels.has(workerId)) return;
       if (!worker) {
         const failed = await this.store.updateCommand(command.command_id, {
           status: 'failed',
@@ -539,15 +529,9 @@ export class Connector {
       await this.store.updateCommand(command.command_id, { status: 'running' });
       this.send('command.started', { command_id: command.command_id });
       try {
-        const driver = this.drivers[worker.runtime];
         const channel = this.channels.get(workerId);
-        if (!channel && (worker.mode !== 'managed' || !driver)) throw new Error(`No managed driver for ${worker.runtime}`);
-        const result = channel ? await this.deliverToChannel(channel, command) : await driver.execute({
-          worker,
-          command,
-          onOutput: (chunk) => this.emitOutput(command.command_id, chunk),
-          onState: (state) => this.store.updateDriverState(workerId, state),
-        });
+        if (!channel) throw new Error('Interactive Channel is not attached');
+        const result = await this.deliverToChannel(channel, command);
         const current = this.store.getCommand(command.command_id);
         if (current.status === 'failed' && current.outcome_unknown) {
           this.send('command.finished', current);
@@ -632,31 +616,18 @@ export class Connector {
   async registerWorker(input) {
     await this.whenReady();
     const runtime = typeof input.runtime === 'string' ? input.runtime.trim() : '';
-    const mode = input.mode ?? 'managed';
     if (!runtime) throw localError('runtime is required');
-    if (!['managed', 'external'].includes(mode)) throw localError('mode must be managed or external');
-    if (runtime === 'test' && !this.allowTestDriver) throw localError('Test driver is disabled', 403);
-    if (mode === 'managed' && !this.drivers[runtime]) throw localError(`Unsupported managed runtime: ${runtime}`);
+    if (input.mode !== undefined && input.mode !== 'external') throw localError('Only interactive external Workers are supported');
 
     let sessionId = input.runtime_session_id ?? input.session_id ?? null;
-    if (sessionId !== null && (typeof sessionId !== 'string' || !sessionId.trim())) {
-      throw localError('runtime_session_id must be a non-empty string');
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw localError('runtime_session_id is required for an interactive Worker');
     }
-    if (sessionId) sessionId = sessionId.trim();
-    const existing = sessionId ? this.store.getWorkerBySession(runtime, sessionId) : null;
-    let driverState = existing?.driver_state ?? {};
-    if (!existing) {
-      if (mode === 'external' && !sessionId) throw localError('runtime_session_id is required for an external Worker');
-      if (mode === 'managed') {
-        const prepared = await this.drivers[runtime].prepareWorker(input);
-        sessionId = prepared.runtime_session_id;
-        driverState = prepared.driver_state ?? {};
-      }
-    }
+    sessionId = sessionId.trim();
     const response = await this.request('worker.register', {
       name: input.name ?? `${runtime}-${sessionId.slice(0, 8)}`,
       runtime,
-      mode,
+      mode: 'external',
       runtime_session_id: sessionId,
       capabilities: input.capabilities ?? [],
       cwd: path.resolve(input.cwd ?? process.cwd()),
@@ -664,7 +635,7 @@ export class Connector {
     });
     const worker = await this.store.upsertWorker({
       ...response.worker,
-      driver_state: driverState,
+      driver_state: {},
     });
     this.adoptPendingChannels();
     if (this.channels.has(worker.worker_id)) await this.announceChannel(worker.worker_id, true);
@@ -846,9 +817,10 @@ export class Connector {
       }
     }
     this.commandWaiters.clear();
-    for (const driver of Object.values(this.drivers)) await driver.close?.();
     if (this.localServer.listening) {
-      await new Promise((resolve) => this.localServer.close(resolve));
+      const closed = new Promise((resolve) => this.localServer.close(resolve));
+      this.localServer.closeAllConnections();
+      await closed;
     }
     await this.store.save();
   }

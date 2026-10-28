@@ -36,8 +36,8 @@ test('Connector launchd spec keeps Runtime settings and carries no tokens', () =
     '--local-port', '8790',
   ]);
   assert.equal(spec.EnvironmentVariables.PATH, '/Users/me/.local/bin:/usr/bin');
-  assert.equal(spec.EnvironmentVariables.AGENT_HUB_KIMI_MODEL, 'kimi-code/kimi-for-coding');
-  assert.equal(spec.EnvironmentVariables.AGENT_HUB_CODEX_MODEL, 'gpt-5.5');
+  assert.equal(spec.EnvironmentVariables.AGENT_HUB_KIMI_MODEL, undefined);
+  assert.equal(spec.EnvironmentVariables.AGENT_HUB_CODEX_MODEL, undefined);
   assert.equal(spec.EnvironmentVariables.AGENT_HUB_AUTO_UPDATE, '0');
   assert.equal(spec.EnvironmentVariables.AGENT_HUB_SUPERVISED, '1');
   assert.equal(spec.KeepAlive, true);

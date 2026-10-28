@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Hub } from '../src/hub.js';
 import { Connector } from '../src/connector.js';
-import { TestDriver } from '../src/drivers/test.js';
 import { waitFor } from './helpers.js';
 
 const silentLogger = { error() {} };
@@ -75,8 +74,6 @@ async function createResilienceContext(t, { hubBuild, connectorBuild, onVersionM
     dataDir: path.join(root, 'connector'),
     localPort: 0,
     enrollToken: 'test-enroll',
-    allowTestDriver: true,
-    drivers: { test: new TestDriver() },
     logger: silentLogger,
     build: connectorBuild ?? { version: '0.1.0', commit: 'same', dirty: false },
     connectTimeoutMs: 300,
@@ -157,7 +154,7 @@ test('Hub and Connector exchange builds and a mismatch is reported once per Hub 
   assert.equal(mismatches.length, 1);
 });
 
-test('A requested restart waits for running managed work to finish', async (t) => {
+test('A requested restart waits for running interactive work to finish', async (t) => {
   const { connector } = await createResilienceContext(t);
   let restarts = 0;
   connector.onRestartRequested = () => {

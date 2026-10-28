@@ -34,7 +34,7 @@ function scriptedDriver() {
       const text = command.kind === 'coordinator_plan'
         ? driver.plan
         : command.kind === 'coordinator_review'
-          ? driver.review
+          ? typeof driver.review === 'function' ? await driver.review(command) : driver.review
           : command.kind === 'coordinator_chat'
             ? typeof driver.chat === 'function' ? await driver.chat(command) : driver.chat
             : typeof driver.work === 'function' ? await driver.work({ worker, command }) : `completed:${worker.name}`;
@@ -227,8 +227,8 @@ test('A failed step blocks the parent and does not run its dependents', async (t
   assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_review').length, 0);
 });
 
-test('A rejected final review leaves the parent in review, not done', async (t) => {
-  const { context } = await setup(t, { reviewPass: false });
+test('A rejected final review stops after the bounded recovery attempts', async (t) => {
+  const { context, driver } = await setup(t, { reviewPass: false });
   const created = await context.local('/local/v1/tasks', {
     method: 'POST',
     body: { title: 'Rejected review', orchestrate: true },
@@ -236,9 +236,95 @@ test('A rejected final review leaves the parent in review, not done', async (t) 
   const reviewing = await waitForOrchestration(context, created.payload.orchestration.orchestration_id, 'review');
   assert.equal(reviewing.parent_task.status, 'review');
   assert.equal(reviewing.error.code, 'coordinator_review_rejected');
+  assert.equal(reviewing.recovery_count, 2);
   assert.equal(reviewing.steps[0].status, 'review');
   assert.equal(reviewing.steps[1].status, 'done');
-  assert.ok(reviewing.steps.some((step) => step.status !== 'done'));
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_review').length, 3);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 6);
+  assert.ok(reviewing.steps.every((step) => step.previous_attempts.length === 2));
+});
+
+test('Central recovery uses review evidence and reruns failed steps and their dependents', async (t) => {
+  const { context, driver } = await setup(t);
+  let reviewRound = 0;
+  driver.review = () => {
+    reviewRound += 1;
+    const pass = reviewRound > 1;
+    return JSON.stringify({
+      parent_pass: pass,
+      reason: pass ? 'Corrected evidence passes' : 'Evidence is insufficient; use the correction from step two',
+      steps: [
+        { key: 'first', pass, reason: pass ? 'First corrected' : 'Missing first evidence' },
+        { key: 'second', pass: true, reason: 'Second passes' },
+      ],
+    });
+  };
+  driver.work = ({ command }) => command.input.includes('上次终审与本次修正上下文') ? 'corrected evidence' : 'initial evidence';
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST',
+    body: { title: 'Recovered review', orchestrate: true },
+  });
+  const completed = await waitForOrchestration(context, created.payload.orchestration.orchestration_id, 'done');
+  assert.deepEqual(driver.executions.map((execution) => execution.kind), [
+    'coordinator_plan', 'prompt', 'prompt', 'coordinator_review', 'prompt', 'prompt', 'coordinator_review',
+  ]);
+  assert.equal(completed.recovery_count, 1);
+  assert.equal(completed.parent_task.task_number, 1);
+  assert.equal(completed.review_command_id, driver.executions.at(-1).command_id);
+  assert.match(driver.executions[4].input, /Evidence is insufficient; use the correction from step two/);
+  assert.match(driver.executions[4].input, /initial evidence/);
+  assert.ok(completed.steps.every((step) => step.attempt === 2 && step.previous_attempts.length === 1));
+  assert.ok(completed.steps.every((step) => step.result.text === 'corrected evidence'));
+});
+
+test('A parent-only rejection does not rerun steps or loop reviews', async (t) => {
+  const { context, driver } = await setup(t);
+  driver.review = JSON.stringify({
+    parent_pass: false,
+    reason: 'Overall acceptance is not covered',
+    steps: [
+      { key: 'first', pass: true, reason: 'First passes' },
+      { key: 'second', pass: true, reason: 'Second passes' },
+    ],
+  });
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST',
+    body: { title: 'Parent only rejection', orchestrate: true },
+  });
+  const reviewing = await waitForOrchestration(context, created.payload.orchestration.orchestration_id, 'review');
+  assert.equal(reviewing.recovery_count, 0);
+  assert.match(reviewing.error.message, /无法自动推进/);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'coordinator_review').length, 1);
+  assert.equal(driver.executions.filter((execution) => execution.kind === 'prompt').length, 2);
+});
+
+test('Hub resume adopts a legacy rejected review and ignores its late review after recovery', async (t) => {
+  const { context, driver } = await setup(t);
+  const created = await context.local('/local/v1/tasks', {
+    method: 'POST',
+    body: { title: 'Legacy rejected review', orchestrate: true },
+  });
+  const orchestrationId = created.payload.orchestration.orchestration_id;
+  const done = await waitForOrchestration(context, orchestrationId, 'done');
+  const steps = done.steps.map((step, index) => index === 0
+    ? { ...step, status: 'review', review: { pass: false, reason: 'Legacy missing evidence' } }
+    : step);
+  context.hub.store.updateTask(steps[0].task_id, { status: 'review' });
+  context.hub.store.updateTask(done.parent_task_id, { status: 'review' });
+  context.hub.store.updateOrchestration(orchestrationId, {
+    status: 'review',
+    steps,
+    error: { code: 'coordinator_review_rejected', message: 'Legacy missing evidence' },
+    reviewReason: 'Legacy missing evidence',
+    recoveryCount: 0,
+  });
+  await context.hub.coordinator.resume();
+  const recovered = await waitForOrchestration(context, orchestrationId, 'done');
+  assert.equal(recovered.recovery_count, 1);
+  assert.ok(recovered.steps.every((step) => step.previous_attempts.length === 1));
+  const executionCount = driver.executions.length;
+  context.hub.coordinator.onCommandFinished(context.hub.store.getCommand(done.review_command_id));
+  assert.equal(driver.executions.length, executionCount);
 });
 
 test('Coordinator configuration requires Admin and a managed Worker', async (t) => {

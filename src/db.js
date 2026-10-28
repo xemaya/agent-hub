@@ -47,6 +47,7 @@ function taskView(row) {
   if (!row) return null;
   return {
     task_id: row.task_id,
+    task_number: row.task_number == null ? null : Number(row.task_number),
     title: row.title,
     goal: row.goal,
     context: row.context,
@@ -54,6 +55,7 @@ function taskView(row) {
     assignee_worker_id: row.assignee_worker_id,
     assignee_name: row.assignee_name ?? null,
     status: row.status,
+    deleted_at: row.deleted_at ?? null,
     created_by: row.created_by,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -121,6 +123,8 @@ function orchestrationView(row) {
     auto_start: row.auto_start === undefined ? true : Boolean(row.auto_start),
     source_message_id: row.source_message_id ?? null,
     review_reason: row.review_reason ?? '',
+    recovery_count: Number(row.recovery_count ?? 0),
+    review_command_id: row.review_command_id ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -287,6 +291,8 @@ export class HubStore {
       auto_start: 'INTEGER NOT NULL DEFAULT 1',
       source_message_id: 'TEXT',
       review_reason: "TEXT NOT NULL DEFAULT ''",
+      recovery_count: 'INTEGER NOT NULL DEFAULT 0',
+      review_command_id: 'TEXT',
     };
     for (const [name, definition] of Object.entries(additions)) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE coordinator_orchestrations ADD COLUMN ${name} ${definition}`);
@@ -302,10 +308,29 @@ export class HubStore {
     if (!workerColumns.has('retired_at')) {
       this.db.exec('ALTER TABLE workers ADD COLUMN retired_at TEXT');
     }
+    const taskColumns = new Set(this.db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name));
+    if (!taskColumns.has('task_number')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN task_number INTEGER');
+    }
+    if (!taskColumns.has('deleted_at')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN deleted_at TEXT');
+    }
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS task_number_sequence (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        next_number INTEGER NOT NULL
+      );
+      UPDATE tasks SET task_number = (
+        SELECT COUNT(*) FROM tasks AS previous WHERE previous.rowid <= tasks.rowid
+      ) WHERE task_number IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_task_number ON tasks(task_number);
+      INSERT INTO task_number_sequence (singleton, next_number)
+        SELECT 1, COALESCE(MAX(task_number), 0) + 1 FROM tasks WHERE true
+      ON CONFLICT(singleton) DO UPDATE SET
+        next_number = MAX(task_number_sequence.next_number, excluded.next_number);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
-      PRAGMA user_version = 6;
+      PRAGMA user_version = 8;
     `);
   }
 
@@ -483,13 +508,19 @@ export class HubStore {
   }
 
   insertTask(data, taskId, timestamp) {
+    const taskNumber = this.db.prepare(`
+      INSERT INTO task_number_sequence (singleton, next_number) VALUES (1, 2)
+      ON CONFLICT(singleton) DO UPDATE SET next_number = task_number_sequence.next_number + 1
+      RETURNING next_number - 1 AS task_number
+    `).get().task_number;
     this.db.prepare(`
       INSERT INTO tasks (
-        task_id, title, goal, context, acceptance_json, assignee_worker_id,
+        task_id, task_number, title, goal, context, acceptance_json, assignee_worker_id,
         status, created_by, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
     `).run(
       taskId,
+      taskNumber,
       data.title,
       data.goal ?? '',
       data.context ?? '',
@@ -515,13 +546,20 @@ export class HubStore {
     return taskView(this.db.prepare(`${TASK_SELECT} WHERE t.task_id = ?`).get(taskId));
   }
 
-  listTasks() {
-    return this.db.prepare(`${TASK_SELECT} ORDER BY t.created_at DESC, t.rowid DESC`).all().map(taskView);
+  listTasks({ includeDeleted = false } = {}) {
+    const where = includeDeleted ? '' : 'WHERE t.deleted_at IS NULL';
+    return this.db.prepare(`${TASK_SELECT} ${where} ORDER BY t.created_at DESC, t.rowid DESC`).all().map(taskView);
   }
 
   updateTask(taskId, data) {
     const current = this.getTask(taskId);
     if (!current) return null;
+    if (current.deleted_at) {
+      const error = new Error('Deleted tasks cannot be updated');
+      error.code = 'task_deleted';
+      error.statusCode = 409;
+      throw error;
+    }
     const timestamp = now();
     const next = {
       title: data.title ?? current.title,
@@ -563,7 +601,54 @@ export class HubStore {
     return this.getTask(taskId);
   }
 
+  deleteTask(taskId) {
+    const current = this.getTask(taskId);
+    if (!current) {
+      const error = new Error('Task not found');
+      error.code = 'task_not_found';
+      error.statusCode = 404;
+      throw error;
+    }
+    const orchestration = this.getOrchestrationByTask(taskId);
+    const childPlan = this.listOrchestrations().find((item) => item.steps.some((step) => step.task_id === taskId));
+    if (childPlan) {
+      const error = new Error('Delete the parent task of an orchestration');
+      error.code = 'task_orchestration_child';
+      error.statusCode = 409;
+      throw error;
+    }
+    const taskIds = [...new Set([taskId, ...(orchestration?.steps ?? []).map((step) => step.task_id).filter(Boolean)])];
+    if (current.deleted_at) return { task: current, deleted_task_ids: taskIds };
+    if (orchestration && (['planning', 'in_progress'].includes(orchestration.status) || (orchestration.status === 'review' && !orchestration.error))) {
+      const error = new Error('Cannot delete a task while its orchestration is active');
+      error.code = 'task_active';
+      error.statusCode = 409;
+      throw error;
+    }
+    const placeholders = taskIds.map(() => '?').join(',');
+    const activeCommand = this.db.prepare(`SELECT command_id FROM commands WHERE task_id IN (${placeholders}) AND status IN ('queued', 'accepted', 'running', 'waiting_manual') LIMIT 1`).get(...taskIds);
+    const activeTask = this.db.prepare(`SELECT task_id FROM tasks WHERE task_id IN (${placeholders}) AND status = 'in_progress' LIMIT 1`).get(...taskIds);
+    if (activeCommand || activeTask) {
+      const error = new Error('Cannot delete a task while work is active');
+      error.code = 'task_active';
+      error.statusCode = 409;
+      throw error;
+    }
+    const timestamp = now();
+    this.transaction(() => {
+      this.db.prepare(`UPDATE tasks SET deleted_at = ? WHERE task_id IN (${placeholders})`).run(timestamp, ...taskIds);
+      this.db.prepare(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE current_task_id IN (${placeholders})`).run(timestamp, ...taskIds);
+    });
+    return { task: this.getTask(taskId), deleted_task_ids: taskIds };
+  }
+
   createCommand(data) {
+    if (data.task_id && this.getTask(data.task_id)?.deleted_at) {
+      const error = new Error('Deleted tasks cannot receive new commands');
+      error.code = 'task_deleted';
+      error.statusCode = 409;
+      throw error;
+    }
     const worker = this.getWorker(data.worker_id);
     if (worker?.retired_at) {
       const error = new Error('Retired Workers cannot receive new commands');
@@ -722,10 +807,12 @@ export class HubStore {
   }
 
   listOrchestrations({ active = false } = {}) {
-    const where = active ? "WHERE status IN ('planning', 'in_progress', 'review')" : '';
+    const where = active ? "AND o.status IN ('planning', 'in_progress', 'review')" : '';
     return this.db.prepare(`
-      SELECT * FROM coordinator_orchestrations ${where}
-      ORDER BY created_at DESC, rowid DESC
+      SELECT o.* FROM coordinator_orchestrations o
+      JOIN tasks t ON t.task_id = o.parent_task_id
+      WHERE t.deleted_at IS NULL ${where}
+      ORDER BY o.created_at DESC, o.rowid DESC
     `).all().map(orchestrationView);
   }
 
@@ -737,11 +824,14 @@ export class HubStore {
     const steps = data.steps === undefined ? current.steps : data.steps;
     const error = data.error === undefined ? current.error : data.error;
     const reviewReason = data.reviewReason ?? current.review_reason;
+    const recoveryCount = data.recoveryCount ?? current.recovery_count;
+    const reviewCommandId = data.reviewCommandId === undefined ? current.review_command_id : data.reviewCommandId;
     this.db.prepare(`
       UPDATE coordinator_orchestrations
-      SET status = ?, summary = ?, steps_json = ?, error_json = ?, review_reason = ?, updated_at = ?
+      SET status = ?, summary = ?, steps_json = ?, error_json = ?, review_reason = ?,
+        recovery_count = ?, review_command_id = ?, updated_at = ?
       WHERE orchestration_id = ?
-    `).run(status, summary, stringifyJson(steps), stringifyJson(error), reviewReason, now(), orchestrationId);
+    `).run(status, summary, stringifyJson(steps), stringifyJson(error), reviewReason, recoveryCount, reviewCommandId, now(), orchestrationId);
     return this.getOrchestration(orchestrationId);
   }
 

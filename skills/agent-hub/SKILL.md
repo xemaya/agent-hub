@@ -17,10 +17,10 @@ curl --fail --silent http://127.0.0.1:8788/local/v1/health
 
 只有用户明确要求**从零安装并接入一台新 Mac** 时，才按仓库 README 的“其他 Mac：接入已有中控”执行首次接入：
 
-- `tailscale` 命令不存在时，先安装官方 Standalone App，或使用 `brew install --cask tailscale-app`；系统扩展和 VPN 授权由用户在 macOS 图形界面完成。
-- 新机器使用管理员提供的地址执行 `tailscale up --login-server="https://<Headscale地址>"`，按浏览器流程登录。需要节点批准时，把注册信息交给管理员在 Headscale 服务端处理，不能假装已加入。
-- 已有其他账号或控制服务器时，先报告 `ControlURL` 和账号列表，不要擅自切换、退出、重置或覆盖原网络。
-- 必须通过 `tailscale status` 和 Hub 的 `/healthz` 验证，再安装 Connector、CLI 和 Skill。只克隆仓库或安装依赖不等于接入完成。
+- 当前 Hub 地址是 `https://hub.findu.work`；管理员另给地址时以管理员为准。先验证 `/healthz`，再安装 Connector、CLI 和 Skill。
+- 公网 HTTPS 接入不要求 Tailscale/Headscale，不要为了 Agent Hub 修改机器已有的网络配置。
+- Enrollment Token 由管理员通过安全方式提供。不要在聊天、命令历史、公开文档或 Git 中暴露它。
+- 只克隆仓库或安装依赖不等于接入完成；必须确认 Connector 已连接，并核对本机 Worker 列表。
 
 后续命令统一使用以下数据目录；CLI 会自行读取 Local Token：
 
@@ -59,7 +59,9 @@ Claude/Kimi 的 `register-current` 从 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSIO
 
 Claude 窗口若用 `agent-hub session start --runtime claude --push` 打开，注册为 external 后会自动接通中控：窗口开着时 `push_capable=true`，中控的任务以 `<channel source="agent-hub" command_id="...">` 送进本窗口。收到后先调用 `agent_hub_ack`，按普通请求完成工作，再用 `agent_hub_report` 交回完整结果，每个 command_id 只报一次；只写在终端里的内容中控看不到。窗口关闭后自动退回 `waiting_manual`。没有用 `--push` 打开的窗口不会收到推送，不要声称能收到。
 
-只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。Kimi CLI 与 Kimi Web Server 对同一 Session 有排他占用：当前 CLI 窗口打开时不要注册为 managed，也不要启动第二个 Web Server 接管它。Kimi 当前交互 Session 的主动推送需要共享 Web/ACP 桥接，不能用简单的 `--session` 代替。Claude/Codex 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
+Kimi 窗口若用 `agent-hub session start --runtime kimi --push` 打开，启动器提供的是 ACP 交互界面，不是原生全屏 TUI。用户输入和 Hub 命令共用同一条 ACP Session；正常回答即可，桥接会自动发送 ack 和最终 report，不要调用 Claude 专用回执工具。`--resume <session-id>` 可恢复同一窗口身份，`/exit` 退出后退回 `waiting_manual`。
+
+只有用户明确要求主动执行，并确认当前交互实例已退出或 Runtime 明确支持共享时，才使用 `--mode managed`。普通 Kimi TUI 与 Web Server 不能实时共享输入：当前 TUI 窗口不要注册为 managed，也不要启动第二个 Web Server 接管它；需要交互推送时通过 `--push` 改用 ACP 窗口。Claude/Codex 使用同一 ID 恢复时，也不要同时手动向该 Session 发另一条 Prompt。
 
 如果 Claude/Kimi 当前窗口不是通过启动器打开的，或者缺少上述可信环境变量，不要假装它是启动器 Session；按下面的 external 边界处理，或建议用户下次通过启动器打开。Codex 缺少原生 `CODEX_SESSION_ID` 时同样不能注册，不要退回随机 ID 或最近会话。
 
@@ -223,7 +225,7 @@ agent-hub task update --local TASK_ID --status done \
 
 未满足时保持真实状态并说明缺口；只有确实存在阻塞时才使用 `blocked`。本机任务更新只允许修改分配给当前 Connector 的任务状态，不能操作其他机器的任务。
 
-最终向用户简要返回：`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。同页任务区与数字员工状态会自动更新，不要求用户在网页上补录。
+最终向用户简要返回：`task_number`（页面 `#0001` 编号）、`task_id`、`command_id`、负责人、命令状态、实际结果和验收结论。同页任务区与数字员工状态会自动更新，不要求用户在网页上补录。
 
 ## 交给中央大脑：全局规划与编排
 
@@ -238,7 +240,7 @@ agent-hub task create --local --orchestrate \
   --acceptance "<整体第一条验收>\n<整体第二条验收>"
 ```
 
-`--orchestrate` 会立即规划并执行，因此只在用户明确要求中央协调执行时使用；仅记录任务仍用普通创建。中央协调者负责选择 Worker、拆步骤和最终评审，不要再用 `send` 给父任务派发普通命令，不要手工关闭父任务。
+`--orchestrate` 会立即规划并执行，因此只在用户明确要求中央协调执行时使用；仅记录任务仍用普通创建。中央协调者负责选择 Worker、拆步骤和最终评审，不要再用 `send` 给父任务派发普通命令，不要手工关闭父任务。终审明确不通过且能定位失败步骤时，Hub 最多自动修正两轮，并连同依赖旧结果的后续步骤一起重做；不要重复派发或另行创建相同任务冒充恢复。
 
 管理员也可以在操作台与中央大脑对话：“先只规划，不要执行”会保存 `ready` 计划而不派发步骤，“开始执行”按钮或对话只启动已有的 `ready` 计划。输入 `@` 可点名 managed 员工或引用任务；单独 `@员工` 提问会转给该员工本人回答，不创建任务，回复显示员工名字；明确要求做事时才安排执行并继续终审。点击员工旁的 `@` 只带入输入框，不会立即发送。任务看板默认显示全部任务，完成详情优先展示完整交付和验收结论。网页对话需要 Admin Token；你持有的 Local Token 不能读取、发送或清空管理员对话，不要尝试绕过。Agent 的 Skill、CLI 和 Local Token 流程不变，不要代替用户在网页中输入。
 

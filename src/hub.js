@@ -363,6 +363,7 @@ export class Hub {
         enabled: body.enabled ?? true,
         maxSteps: body.max_steps,
       });
+      this.broadcast('coordinator.updated', { coordinator });
       sendJson(response, 200, { coordinator });
       return;
     }
@@ -418,7 +419,8 @@ export class Hub {
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/tasks') {
-      sendJson(response, 200, { tasks: this.store.listTasks() });
+      const includeDeleted = url.searchParams.get('include_deleted') === 'true';
+      sendJson(response, 200, { tasks: this.store.listTasks({ includeDeleted }) });
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/events') {
@@ -523,6 +525,16 @@ export class Hub {
       const task = this.store.getTask(taskMatch[1]);
       if (!task) {
         sendJson(response, 404, { error: 'Task not found' });
+        return;
+      }
+      if (request.method === 'DELETE') {
+        const deleted = this.store.deleteTask(task.task_id);
+        this.emit('task.deleted', { type: 'admin', id: 'admin' }, {
+          task_id: task.task_id,
+          payload: { deleted_task_ids: deleted.deleted_task_ids },
+        });
+        this.broadcast('task.deleted', deleted);
+        sendJson(response, 200, deleted);
         return;
       }
       if (request.method === 'GET') {

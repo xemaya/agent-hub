@@ -244,7 +244,7 @@ function renderTaskDetail(entry) {
         </li>`).join('')}</ol>
     </details>` : ''}
     ${!complete && orchestration?.review_reason ? `<div class="review-note final-review ${orchestration.error ? 'rejected' : ''}"><strong>终审结论</strong><p>${escapeHtml(orchestration.review_reason)}</p></div>` : ''}
-    <div class="dialog-reference"><button class="text-button" type="button" data-reference-task="${escapeHtml(task.task_id)}">在对话中继续这个任务 →</button></div>`;
+    <div class="dialog-reference task-detail-actions"><button class="button button-quiet task-delete" type="button" data-delete-task="${escapeHtml(task.task_id)}">删除任务</button><button class="text-button" type="button" data-reference-task="${escapeHtml(task.task_id)}">在对话中继续这个任务 →</button></div>`;
 }
 
 function renderProgress(entry) {
@@ -327,7 +327,7 @@ function renderComposerMentions() {
 }
 
 function syncComposer() {
-  const available = Boolean(state.coordinator?.enabled && state.coordinator.worker?.push_capable);
+  const available = Boolean(state.coordinator?.enabled && state.coordinator.worker?.push_capable && !state.coordinator.worker?.retired_at);
   const input = $('#chat-input');
   input.disabled = !available;
   input.readOnly = state.sending;
@@ -341,9 +341,13 @@ function syncComposer() {
   renderComposerMentions();
 }
 
+function coordinatorCandidates() {
+  return state.workers.filter((worker) => worker.mode === 'managed' && worker.push_capable && !worker.retired_at);
+}
+
 function renderCoordinator() {
   const coordinator = state.coordinator;
-  const worker = coordinator?.worker;
+  const worker = coordinator?.worker?.retired_at ? null : coordinator?.worker;
   const available = Boolean(coordinator?.enabled && worker?.push_capable);
   const online = worker?.presence === 'online';
   const live = state.workers.find((item) => item.worker_id === worker?.worker_id);
@@ -360,8 +364,70 @@ function renderCoordinator() {
       <span class="brain-symbol" aria-hidden="true"></span>
       <div><h3>${escapeHtml(worker?.name ?? '中央大脑')}</h3><p>${escapeHtml(description)}</p></div>
       ${badge(available ? online ? 'online' : 'offline' : 'blocked')}
+      <button class="button button-quiet coordinator-configure" type="button" data-configure-coordinator ${coordinatorCandidates().length ? '' : 'disabled'}>${worker ? '更换' : '指定'}</button>
+      ${worker ? `<button class="button button-quiet coordinator-retire" type="button" data-retire-coordinator="${escapeHtml(worker.worker_id)}">注销</button>` : ''}
     </div>`;
   syncComposer();
+}
+
+function openCoordinatorDialog() {
+  const candidates = coordinatorCandidates();
+  if (!candidates.length) return;
+  $('#coordinator-worker').innerHTML = candidates.map((worker) => `
+    <option value="${escapeHtml(worker.worker_id)}">${escapeHtml(worker.name)} · ${escapeHtml(worker.connector_name)} · ${escapeHtml(worker.runtime)}${worker.presence === 'offline' ? '（离线）' : ''}</option>
+  `).join('');
+  if (candidates.some((worker) => worker.worker_id === state.coordinator?.worker_id)) {
+    $('#coordinator-worker').value = state.coordinator.worker_id;
+  }
+  $('#coordinator-error').textContent = '';
+  $('#coordinator-dialog').showModal();
+}
+
+async function retireWorker(worker, button, coordinator = false) {
+  if (!worker || !window.confirm(`确认注销「${worker.name}」？\n\n该员工将从列表和调度中移除，任务与对话历史会保留。`)) return;
+  button.disabled = true;
+  const wasEnabled = coordinator && state.coordinator?.enabled;
+  try {
+    if (wasEnabled) await api('/api/v1/coordinator', { method: 'PUT', body: { enabled: false } });
+    await api(`/api/v1/workers/${encodeURIComponent(worker.worker_id)}`, { method: 'DELETE' });
+    toast(`已注销 ${worker.name}`);
+  } catch (error) {
+    let message = `注销失败：${error.message}`;
+    if (wasEnabled) {
+      try {
+        await api('/api/v1/coordinator', { method: 'PUT', body: { enabled: true, worker_id: worker.worker_id } });
+      } catch {
+        message += '；中央大脑仍处于停用状态';
+      }
+    }
+    toast(message, true);
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+function applyTaskDeletion(taskIds) {
+  const deleted = new Set(taskIds);
+  state.tasks = state.tasks.filter((task) => !deleted.has(task.task_id));
+  state.orchestrations = state.orchestrations.filter((orchestration) => !deleted.has(orchestration.parent_task_id));
+  for (const mention of state.mentions.filter((item) => item.type === 'task' && deleted.has(item.id))) {
+    removeMention('task', mention.id);
+  }
+  render();
+}
+
+async function deleteTask(taskId, button) {
+  const entry = taskEntry(taskId);
+  if (!entry || !window.confirm(`确认删除「${taskName(entry.task)}」？\n\n任务将从看板移除，执行与对话历史会保留。`)) return;
+  button.disabled = true;
+  try {
+    const deleted = await api(`/api/v1/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+    applyTaskDeletion(deleted.deleted_task_ids);
+    toast(`已删除 ${taskName(entry.task)}`);
+  } catch (error) {
+    toast(`删除失败：${error.message}`, true);
+    if (button.isConnected) button.disabled = false;
+  }
 }
 
 function mentionCandidates() {
@@ -592,7 +658,7 @@ function renderChat(forceScroll = false) {
   }
   const lastTaskMessage = new Map();
   state.messages.forEach((message, index) => {
-    if (message.task_id) lastTaskMessage.set(message.task_id, index);
+    if (message.task_id && taskEntry(message.task_id)) lastTaskMessage.set(message.task_id, index);
   });
   container.innerHTML = state.messages.map((message, index) => {
     let content;
@@ -606,7 +672,7 @@ function renderChat(forceScroll = false) {
       content = `
         <article class="chat-activity ${phase ? `activity-${phase}` : ''}">
           <p class="message-meta">${label} · ${escapeHtml(time(message.created_at))}</p><p class="message-content">${escapeHtml(messageContent(message))}</p>
-          ${message.task_id ? `<button class="text-button" type="button" data-task-detail="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}
+          ${message.task_id && taskEntry(message.task_id) ? `<button class="text-button" type="button" data-task-detail="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}
           ${copyButton(message)}
         </article>`;
     } else {
@@ -619,7 +685,7 @@ function renderChat(forceScroll = false) {
           ${pending
             ? `<div class="thinking"><i></i><i></i><i></i><span>${escapeHtml(pendingMessageLabel(message))}</span></div>`
             : `<p class="message-content">${escapeHtml(message.content)}</p>`}
-          ${message.task_id ? `<button class="text-button" type="button" data-task-detail="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}
+          ${message.task_id && taskEntry(message.task_id) ? `<button class="text-button" type="button" data-task-detail="${escapeHtml(message.task_id)}">查看这项任务 <span aria-hidden="true">→</span></button>` : ''}
           ${copyButton(message)}
         </article>`;
     }
@@ -656,7 +722,7 @@ function renderTasks() {
 function renderWorkers() {
   const expanded = new Map($$('#workers-list [data-worker-card]').map((element) => [element.dataset.workerCard, element.open]));
   const visibility = new Map($$('#workers-list [data-output-key]').map((element) => [element.dataset.outputKey, element.open]));
-  const workers = state.workers.filter((worker) => worker.worker_id !== state.coordinator?.worker_id);
+  const workers = state.workers;
   const online = workers.filter((worker) => worker.presence === 'online').length;
   const working = workers.filter((worker) => !['idle', 'offline'].includes(worker.activity?.phase ?? worker.work_state)).length;
   $('#workforce-summary').textContent = `${online} / ${workers.length} 在线${working ? ` · ${working} 忙碌` : ''}`;
@@ -681,7 +747,7 @@ function renderWorkers() {
           <button class="worker-mention" type="button" data-mention-worker="${escapeHtml(worker.worker_id)}" title="${escapeHtml(mentionHint)}" aria-label="${escapeHtml(mentionHint)}" ${canMention ? '' : 'disabled'}>@</button>
         </summary>
         <div class="worker-details">
-          <p class="worker-runtime">${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${worker.mode === 'external' ? (worker.push_capable ? '交互会话 · 已接通' : '人工协作') : '可主动调度'}</p>
+          <p class="worker-runtime">${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${state.coordinator?.enabled && worker.worker_id === state.coordinator.worker_id ? '中央大脑' : worker.mode === 'external' ? (worker.push_capable ? '交互会话 · 已接通' : '人工协作') : '可主动调度'}</p>
           <div class="capabilities">${worker.capabilities.map((capability) => `<span>${escapeHtml(capability)}</span>`).join('')}</div>
           ${active ? `<div class="worker-current">
             <strong>${escapeHtml(activity.task_title ?? activity.detail)}</strong>
@@ -691,6 +757,7 @@ function renderWorkers() {
           ${activity.output_text ? `<details class="worker-output" data-output-key="${liveKey}" open><summary>实时输出${activity.output_truncated ? '（最近部分）' : ''}</summary><pre>${escapeHtml(activity.output_text)}</pre></details>` : ''}
           ${!activity.output_text && activity.recent_result ? `<details class="worker-output" data-output-key="${recentKey}"><summary>最近一次返回</summary><pre>${escapeHtml(activity.recent_result)}</pre></details>` : ''}
           ${activity.updated_at ? `<time class="worker-updated" datetime="${escapeHtml(activity.updated_at)}">${escapeHtml(dateTime(activity.updated_at))}</time>` : ''}
+          <button class="button button-quiet worker-retire" type="button" data-retire-worker="${escapeHtml(worker.worker_id)}">注销员工</button>
         </div>
       </details>`;
   }).join('') : empty('暂无数字员工');
@@ -821,6 +888,10 @@ function connectSocket() {
       scheduleRefresh();
       return;
     }
+    if (message.type === 'task.deleted') {
+      applyTaskDeletion(message.payload.deleted_task_ids);
+      return;
+    }
     if (message.type === 'worker.unregistered') {
       const workerId = message.payload.worker.worker_id;
       state.workers = state.workers.filter((worker) => worker.worker_id !== workerId);
@@ -831,6 +902,7 @@ function connectSocket() {
       renderCoordinator();
       renderChat();
       renderMentionPicker();
+      scheduleRefresh();
       return;
     }
     if (message.type === 'worker.updated') {
@@ -844,6 +916,14 @@ function connectSocket() {
       }
       renderWorkers();
       renderCoordinator();
+      renderChat();
+      renderMentionPicker();
+      return;
+    }
+    if (message.type === 'coordinator.updated') {
+      state.coordinator = message.payload.coordinator;
+      renderCoordinator();
+      renderWorkers();
       renderChat();
       renderMentionPicker();
       return;
@@ -934,6 +1014,29 @@ $('#task-filters').addEventListener('click', (event) => {
   if (!button) return;
   state.taskFilter = button.dataset.taskFilter;
   renderTasks();
+});
+$('#close-coordinator-dialog').addEventListener('click', () => $('#coordinator-dialog').close());
+$('#cancel-coordinator').addEventListener('click', () => $('#coordinator-dialog').close());
+$('#coordinator-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = $('#save-coordinator');
+  if (button.disabled) return;
+  button.disabled = true;
+  $('#coordinator-error').textContent = '';
+  try {
+    const { coordinator } = await api('/api/v1/coordinator', {
+      method: 'PUT',
+      body: { enabled: true, worker_id: $('#coordinator-worker').value },
+    });
+    state.coordinator = coordinator;
+    $('#coordinator-dialog').close();
+    render();
+    toast(`已指定 ${coordinator.worker.name} 为中央大脑`);
+  } catch (error) {
+    $('#coordinator-error').textContent = `指定失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 });
 $('#close-task-dialog').addEventListener('click', () => $('#task-dialog').close());
 $('#task-dialog').addEventListener('close', () => { state.dialogTaskId = null; });
@@ -1086,6 +1189,23 @@ document.addEventListener('click', async (event) => {
     event.preventDefault();
     event.stopPropagation();
     insertMention('worker', worker.dataset.mentionWorker);
+    return;
+  }
+  if (event.target.closest('[data-configure-coordinator]')) {
+    openCoordinatorDialog();
+    return;
+  }
+  const retire = event.target.closest('[data-retire-worker], [data-retire-coordinator]');
+  if (retire) {
+    const coordinator = retire.hasAttribute('data-retire-coordinator');
+    const workerId = coordinator ? retire.dataset.retireCoordinator : retire.dataset.retireWorker;
+    const selected = state.workers.find((item) => item.worker_id === workerId) ?? state.coordinator?.worker;
+    retireWorker(selected, retire, coordinator);
+    return;
+  }
+  const deletion = event.target.closest('[data-delete-task]');
+  if (deletion) {
+    deleteTask(deletion.dataset.deleteTask, deletion);
     return;
   }
   const reference = event.target.closest('[data-reference-task]');

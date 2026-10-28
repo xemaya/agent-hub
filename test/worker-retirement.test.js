@@ -139,4 +139,11 @@ test('Retirement protects active work and the Coordinator while preserving comma
   const workerRetired = await context.admin(`/api/v1/workers/${worker.worker_id}`, { method: 'DELETE' });
   assert.equal(workerRetired.response.status, 200);
   assert.equal(context.hub.store.getOrchestration(orchestration.orchestration_id).steps[0].worker_id, worker.worker_id);
+
+  const disabled = await context.admin('/api/v1/coordinator', { method: 'PUT', body: { enabled: false } });
+  assert.equal(disabled.response.status, 200);
+  assert.equal(disabled.payload.coordinator.enabled, false);
+  const coordinatorRetired = await context.admin(`/api/v1/workers/${coordinator.worker_id}`, { method: 'DELETE' });
+  assert.equal(coordinatorRetired.response.status, 200);
+  assert.equal(context.hub.store.getWorker(coordinator.worker_id).retired_at, coordinatorRetired.payload.worker.retired_at);
 });

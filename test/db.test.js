@@ -46,7 +46,8 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 6);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 8);
+  assert.ok(store.db.prepare('PRAGMA table_info(tasks)').all().some((column) => column.name === 'deleted_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'conversation_epoch'));
@@ -127,4 +128,40 @@ test('Conversation epochs filter visible chat without deleting source messages',
   assert.equal(store.getChatMessage(first.message_id).content, 'Old epoch');
   assert.equal(store.clearConversation(), 2);
   assert.deepEqual(store.listChatMessages({ epoch: 2 }), []);
+});
+
+test('Task numbers migrate in order and are not reused after restart or history clearing', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  const legacy = new DatabaseSync(filename);
+  legacy.exec(`
+    CREATE TABLE tasks (
+      task_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      context TEXT NOT NULL,
+      acceptance_json TEXT NOT NULL,
+      assignee_worker_id TEXT,
+      status TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO tasks VALUES
+      ('task_old_1', 'Old one', '', '', '[]', NULL, 'ready', 'admin', '2026-10-26T00:00:00.000Z', '2026-10-26T00:00:00.000Z'),
+      ('task_old_2', 'Old two', '', '', '[]', NULL, 'ready', 'admin', '2026-10-26T00:00:01.000Z', '2026-10-26T00:00:01.000Z');
+    PRAGMA user_version = 6;
+  `);
+  legacy.close();
+  let store = new HubStore(filename);
+  t.after(() => {
+    if (store) store.close();
+  });
+  assert.equal(store.getTask('task_old_1').task_number, 1);
+  assert.equal(store.getTask('task_old_2').task_number, 2);
+  assert.equal(store.createTask({ title: 'New three' }).task_number, 3);
+  store.close();
+  store = new HubStore(filename);
+  store.clearHistory();
+  assert.equal(store.createTask({ title: 'After clear' }).task_number, 4);
 });

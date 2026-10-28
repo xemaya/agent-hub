@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Agent Hub · 中央工作台</title>
-  <link rel="stylesheet" href="/style.css?v=9">
+  <link rel="stylesheet" href="/style.css?v=11">
 </head>
 <body>
   <section id="auth-view" class="auth-shell">
@@ -83,6 +83,21 @@
     </div>
   </div>
 
+  <dialog id="coordinator-dialog" class="coordinator-dialog" aria-labelledby="coordinator-dialog-title">
+    <div class="dialog-heading">
+      <h2 id="coordinator-dialog-title">指定中央大脑</h2>
+      <button id="close-coordinator-dialog" class="dialog-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <form id="coordinator-form" class="dialog-content">
+      <label for="coordinator-worker">数字员工</label>
+      <select id="coordinator-worker" required></select>
+      <p id="coordinator-error" class="form-error" role="alert"></p>
+      <div class="composer-footer">
+        <button id="cancel-coordinator" class="button button-quiet" type="button">取消</button>
+        <button id="save-coordinator" class="button button-primary" type="submit">指定</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="task-dialog" class="task-dialog" aria-labelledby="task-dialog-title">
     <div class="dialog-heading">
       <h2 id="task-dialog-title"></h2>
@@ -92,6 +107,6 @@
     <div id="task-dialog-content" class="dialog-content"></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js?v=10"></script>
+  <script type="module" src="/app.js?v=12"></script>
 </body>
 </html>

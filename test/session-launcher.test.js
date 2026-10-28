@@ -82,6 +82,54 @@ test('Kimi launcher closes its server when the client cannot start', async () =>
   assert.equal(closed, 1);
 });
 
+test('Kimi push launcher shares one ACP Session until the interactive window exits', async () => {
+  const prepared = [];
+  let temporaryDriverClosed = 0;
+  let acpDriverClosed = 0;
+  let channelStarted = 0;
+  let channelStopped = 0;
+  let temporaryDriverClosedAtStart = -1;
+  const kimiDriver = {
+    async prepareWorker(input) {
+      prepared.push(input);
+      return { runtime_session_id: input.runtime_session_id, driver_state: {} };
+    },
+    async close() { temporaryDriverClosed += 1; },
+  };
+  const kimiAcpDriver = {
+    async close() { acpDriverClosed += 1; },
+  };
+  const kimiChannel = {
+    async start() {
+      temporaryDriverClosedAtStart = temporaryDriverClosed;
+      channelStarted += 1;
+    },
+    async run() { return 0; },
+    async stop() { channelStopped += 1; },
+  };
+  const result = await startSession({
+    runtime: 'kimi',
+    cwd: process.cwd(),
+    push: true,
+    resumeSessionId: 'session-resume-kimi',
+    kimiDriver,
+    kimiAcpDriver,
+    kimiChannel,
+    spawn() { throw new Error('Kimi push must not spawn a second TUI client'); },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.sessionId, 'session-resume-kimi');
+  assert.equal(prepared[0].runtime_session_id, 'session-resume-kimi');
+  assert.deepEqual(result.args, ['acp']);
+  assert.equal(result.env.AGENT_HUB_SESSION_ID, 'session-resume-kimi');
+  assert.equal(Object.hasOwn(result.env, 'KIMI_CODE_SESSION_LOCK'), false);
+  assert.equal(temporaryDriverClosedAtStart, 1);
+  assert.equal(channelStarted, 1);
+  assert.equal(channelStopped, 1);
+  assert.equal(temporaryDriverClosed, 1);
+  assert.equal(acpDriverClosed, 1);
+});
+
 test('Codex launcher opens a fresh client and leaves native identity to Codex', async () => {
   const calls = [];
   const result = await startSession({

@@ -97,6 +97,13 @@ export class ConnectorStore {
     return worker ? structuredClone(worker) : null;
   }
 
+  setWorkerPushCapability(workerId, pushCapable) {
+    const worker = this.state.workers.find((item) => item.worker_id === workerId);
+    if (!worker) return null;
+    worker.push_capable = Boolean(pushCapable);
+    return this.getWorker(workerId);
+  }
+
   async upsertWorker(worker) {
     const index = this.state.workers.findIndex((item) => item.worker_id === worker.worker_id);
     if (index === -1) this.state.workers.push(structuredClone(worker));

@@ -19,7 +19,7 @@ Usage:
   agent-hub service uninstall|status
   agent-hub update
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
-  agent-hub session start --runtime claude --push [--resume SESSION_ID] [--data-dir DIR]
+  agent-hub session start --runtime claude|kimi --push [--resume SESSION_ID] [--data-dir DIR]
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
@@ -254,9 +254,10 @@ async function serviceCommand(positionals, flags) {
     return;
   }
   if (action !== 'install') throw new Error('Usage: agent-hub service install|uninstall|status');
+  const localPort = flags['local-port'] === undefined ? undefined : port(flags['local-port'], 8788);
   const status = await connectorServiceStatus();
   if (!status.loaded) {
-    const running = await fetch(`http://127.0.0.1:${port(flags['local-port'], 8788)}/local/v1/health`)
+    const running = await fetch(`http://127.0.0.1:${localPort ?? 8788}/local/v1/health`)
       .then((response) => response.ok)
       .catch(() => false);
     if (running) throw new Error('A Connector is already running outside the service; stop it first, then rerun');
@@ -265,6 +266,7 @@ async function serviceCommand(positionals, flags) {
     hubUrl: flags['hub-url'] ?? process.env.AGENT_HUB_URL,
     name: flags.name,
     dataDir: path.resolve(flags['data-dir'] ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector')),
+    localPort,
   }));
 }
 
@@ -359,14 +361,20 @@ async function workerCommand(positionals, flags) {
 
 async function sessionCommand(positionals, flags, runtimeArgs) {
   if (positionals[0] !== 'start') throw new Error('Usage: agent-hub session start --runtime claude|kimi|codex');
+  const dataDir = flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector');
+  const connectorUrl = flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL;
+  const channel = flags.push === true && flags.runtime === 'kimi'
+    ? await localOptions({ 'data-dir': dataDir, 'connector-url': connectorUrl })
+    : null;
   const result = await startSession({
     runtime: flags.runtime,
     cwd: flags.cwd ?? process.cwd(),
     runtimeArgs,
     push: flags.push === true,
     resumeSessionId: typeof flags.resume === 'string' ? flags.resume : undefined,
-    dataDir: flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'),
-    connectorUrl: flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL,
+    dataDir,
+    connectorUrl,
+    ...(channel ? { channel: { connectorUrl: channel.baseUrl, token: channel.token } } : {}),
     onReady({ runtime, sessionId }) {
       console.error(`Agent Hub session ready: ${runtime}${sessionId ? ` ${sessionId}` : ''}`);
     },

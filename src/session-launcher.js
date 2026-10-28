@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { KimiDriver } from './drivers/kimi.js';
+import { KimiAcpDriver } from './drivers/kimi-acp.js';
+import { KimiChannel } from './kimi-channel.js';
 import { PROJECT_ROOT } from './build-info.js';
 import { CHANNEL_SERVER_NAME, CHANNEL_TOOLS } from './channel.js';
 
@@ -42,8 +44,9 @@ export async function prepareSessionLaunch(options = {}) {
   let executable;
   let args;
   let driver = null;
-  if ((options.push || options.resumeSessionId) && runtime !== 'claude') {
-    const error = new Error('--push and --resume are only supported for claude');
+  let channel = null;
+  if ((options.push || options.resumeSessionId) && !['claude', 'kimi'].includes(runtime)) {
+    const error = new Error('--push and --resume are only supported for claude or kimi');
     error.code = 'unsupported_session_option';
     throw error;
   }
@@ -67,12 +70,33 @@ export async function prepareSessionLaunch(options = {}) {
     }
     args.push(options.resumeSessionId ? '--resume' : '--session-id', sessionId, ...runtimeArgs);
   } else if (runtime === 'kimi') {
+    if (options.push && !options.kimiChannel && (!options.channel?.connectorUrl || !options.channel?.token)) {
+      throw new Error('Kimi push requires Connector connection details');
+    }
+    if (options.push && runtimeArgs.length) throw new Error('Kimi --push does not accept runtime arguments');
     driver = options.kimiDriver ?? new KimiDriver({ env });
-    const prepared = await driver.prepareWorker({ cwd });
+    const prepared = await driver.prepareWorker({
+      cwd,
+      ...(options.resumeSessionId ? { runtime_session_id: options.resumeSessionId } : {}),
+    });
     sessionId = prepared.runtime_session_id;
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('Kimi did not return a valid session id');
     executable = 'kimi';
-    args = ['--session', sessionId, ...runtimeArgs];
+    args = options.push ? ['acp'] : ['--session', sessionId, ...runtimeArgs];
+    if (options.push) {
+      await driver.close();
+      driver = options.kimiAcpDriver ?? new KimiAcpDriver({
+        sessionId,
+        cwd,
+        env: { ...env, AGENT_HUB_RUNTIME: 'kimi', AGENT_HUB_SESSION_ID: sessionId },
+      });
+      channel = options.kimiChannel ?? new KimiChannel({
+        ...options.channel,
+        sessionId,
+        driver,
+        cwd,
+      });
+    }
   } else {
     executable = 'codex';
     args = [...runtimeArgs];
@@ -81,9 +105,13 @@ export async function prepareSessionLaunch(options = {}) {
   const close = async () => {
     if (closed) return;
     closed = true;
-    await driver?.close();
+    try {
+      await channel?.stop?.();
+    } finally {
+      await driver?.close();
+    }
   };
-  if (runtime === 'kimi') await close();
+  if (runtime === 'kimi' && !options.push) await close();
   const launchEnv = { ...env, AGENT_HUB_RUNTIME: runtime };
   // Launched from inside another Claude Code session, the marker would turn off transcripts and break --resume.
   if (runtime === 'claude' && launchEnv.CLAUDE_CODE_CHILD_SESSION) launchEnv.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1';
@@ -97,6 +125,7 @@ export async function prepareSessionLaunch(options = {}) {
     cwd,
     env: launchEnv,
     close,
+    ...(channel ? { kimiChannel: channel } : {}),
   };
 }
 
@@ -104,6 +133,12 @@ export async function startSession(options = {}) {
   const launch = await prepareSessionLaunch(options);
   const spawnProcess = options.spawn ?? spawn;
   try {
+    if (launch.kimiChannel) {
+      await launch.kimiChannel.start();
+      await options.onReady?.(launch);
+      const exitCode = await launch.kimiChannel.run();
+      return { ...launch, exitCode, signal: null };
+    }
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: launch.cwd,
       env: launch.env,

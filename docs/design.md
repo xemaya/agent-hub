@@ -178,10 +178,16 @@ Local CLI/Session
 ### 5.3 Worker 撤下与恢复
 
 - `workers.retired_at` 记录可恢复的软注销，数据库迁移到 `user_version=6`。默认 `listWorkers`、Connector 本地列表、Dashboard、@选择器和调度 Registry 都排除已撤下员工；`getWorker`、历史 Task/Command/Event 与 `GET /api/v1/workers?include_retired=true` 仍可读取。
-- 当前 Agent 通过 `POST /local/v1/workers/unregister-current` 提交 runtime 和原生 Session ID，Connector 以 `worker.unregister` 请求 Hub 校验归属并撤下；管理员通过 `DELETE /api/v1/workers/:id` 撤下指定员工。`worker unregister-current` 复用注册时的可信身份，不需要 Admin Token；管理员命令为 `worker unregister WORKER_ID`。
+- 当前 Agent 通过 `POST /local/v1/workers/unregister-current` 提交 runtime 和原生 Session ID，Connector 以 `worker.unregister` 请求 Hub 校验归属并撤下；管理员通过 `DELETE /api/v1/workers/:id` 撤下指定员工。`worker unregister-current` 复用注册时的可信身份，不需要 Admin Token；管理员命令为 `worker unregister WORKER_ID`。Dashboard 的员工详情提供同样的管理员注销操作，须确认后执行并显示失败原因；注销中央大脑时先通过 `PUT /api/v1/coordinator {enabled:false}` 停用，再调用删除接口。
 - 撤下在事务中检查 queued/accepted/running/waiting_manual 命令、进行中任务、ready/planning/in_progress/待终审编排分配及当前协调者身份，存在活动工作时返回 409，不自动取消。已结束或失败的历史计划不阻止撤下。
 - `createCommand`、@解析、直接问答、协调者配置和已有计划启动都拒绝已撤下员工。重复撤下幂等；显式重新注册同一 `runtime + runtime_session_id` 恢复原 Worker ID 并清除 `retired_at`，心跳和 Connector 重连不会自动恢复。
 - Hub 发出 `worker.unregistered` 事件并同步新版 Connector 的 `retired_at`，Dashboard 立即移除员工及未发送的 @引用；旧版 Connector 忽略未知消息，需更新后才支持自注销和本地状态同步。历史消息中的 speaker 姓名保留。
+
+### 5.4 Task 看板删除
+
+- `tasks.deleted_at` 记录软删除，数据库迁移到 `user_version=8`。`DELETE /api/v1/tasks/:id` 只接受独立任务或编排父任务，同一事务标记父任务和已有子任务，清理 Worker 的当前指派，保留 Task、Command、Event、Chat 和任务编号。重复删除幂等。
+- 存在 queued/accepted/running/waiting_manual 命令、进行中任务或活动编排时返回 409，不自动取消。`createCommand`、`updateTask` 与 @任务解析拒绝已删除任务。默认 Task/Orchestration 列表排除墓碑，`getTask`、`getOrchestration` 和管理员 `GET /api/v1/tasks?include_deleted=true` 保留审计读取。
+- Dashboard 任务详情提供确认后的“删除任务”，发出 `task.deleted` 后移除整份计划、任务卡和未发送的 @任务引用；历史对话保留但不提供失效任务入口。
 
 ## 6. 任务与命令模型
 
@@ -491,7 +497,7 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 
 ### 10.6 中央协调器
 
-- 管理员通过 `PUT /api/v1/coordinator` 指定一个 managed、可推送 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Worker 自声明协调者身份不会获得权限，未启用时 `orchestrate` 请求返回 `coordinator_disabled`。
+- 管理员通过 `PUT /api/v1/coordinator` 指定一个 managed、可推送 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Dashboard 的“指定/更换”对话框复用该接口，候选仅为未注销的 managed、可推送 Worker；中央大脑仍显示在员工列表并标注角色。注册员工不要求先配置中央大脑，但未启用时不能进行中央对话或自动编排，`orchestrate` 请求返回 `coordinator_disabled`。Worker 自声明协调者身份不会获得权限。
 - 协调者生成受限对话动作、规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含 Driver 私有状态、任意 metadata 或 Token。
 - `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误、`auto_start`、来源消息、终审理由、`recovery_count`、`review_command_id` 和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由；修正前的结果和评审归档在 `previous_attempts`。`coordinator_chat_messages` 保存用户、协调者和任务活动消息，通过 request/source 去重键及 Command/Task 关联支持恢复。
 - 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。终审 Command ID 与编排关联，迟到的上一轮回执不能再次触发评审或修正。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
@@ -529,6 +535,7 @@ GET    /api/v1/tasks
 POST   /api/v1/tasks
 GET    /api/v1/tasks/:id
 PATCH  /api/v1/tasks/:id
+DELETE /api/v1/tasks/:id
 GET    /api/v1/commands
 POST   /api/v1/commands
 GET    /api/v1/commands/:id
@@ -751,7 +758,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：82 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：85 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。

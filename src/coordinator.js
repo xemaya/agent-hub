@@ -4,6 +4,12 @@ const FINAL_COMMAND_STATUSES = new Set(['succeeded', 'failed']);
 const FINISHED_STEP_STATUSES = new Set(['review', 'done']);
 const DEPENDENCY_EVIDENCE_BUDGET = 64000;
 const REFERENCE_EVIDENCE_BUDGET = 24000;
+const MAX_RECOVERY_ROUNDS = 2;
+
+function taskLabel(task) {
+  const reference = Number.isInteger(task?.task_number) ? `#${String(task.task_number).padStart(4, '0')} · ` : '';
+  return `${reference}${task?.title ?? '任务'}`;
+}
 
 function validateChatResponse(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw coordinatorError('Chat response must be a JSON object');
@@ -262,8 +268,9 @@ export class Coordinator {
         if (worker.worker_id === coordinatorWorkerId || !canReceivePush(worker)) {
           throw coordinatorError('Mentioned Worker must be online and able to receive pushed work', 'mention_worker_unavailable', 409);
         }
-      } else if (!this.store.getTask(id)) {
-        throw coordinatorError('Mentioned Task does not exist', 'mention_task_not_found', 404);
+      } else {
+        const task = this.store.getTask(id);
+        if (!task || task.deleted_at) throw coordinatorError('Mentioned Task does not exist', 'mention_task_not_found', 404);
       }
       mentions.push({ type: item.type, id });
     }
@@ -286,7 +293,7 @@ export class Coordinator {
 
   taskReference(taskId, { resultBudget = null } = {}) {
     const task = this.store.getTask(taskId);
-    if (!task) return null;
+    if (!task || task.deleted_at) return null;
     const orchestration = this.store.getOrchestrationByTask(taskId)
       ?? this.store.listOrchestrations().find((item) => item.steps.some((step) => step.task_id === taskId));
     const stepCount = orchestration?.steps.length ?? 0;
@@ -446,18 +453,21 @@ export class Coordinator {
 
   requestReview(orchestration) {
     const parent = this.store.getTask(orchestration.parent_task_id);
-    const reviewing = this.store.updateOrchestration(orchestration.orchestration_id, {
+    const input = this.reviewPrompt({ ...orchestration, status: 'review', error: null });
+    this.store.updateOrchestration(orchestration.orchestration_id, {
       status: 'review',
       error: null,
+      reviewCommandId: null,
     });
     this.store.updateTask(parent.task_id, { status: 'review' });
     const command = this.store.createCommand({
       task_id: parent.task_id,
       worker_id: orchestration.coordinator_worker_id,
       kind: 'coordinator_review',
-      input: this.reviewPrompt(reviewing),
+      input,
       push_capable: true,
     });
+    this.store.updateOrchestration(orchestration.orchestration_id, { reviewCommandId: command.command_id });
     this.emit('coordinator.review.requested', { type: 'worker', id: orchestration.coordinator_worker_id }, {
       task_id: parent.task_id,
       command_id: command.command_id,
@@ -486,7 +496,11 @@ export class Coordinator {
       error: { code, message },
     });
     this.store.updateTask(orchestration.parent_task_id, { status: 'review' });
-    this.recordActivity(reviewing, 'review-required', `评审还需要关注：${String(message).slice(0, 4000)}\n任务没有标记为完成。`);
+    const next = reviewing.recovery_count
+      ? `已完成 ${reviewing.recovery_count} 轮自动修正，任务仍未完成；可以 @任务 补充信息或调整验收。`
+      : '任务没有标记为完成；可以 @任务 补充信息。';
+    const activityKey = reviewing.recovery_count ? `review-required:${reviewing.recovery_count}` : 'review-required';
+    this.recordActivity(reviewing, activityKey, `评审还需要关注：${String(message).slice(0, 4000)}\n${next}`);
     this.emit('coordinator.review_required', { type: 'worker', id: orchestration.coordinator_worker_id }, {
       task_id: orchestration.parent_task_id,
       payload: { orchestration_id: orchestration.orchestration_id, code, message },
@@ -514,7 +528,7 @@ export class Coordinator {
         assignee_worker_id: null,
         created_by: 'coordinator',
       });
-      return { ...step, task_id: task.task_id };
+      return { ...step, task_id: task.task_id, task_number: task.task_number };
     });
     const status = orchestration.auto_start ? 'in_progress' : 'ready';
     const updated = this.store.updateOrchestration(orchestration.orchestration_id, {
@@ -559,7 +573,7 @@ export class Coordinator {
       const parent = this.store.getTask(completed.parent_task_id);
       const deliverables = steps.filter((step) => resultText(step.result).trim()).length;
       const acceptanceCount = parent?.acceptance.length ?? 0;
-      this.recordActivity(completed, 'completed', `「${parent?.title ?? '任务'}」已完成。${deliverables} 项交付结果${acceptanceCount ? ` · ${acceptanceCount} 条整体验收通过` : ' · 终审通过'}。`);
+      this.recordActivity(completed, 'completed', `「${taskLabel(parent)}」已完成。${deliverables} 项交付结果${acceptanceCount ? ` · ${acceptanceCount} 条整体验收通过` : ' · 终审通过'}。`);
       this.emit('coordinator.completed', { type: 'worker', id: orchestration.coordinator_worker_id }, {
         task_id: orchestration.parent_task_id,
         payload: { orchestration_id: orchestration.orchestration_id, reason: review.reason },
@@ -567,7 +581,78 @@ export class Coordinator {
       return completed;
     }
     const updated = this.store.updateOrchestration(orchestration.orchestration_id, { steps, reviewReason: review.reason });
-    return this.reviewNeeded(updated, 'coordinator_review_rejected', review.reason);
+    return this.recoverRejectedReview(updated);
+  }
+
+  recoverRejectedReview(orchestration) {
+    if (orchestration.recovery_count >= MAX_RECOVERY_ROUNDS) {
+      return this.reviewNeeded(orchestration, 'coordinator_review_rejected', orchestration.review_reason);
+    }
+    const reworkKeys = new Set(orchestration.steps.filter((step) => step.status !== 'done').map((step) => step.key));
+    if (!reworkKeys.size) {
+      return this.reviewNeeded(
+        orchestration,
+        'coordinator_review_rejected',
+        `${orchestration.review_reason}\n终审未指出需要重做的步骤，无法自动推进。`,
+      );
+    }
+    let expanded = true;
+    while (expanded) {
+      expanded = false;
+      for (const step of orchestration.steps) {
+        if (!reworkKeys.has(step.key) && step.depends_on.some((key) => reworkKeys.has(key))) {
+          reworkKeys.add(step.key);
+          expanded = true;
+        }
+      }
+    }
+    const recoveryCount = orchestration.recovery_count + 1;
+    const steps = orchestration.steps.map((step) => {
+      if (!reworkKeys.has(step.key)) return step;
+      return {
+        ...step,
+        attempt: (step.attempt ?? 1) + 1,
+        previous_attempts: [
+          ...(step.previous_attempts ?? []),
+          {
+            attempt: step.attempt ?? 1,
+            command_id: step.command_id,
+            result: step.result,
+            error: step.error,
+            review: step.review,
+          },
+        ],
+        status: 'ready',
+        command_id: null,
+        result: null,
+        error: null,
+        review: null,
+      };
+    });
+    for (const step of steps) {
+      if (reworkKeys.has(step.key)) {
+        this.store.updateTask(step.task_id, { status: 'ready', assignee_worker_id: null });
+      }
+    }
+    const updated = this.store.updateOrchestration(orchestration.orchestration_id, {
+      status: 'in_progress',
+      steps,
+      error: null,
+      recoveryCount,
+      reviewCommandId: null,
+    });
+    this.store.updateTask(orchestration.parent_task_id, { status: 'in_progress' });
+    this.recordActivity(
+      updated,
+      `recovery:${recoveryCount}`,
+      `终审未通过，中央大脑已开始第 ${recoveryCount} 次修正：重做 ${reworkKeys.size} 个步骤，并带上上轮结果和验收意见。`,
+    );
+    this.emit('coordinator.recovery.started', { type: 'worker', id: orchestration.coordinator_worker_id }, {
+      task_id: orchestration.parent_task_id,
+      payload: { orchestration_id: orchestration.orchestration_id, recovery_count: recoveryCount, steps: [...reworkKeys] },
+    });
+    this.pump(updated);
+    return this.store.getOrchestration(orchestration.orchestration_id);
   }
 
   workerAvailable(worker, taskId) {
@@ -593,6 +678,25 @@ export class Coordinator {
     const referenceIds = this.orchestrationTaskIds(orchestration);
     const referenceLimit = Math.max(1, Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(referenceIds.length, 1)));
     const references = referenceIds.map((taskId) => this.taskReference(taskId, { resultBudget: referenceLimit })).filter(Boolean);
+    const recovering = (step.attempt ?? 1) > 1;
+    const recoveryLimit = Math.max(1, Math.floor(DEPENDENCY_EVIDENCE_BUDGET / Math.max(orchestration.steps.length, 1)));
+    const recoveryContext = recovering ? {
+      recovery_round: orchestration.recovery_count,
+      overall_review: orchestration.review_reason,
+      instruction: '针对上次未满足的验收重新执行，不要只复述旧结果。其他步骤的结果可能包含纠正信息，先核实再行动。',
+      steps: orchestration.steps.map((item) => {
+        const previous = item.previous_attempts?.at(-1);
+        const result = item.result ?? previous?.result ?? null;
+        return {
+          key: item.key,
+          title: item.title,
+          result: resultEvidence(result, recoveryLimit),
+          result_truncated: resultText(result).length > recoveryLimit,
+          result_incomplete: Boolean(result?.output_gap),
+          review: item.review ?? previous?.review ?? null,
+        };
+      }),
+    } : null;
     return [
       '你正在执行中央大脑分配的一个步骤。只完成当前步骤，不要修改其他任务，不要读取 Admin Token。',
       '返回真实结果：完成内容、修改的文件、实际测试及结果。文案交付请直接给出完整正文，不要只给摘要。不要虚构证据。',
@@ -600,11 +704,15 @@ export class Coordinator {
       '父任务背景 JSON:',
       JSON.stringify(parent, null, 2),
       '当前步骤 JSON:',
-      JSON.stringify({ ...step, command_id: undefined }, null, 2),
+      JSON.stringify({ ...step, command_id: undefined, previous_attempts: undefined }, null, 2),
       '已完成依赖步骤的真实结果 JSON:',
       JSON.stringify(dependencyResults, null, 2),
       '对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:',
       JSON.stringify(references, null, 2),
+      ...(recoveryContext ? [
+        '上次终审与本次修正上下文 JSON:',
+        JSON.stringify(recoveryContext, null, 2),
+      ] : []),
     ].join('\n\n');
   }
 
@@ -675,6 +783,7 @@ export class Coordinator {
         }
       } else {
         if (orchestration.status !== 'review') return true;
+        if (orchestration.review_command_id && orchestration.review_command_id !== command.command_id) return true;
         if (command.status !== 'succeeded' || command.outcome_unknown) {
           this.reviewNeeded(orchestration, 'coordinator_review_failed', command.error?.message ?? 'Coordinator review failed');
         } else {
@@ -734,10 +843,12 @@ export class Coordinator {
     const orchestrations = this.list().slice(0, 10).map((orchestration) => ({
       orchestration_id: orchestration.orchestration_id,
       parent_task_id: orchestration.parent_task_id,
+      task_number: orchestration.parent_task?.task_number,
       title: orchestration.parent_task?.title,
       goal: orchestration.parent_task?.goal?.slice(0, 1200),
       acceptance: orchestration.parent_task?.acceptance?.slice(0, 8).map((item) => item.slice(0, 300)),
       status: orchestration.status,
+      recovery_count: orchestration.recovery_count,
       auto_start: orchestration.auto_start,
       summary: orchestration.summary.slice(0, 1000),
       review_reason: orchestration.review_reason.slice(0, 1000),
@@ -944,7 +1055,7 @@ export class Coordinator {
 
   taskChatReply(action, orchestration, started = false) {
     const task = this.store.getTask(orchestration.parent_task_id);
-    const title = task?.title ?? '任务';
+    const title = taskLabel(task);
     if (orchestration.status === 'blocked') {
       return `「${title}」未完成：${orchestration.error?.message ?? '规划或执行未完成'}。不会自动重试；可以引用任务并说明新的处理要求。`;
     }
@@ -953,7 +1064,7 @@ export class Coordinator {
       return `「${title}」已完成。${deliverables} 项交付结果${task?.acceptance.length ? ` · ${task.acceptance.length} 条整体验收通过` : ' · 终审通过'}。`;
     }
     if (orchestration.status === 'review' && orchestration.error) {
-      return `「${title}」验收未通过：${orchestration.error.message}。任务尚未完成；可以引用任务并提出修改要求。`;
+      return `「${title}」${orchestration.recovery_count ? '自动修正后仍未通过' : '验收未通过'}：${orchestration.error.message}。可以引用任务并补充信息或调整验收。`;
     }
     if (action.type === 'plan') {
       return orchestration.status === 'ready'
@@ -1135,8 +1246,15 @@ export class Coordinator {
         this.pump(orchestration);
         continue;
       }
+      if (orchestration.status === 'review' && orchestration.error?.code === 'coordinator_review_rejected'
+        && orchestration.recovery_count < MAX_RECOVERY_ROUNDS) {
+        this.recoverRejectedReview(orchestration);
+        continue;
+      }
       if (orchestration.status === 'review' && !orchestration.error) {
-        const review = commands.find((command) => command.kind === 'coordinator_review');
+        const review = orchestration.review_command_id
+          ? this.store.getCommand(orchestration.review_command_id)
+          : commands.find((command) => command.kind === 'coordinator_review');
         if (review && FINAL_COMMAND_STATUSES.has(review.status)) this.onCommandFinished(review);
         else if (!review) this.requestReview(orchestration);
       }

@@ -9,6 +9,8 @@ const execFileAsync = promisify(execFile);
 
 export const SERVICE_LABEL = 'com.agent-hub.connector';
 
+const INHERITED_ENV = ['AGENT_HUB_KIMI_MODEL', 'AGENT_HUB_CODEX_MODEL', 'AGENT_HUB_AUTO_UPDATE'];
+
 function escapeXml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -41,6 +43,7 @@ export function connectorServiceSpec({
   hubUrl,
   name,
   dataDir,
+  localPort,
   logFile,
   nodePath = process.execPath,
   rootDir = PROJECT_ROOT,
@@ -49,6 +52,7 @@ export function connectorServiceSpec({
   if (!hubUrl) throw new Error('--hub-url is required');
   const args = [nodePath, path.join(rootDir, 'bin/agent-hub.js'), 'connector', '--hub-url', hubUrl, '--data-dir', dataDir];
   if (name) args.push('--name', name);
+  if (localPort !== undefined) args.push('--local-port', String(localPort));
   return {
     Label: SERVICE_LABEL,
     ProgramArguments: args,
@@ -58,6 +62,7 @@ export function connectorServiceSpec({
       PATH: env.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin',
       HOME: env.HOME ?? os.homedir(),
       AGENT_HUB_SUPERVISED: '1',
+      ...Object.fromEntries(INHERITED_ENV.filter((key) => env[key] !== undefined).map((key) => [key, env[key]])),
     },
     RunAtLoad: true,
     KeepAlive: true,

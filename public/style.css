@@ -199,6 +199,12 @@ button:disabled { cursor: wait; }
 .worker-mention:hover:not(:disabled) { color: var(--paper); background: var(--blue); }
 .worker-mention:disabled { cursor: not-allowed; opacity: .35; }
 .worker-details { padding: 0 0 14px 35px; }
+.worker-retire, .coordinator-retire, .task-delete { margin-top: 12px; color: #9d3422; }
+.coordinator-retire { margin: 0; }
+.coordinator-configure { margin-left: auto; }
+.coordinator-dialog { width: min(480px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--ink); border-radius: 0; color: var(--ink); background: var(--paper-light); }
+.coordinator-dialog::backdrop { background: rgba(24, 34, 30, .48); }
+.coordinator-dialog select { display: block; width: 100%; margin-top: 8px; padding: 10px; color: var(--ink); border: 1px solid var(--line); background: var(--paper); font: 12px var(--body); }
 .worker-runtime { margin: 0 0 9px; color: var(--muted); font-size: 9px; line-height: 1.6; overflow-wrap: anywhere; }
 .capabilities { display: flex; flex-wrap: wrap; gap: 5px; }
 .capabilities span { padding: 3px 6px; color: var(--blue); border: 1px solid #afc0cb; font-size: 9px; }
@@ -264,6 +270,8 @@ button:disabled { cursor: wait; }
 .dialog-content { padding: 23px 24px 27px; }
 .dialog-reference { margin: 25px 0 0; padding-top: 15px; border-top: 1px solid var(--paper-deep); }
 .dialog-reference .text-button { margin: 0; }
+.task-detail-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.task-detail-actions .task-delete { margin: 0; }
 .delivery-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 17px; border-bottom: 1px solid var(--ink); }
 .delivery-heading h3 { margin: 0; font: 700 23px/1.4 var(--display); }
 .delivery-heading p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.7; }

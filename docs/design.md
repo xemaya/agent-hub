@@ -1,7 +1,7 @@
 # Agent Hub 设计文档
 
-状态：MVP 设计基线
-适用阶段：本机中控、本机 Worker，后续接入其他 Mac
+状态：当前实现与部署基线
+适用阶段：AWS 单实例公网 Hub，多台 Mac 通过 Connector 接入
 
 ## 1. 背景与目标
 
@@ -20,8 +20,8 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 
 ### 2.1 包含
 
-- 本机运行一个 Hub。
-- 每台 Mac 运行一个 Connector；本次只启动本机 Connector。
+- AWS 上运行一个公网 Hub；本机开发也可在 macOS 启动。
+- 每台 Mac 运行一个 Connector，通过 HTTPS/WSS 出站接入。
 - Worker 通过所在机器的 Connector 自注册。
 - Workers、Connectors、Tasks、Commands、Events 的持久化和展示。
 - Connector 与 Hub 之间使用出站 WebSocket 推送命令。
@@ -30,7 +30,7 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - 外部 Session 的登记和人工协作模式。
 - 一个无构建步骤的 Web 中控页面和通用 CLI。
 - 管理员启用的中央协调器：全局规划、Worker 匹配、依赖编排与最终证据评审。
-- 默认回环地址运行；后续可绑定本机 Tailscale IP，让其他 Mac 注册。
+- systemd 常驻、Caddy TLS 和 SQLite 一致性备份；Headscale 作为可选管理或私网通道。
 
 ### 2.2 暂不包含
 
@@ -38,9 +38,9 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - 多 Hub、多主写入、分布式锁和消息队列集群。
 - 双向文件同步、自动解决 Git 冲突、向量数据库。
 - 直接控制任意已经打开的交互式 TUI。
-- MCP 工具服务和 Codex 桌面端自动化的首版适配。Claude 交互窗口已通过 Channel 接入（见 10.7），Kimi/Codex 的交互推送仍未实现。
-- Tailscale/Headscale 的安装、启动或配置变更。
-- 公网开放、Tailscale Funnel、多租户和细粒度用户权限。
+- MCP 工具服务和 Codex 桌面端自动化的首版适配。Claude 交互窗口已通过 Channel 接入（见 10.7），Kimi 通过 ACP 交互窗口接入（见 10.8）；Codex 的交互推送仍未实现。
+- 自动安装或修改 Tailscale/Headscale。
+- Tailscale Funnel、多租户和细粒度用户权限。
 
 ## 3. 核心概念
 
@@ -101,15 +101,15 @@ work_state: idle | working | waiting | blocked
                     └──────────┬──────────┘
                                │ REST + Dashboard WebSocket
 ┌──────────────────────────────▼───────────────────────────────┐
-│ Agent Hub（本机）                                            │
+│ Agent Hub（AWS 单实例）                                      │
 │ HTTP API · WebSocket · SQLite · Durable Command Outbox      │
 └──────────────────────────────▲───────────────────────────────┘
-                               │ 出站 Connector WebSocket
+                               │ 出站 Connector WSS
                                │ 命令下行 / 状态上行
                     ┌──────────┴──────────┐
                     │                     │
               本机 Connector          其他 Mac Connector
-                    │                     │ 后续接入
+                    │                     │
         ┌───────────┼───────────┐         │
         │           │           │         │
    Claude Driver  Kimi Driver  Manual     │
@@ -122,10 +122,10 @@ work_state: idle | working | waiting | blocked
 网络原则：
 
 - Connector 主动连接 Hub，Worker Mac 不开放入站端口。
-- Hub 默认监听 `127.0.0.1:8787`。
+- 正式 Hub 只监听 `127.0.0.1:8787`，由 Caddy 在 443 提供 HTTPS/WSS。
 - Connector 本地 API 默认只监听 `127.0.0.1:8788`。
 - Kimi API 只监听回环地址，令牌不写入日志。
-- 后续 Hub 绑定 Tailscale IP 后，其他 Connector 仍只需出站连接 Hub。
+- Headscale 仅作为管理或可选私网通道，不是公网接入的依赖。
 
 ## 5. 自注册与身份
 
@@ -190,6 +190,7 @@ Local CLI/Session
 ```json
 {
   "task_id": "task_...",
+  "task_number": 1,
   "title": "增加收藏刷新",
   "goal": "为什么做、要做到什么",
   "context": "已确认结论、相关 commit、注意事项",
@@ -201,6 +202,8 @@ Local CLI/Session
   "updated_at": "..."
 }
 ```
+
+`task_number` 是独立序列分配的持久化编号，页面显示为 `#0001`；旧任务按插入顺序回填，清空历史不复用编号。所有外键、API 引用和 Worker 关联仍使用完整 `task_id`。
 
 任务状态：
 
@@ -353,9 +356,13 @@ Dashboard 的新增、修改操作仍使用带 `Authorization: Bearer` 的 REST 
 
 ### 8.3 版本一致与自更新
 
+这些机制属于连接恢复与代码发布层，不改变 Worker 身份、中央协调者权限、任务编排或 Command 投递语义。
+
 - 版本标识是检出目录的 git commit（另带 `package.json` 版本和是否有未提交修改），Hub 与 Connector 在握手时交换，并通过 `/healthz`、`GET /api/v1/connectors` 暴露。
 - Connector 每遇到一个新的 Hub commit 只处理一次：`git fetch` 后仅在工作区干净、本地是上游祖先时 fast-forward，依赖文件变化时执行 `pnpm install --frozen-lockfile`。脏、领先或分叉的检出一律跳过并记录原因；Hub commit 不在上游时提示更新 Hub。
+- Hub 只触发更新检查，实际代码来自 Connector 本机配置的 Git upstream。该 upstream 属于代码执行信任边界；开发检出或不允许自动变更的机器用 `--no-auto-update` 或 `AGENT_HUB_AUTO_UPDATE=0` 关闭。
 - 以 launchd 服务运行（`AGENT_HUB_SUPERVISED=1`）时，更新后等所有正在执行的 managed 命令结束再退出，由 launchd 拉起新代码；前台运行只提示手动重启，避免中断执行中的命令被标记为 `outcome_unknown`。
+- 服务安装保留 `PATH`、`HOME` 和已设置的 `AGENT_HUB_KIMI_MODEL`、`AGENT_HUB_CODEX_MODEL`、`AGENT_HUB_AUTO_UPDATE`，并透传显式 `--local-port`；任何 Token 都不写入 plist。
 - Hub 不自更新，只记录与 Connector 的版本差异；Hub 机器手动 `agent-hub update` 后重启。
 
 ## 9. 持久化设计
@@ -382,7 +389,7 @@ UNIQUE(connector_id, runtime, runtime_session_id)
 ### tasks
 
 ```text
-task_id PK, title, goal, context, acceptance_json,
+task_id PK, task_number UNIQUE, title, goal, context, acceptance_json,
 assignee_worker_id, status, created_by, created_at, updated_at
 ```
 
@@ -453,21 +460,29 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 ### 10.4 当前交互 Session 启动器
 
 - `agent-hub session start --runtime claude|kimi|codex` 只建立当前原生身份并打开客户端，不注册 Worker、不创建任务。
-- Claude 生成 UUID，以 `claude --session-id <uuid>` 启动；Kimi 通过现有 Server API 创建原生 Session，关闭临时 Server 后以 `kimi --session <id>` 启动，避免 Web/CLI 对同一 Session 的排他占用。
+- Claude 生成 UUID，以 `claude --session-id <uuid>` 启动；普通 Kimi 通过现有 Server API 创建原生 Session，关闭临时 Server 后以 `kimi --session <id>` 启动，避免 Web/CLI 对同一 Session 的排他占用。Kimi `--push` 只用临时 Server 取得真实 ID，随后改用 ACP（见 10.8）。
 - Codex 没有新会话 `--session-id` 参数。启动器直接打开新 Codex 客户端并只注入 `AGENT_HUB_RUNTIME`，不预创建空 Thread、不选择最近会话。Codex 自身向工具进程注入 `CODEX_SESSION_ID`，`worker register-current` 读取这个真实原生 ID；因此未通过启动器打开的现有 Codex 窗口也可以登记。若同时存在启动器 ID，必须与原生 ID 一致。
 - Claude/Kimi 由启动器注入 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`；Codex 以原生 `CODEX_SESSION_ID` 为身份来源。`worker register-current` 校验 Runtime 一致性，缺失时失败，不生成随机 ID、不选择最近会话，并记录实际身份来源。
 - 当前交互 Session 默认登记为 external，并保存 `interactive: true` 与 `session_origin`。只有用户明确选择且确认交互实例已退出或 Runtime 支持共享时才使用 managed。
-- Claude/Codex 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接，不能用简单 `--session` 替代。
-- `--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。
+- Claude/Codex 可以在交互进程退出后通过同一 ID 恢复，但不允许同时手动发送另一条 Prompt。普通 Kimi TUI 不能由另一个 Web Server 实时接管；需要交互推送时通过 `--push` 改用 ACP 窗口，不能用简单 `--session` 或 `:takeover` 冒充。
+- 非 Kimi `--push` 时，`--` 后的参数原样传给 Runtime，标准输入输出继承当前终端；客户端退出后清理子进程和启动器拥有的临时服务。Kimi `--push` 不接受 Runtime 参数。
 
 ### 10.7 Claude 交互窗口实时推送（Channel）
 
 - `agent-hub session start --runtime claude --push [--resume <id>]` 在 Connector 数据目录下写入 `channels/<session>.json` MCP 配置，并以 `--allowedTools mcp__agent-hub__agent_hub_ack,mcp__agent-hub__agent_hub_report --mcp-config <file> --dangerously-load-development-channels server:agent-hub` 启动交互式 Claude Code。由于这三个参数都是可变参数，启动器总把它们放在 `--session-id`/`--resume` 之前，保证 `--` 后的 Runtime 参数不被吞掉。从另一个 Claude Code 会话内启动时设置 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`，避免继承的子会话标记关闭转录导致无法 `--resume`。
 - Claude Code 以 stdio 拉起 `agent-hub channel`（不依赖 MCP SDK 的最小 JSON-RPC 实现），它声明 `experimental['claude/channel']` 与 `tools`，并用 Local Token 打开 Connector 的 `GET /local/v1/channel?runtime=&session_id=` SSE 流，Connector 重启后自动重连。
 - Connector 按 `runtime + session_id` 找到 Worker：未注册时保持 `waiting_registration`，注册后立即接通；managed Worker 拒绝接通（无头执行与交互窗口不能共用同一 Session）。接通与断开通过 `worker.channel { worker_id, attached }` 报给 Hub，Hub 仅对 external Worker 切换 `push_capable` 并在接通时重放队列；每次重连后 Connector 重报所有 external Worker 的接通状态。
-- 投递：命令按 Worker 串行，写入 SSE 后 Channel 发出 `notifications/claude/channel`，`meta` 带 `command_id`、`kind`、`task_id`，正文末尾重申须用 `agent_hub_report` 回执。`agent_hub_ack` 只追加进度输出；`agent_hub_report { command_id, status, result }` 结束命令，结果为 `{ text, session_id, delivery: "channel" }`，与 managed Driver 同形，直接问答与编排读取方式不变。重复回执被拒绝。
+- 投递：命令按 Worker 串行，写入 SSE 后 Channel 发出 `notifications/claude/channel`，`meta` 带 `command_id`、`kind`、`task_id`，正文末尾重申须用 `agent_hub_report` 回执。`agent_hub_ack` 只追加进度输出；`agent_hub_report { command_id, status, result }` 结束命令，结果为 `{ text, session_id, delivery: "channel" }`，与 managed Driver 同形，直接问答与编排读取方式不变。重复回执被拒绝。报告还可携带 `output_gap=true`，不完整证据不能被中央评审当作完整结果。
 - 接通前已为 `waiting_manual` 的命令不自动转推。窗口在执行中关闭时命令记为 `failed` 且 `outcome_unknown=true`。
 - @员工与直接问答对「在线且可推送」的员工开放（含接通的交互窗口）；中央协调者与自动编排步骤仍只选择 managed 员工。权限确认暂未经 Channel 中转到中控。
+
+### 10.8 Kimi ACP 交互窗口实时推送
+
+- `agent-hub session start --runtime kimi --push [--resume <id>]` 通过临时 Web Server 创建或核对真实 Session ID后立即关闭它，再以 `kimi acp` 建立单条 ACP 连接。`KimiAcpDriver` 完成 `initialize` 与 `session/load`，在 ACP 子进程环境中注入启动器身份，用户和 Hub 共用这个原生 Session，不生成替代 ID。
+- 启动器提供轻量交互输入，不是 Kimi 原生全屏 TUI。用户输入与 `KimiChannel` 收到的 Hub 命令进入同一个串行队列，`session/prompt` 只在同一 ACP 连接上发送；`agent_message_chunk` 同时用于窗口显示和 Hub 结果收集。`session/request_permission` 在同一窗口由用户选择，不能响应时明确失败。
+- `KimiChannel` 复用 Connector 的 SSE 接通、注册、重连和 external Worker 语义：prompt 开始时 `/ack`，结束时 `/report`，结果为 `{ text, session_id, delivery: "channel" }` 并传递 `output_gap`。模型不需要调用 Claude 专用 MCP 回执工具；停止原因、API 错误、关闭和未知结果均按真实状态报告。
+- 不关闭 Session 锁、不调用 `:takeover`、不保留共享 Web Server、不模拟键盘或修改 wire.jsonl。`--resume` 通过 `session/load` 恢复原上下文，`/exit` 关闭 ACP 和 Channel，Worker 自动退回 `waiting_manual`。
+- 自动编排仍只选择 managed Worker；显式 @ 和直接命令可发给已接通的 external Kimi。Kimi `--push` 已在 2.3.3 验证。
 
 ### 10.5 Test Driver
 
@@ -478,14 +493,15 @@ MVP 数据量较小，不做 ORM、迁移框架或外部数据库。
 
 - 管理员通过 `PUT /api/v1/coordinator` 指定一个 managed、可推送 Worker 作为中央协调者，并设置 `enabled` 与 `max_steps`。Worker 自声明协调者身份不会获得权限，未启用时 `orchestrate` 请求返回 `coordinator_disabled`。
 - 协调者生成受限对话动作、规划与评审 JSON，不能访问 Admin API、不能直接改库或任意选择命令目标。规划输入是总 Task 和脱敏 Registry：Worker ID、名称、机器、Runtime、能力、description、cwd、在线和工作状态；不包含 Driver 私有状态、任意 metadata 或 Token。
-- `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误、`auto_start`、来源消息、终审理由和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由。`coordinator_chat_messages` 保存用户、协调者和任务活动消息，通过 request/source 去重键及 Command/Task 关联支持恢复。
-- 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
+- `coordinator_config` 保存协调者配置；`coordinator_orchestrations` 保存父任务、协调者、状态、摘要、`steps_json`、错误、`auto_start`、来源消息、终审理由、`recovery_count`、`review_command_id` 和时间。步骤持久化 key、选定 Worker、依赖、task/command ID、状态、结果、错误与评审理由；修正前的结果和评审归档在 `previous_attempts`。`coordinator_chat_messages` 保存用户、协调者和任务活动消息，通过 request/source 去重键及 Command/Task 关联支持恢复。
+- 对话使用 `coordinator_chat` Command，规划使用 `coordinator_plan` Command，终审使用 `coordinator_review` Command，复用现有持久化、ACK、去重、断线重放和串行执行。终审 Command ID 与编排关联，迟到的上一轮回执不能再次触发评审或修正。规划与评审在 Command 回执中也可审计；内部 JSON 不作为员工工作动态展示。
 - 单独 `@员工` 的 `action=chat` 是转交问答，不采用中央代答。Hub 从回复的来源键找回原用户消息，向目标 Worker 发出 `worker_chat` Command，附带必要的 @任务上下文，`task_id=null`，不创建 Orchestration。创建 Command 与更新回复关联在同一事务提交，最终回复和 Hub 重启恢复按 Command 幂等完成，不重复转交。Worker 的纯文本结果才是最终回复；失败、空结果和未知结果明确失败，不伪造验收。
 - 一步能完成就不硬拆，默认最多 4 步。Hub 校验 JSON Schema、字段、Worker 可用性、重复 key、未知依赖与环。子 Task 初始不指定负责人，轮到执行时才分配，避免提前占用多个 `current_task_id`；派发前还会检查 Worker 是否忙碌及其当前 Task 是否活跃。
-- 自动编排状态为 `planning → in_progress → review → done`，可进入 `blocked` 或停留在 `review`。只规划对话在计划生成后进入 `ready`，确认后只启动这个已有计划，不重新规划，也不重跑失败、评审或完成任务。子步骤为 `ready / running / review / done / blocked`。命令成功后步骤先进入 `review`，终审通过才进入 `done`。依赖只在前序命令成功后继续，终审仍可拒绝父任务。
+- 自动编排状态为 `planning → in_progress → review → done`，可进入 `blocked` 或停留在 `review`。只规划对话在计划生成后进入 `ready`，确认后只启动这个已有计划，不重新规划，也不通过 `start` 重跑失败、评审或完成任务。子步骤为 `ready / running / review / done / blocked`。命令成功后步骤先进入 `review`，终审通过才进入 `done`。依赖只在前序命令成功后继续，终审仍可拒绝父任务。
 - 步骤 Prompt 直接携带已完成直接依赖的真实结果（总预算 64,000 字符）和来源消息中 `@任务` 的历史结果（总预算 24,000 字符，再按各任务步骤分配），不再要求 Worker 自行查询上游。超出预算标记 `result_truncated`，Runtime 的 `output_gap` 映射为 `result_incomplete`；不完整证据不能被描述为已经完整阅读。终审每个结果最多使用 12,000 字符，并附带同样的不完整标记，无法确认的验收必须拒绝。
-- 每个编排只有一次规划和一次终审，不自动重试或扩写计划。计划失败或无效进入 `blocked`；步骤执行失败进入 `blocked`；评审证据不足、拒绝或无法解析时停留在 `review`，不能伪造完成。终审只根据返回证据，不虚构独立测试。
-- 重启时按持久化的编排和 Command 状态恢复，不重复创建子任务或命令。`orchestration.list` 仅返回当前 Connector 创建的或其 Worker/协调者参与的编排。
+- 每个编排只有一次初始规划，不自动扩写计划。合法终审明确拒绝且能定位失败步骤时，中央大脑最多自动修正两轮：失败步骤及其传递依赖的后续步骤重新执行，独立且已通过的步骤不重跑。修正 Prompt 携带上轮整体意见、步骤评审和其他步骤真实结果，修正后重新终审；仍不通过则停留 `review` 并请求补充信息。
+- 计划失败或无效、步骤执行失败进入 `blocked`；评审无法解析、父任务整体未通过但没有失败步骤时不盲目重试，不能伪造完成。终审只根据返回证据，不虚构独立测试。
+- 重启时按持久化的编排和 Command 状态恢复，不重复创建子任务或命令；既有 rejected review 在未使用过修正额度时由同一恢复逻辑接管。`orchestration.list` 仅返回当前 Connector 创建的或其 Worker/协调者参与的编排。
 
 ## 11. HTTP API
 
@@ -638,7 +654,7 @@ node scripts/install-local.js --connector-data-dir .runtime/connector
 
 显式调用方式：Kimi 在新 Session 中使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Claude 和 Codex 支持运行中发现 Skill 变更；未出现时重新打开 Session。Skill 不是常驻进程，启动即自动注册需要另配启动指令或 hook，不能覆盖已有 Orca hooks。
 
-Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude|codex` 打开客户端后，Claude/Kimi 使用启动器提供的 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，Codex 使用自身注入工具进程的 `CODEX_SESSION_ID`，因此已有 Codex 窗口也能通过 `worker register-current` 登记本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；当前 Kimi CLI 不能由另一个 Web Server 同时接管，当前交互主动推送需要共享 Web/ACP 桥接。Claude/Codex 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。缺少可信原生身份时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
+Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start --runtime kimi|claude|codex` 打开客户端后，Claude/Kimi 使用启动器提供的 `AGENT_HUB_RUNTIME` 和 `AGENT_HUB_SESSION_ID`，Codex 使用自身注入工具进程的 `CODEX_SESSION_ID`，因此已有 Codex 窗口也能通过 `worker register-current` 登记本人，不需要手工填写 ID。当前交互窗口默认登记为 external；只有明确要求主动执行且交互实例已退出或 Runtime 支持共享时才使用 managed。普通 Kimi 启动器会在打开 CLI 前关闭临时 Web Server，避免排他占用；Kimi `--push` 改用单连接 ACP 交互窗口，由桥接自动回执，普通 TUI 不能用另一个 Web Server 实时接管。Claude/Codex 在同一 ID 恢复时也不能同时手动发送另一条 Prompt。另建 managed Worker 仍是独立数字员工的接入方式，与当前窗口身份不同。缺少可信原生身份时不得随机生成或选择最近会话。Worker 的能力标签与 `metadata.description` 必须如实填写。
 
 用户可以直接说“添加任务”“添加并执行”或“交给中央大脑”。普通任务由 Agent 从自然语言整理字段并选择本机 Worker；中央编排由管理员指定的协调者生成计划、Hub 校验后跨 Connector 调度。Worker 仍不能自主跨机互派。Agent 根据真实回执逐条核对验收，满足后才能更新为 `done`；失败、人工等待和等待超时都不能冒充成功。网页不提供任务编辑或调度表单；管理员通过中央对话安排工作，Agent 原有 Local Token 和 CLI 流程不变。
 
@@ -647,7 +663,7 @@ Skill 明确区分当前窗口与独立 Worker：通过 `agent-hub session start
 主界面只有“操作台”和“任务看板”两个视图：
 
 - **操作台**：中央对话与数字员工。关联任务以紧凑进展卡进入对话时间线；员工默认只显示一个状态、名称、一句简介和 `@`，点击条目展开能力、机器/Runtime、当前工作和实际输出。员工栏标题在内部滚动时固定。
-- **任务看板**：按父任务归组，默认显示全部，支持按状态筛选。卡片区分计划待启动、正在验收、验收未通过和已完成。已完成详情优先展示完整交付正文、整体验收结论与复制操作，执行过程默认收起；进行中的详情仍展示目标、步骤和已返回证据。
+- **任务看板**：按父任务归组，每个任务以 `#0001` 形式显示持久化 `task_number`，编号可用于 `@任务` 搜索；内部关联仍使用 `task_id`。默认显示全部并支持按状态筛选，卡片区分计划待启动、正在修正、正在验收、验收未通过和已完成。步骤显示执行轮次，上一轮结果与评审折叠保留。已完成详情优先展示完整交付正文、整体验收结论与复制操作，执行过程默认收起；进行中的详情仍展示目标、步骤和已返回证据。
 
 主界面不设置宣传/教学文案、命令回执、事件流水或调度表单。交付使用 `public/markdown.js` 渲染常用 Markdown 结构，不再截断为 6000 字；Agent 原文先转义，原始 HTML 不执行，链接仅允许安全协议。支持单步和全部结果复制，保留完整原始返回。Enter 发送，Cmd/Ctrl+Enter 或 Shift+Enter 换行；每条消息可复制，Clipboard API 不可用时使用兼容复制路径。中央忙碌时待回复消息显示排队，旧版本留下的超长步骤汇报只在显示层收敛，不改写原始记录。
 
@@ -668,46 +684,57 @@ Admin Token 仅保存在浏览器 `sessionStorage`，WebSocket 首条消息认�
 - 首次启动生成随机 Admin Token 和 Enrollment Token，写入 0600 凭证文件；也允许通过环境变量显式提供。
 - Connector Token 和 Local Token 都是独立随机凭证。
 - 协调者配置只能由 Admin 修改，Worker 自声明不会获得中央权限。协调器接收的 Registry 不包含 Token、Driver 私有状态或任意 metadata；模型输出始终作为不可信输入进行 Schema、Worker 和依赖校验。
-- 每个编排最多 4 步，只有一次规划和一次终审，不自动重试。父任务只有在全部步骤和整体验收都通过后才能完成，执行失败、证据不足和评审拒绝都不能冒充成功。
+- 每个编排最多 4 步，只有一次初始规划；终审拒绝后的自动修正最多两轮，且必须有明确失败步骤，下游随依赖失效并保留历史证据。父任务只有在全部步骤和整体验收都通过后才能完成，执行失败、证据不足和评审拒绝都不能冒充成功。
 - 管理员对话仅支持 `chat`、`plan`、`orchestrate`、`start` 四类受限动作；计划与启动由 Hub 校验，模型不能自行扩权。`request_id` 和来源消息提供重试去重，对话历史仅向 Admin 开放。
 - `@` 引用只接受 Hub 核验的真实 ID。指定 Worker 时同时约束规划器的 Registry 与返回计划的校验，不能只靠提示词防止改派；external 和离线 Worker 不能冒充可推送。
 - 历史清理要求 Admin 和显式确认，先备份再事务删除；有活动工作则拒绝，Connector/Worker 身份与凭证不在清理范围内。
 - Hub 数据目录、Connector 数据目录和凭证文件不作为静态资源暴露。
-- 默认只监听回环地址；绑定 Tailscale IP 是有意的部署操作。
-- Tailscale 提供加密私网传输，但不替代应用层认证。
-- Headscale 无策略时默认允许节点间通信，后续应使用 Grants 仅开放 Hub 端口。
-- 不启用 Funnel，不关闭 Kimi API 认证，不默认绕过 Claude/Kimi 权限。
+- 正式公网 Hub 只监听服务器回环地址，由 Caddy 提供 HTTPS/WSS；不得直接开放 8787。公网安全组只需 80/443。
+- TLS 加密不替代应用层认证；Admin、Connector 和 Local Token 仍分别校验，凭证文件保持 0600。
+- Headscale 可用于服务器管理和可选私网备用通道；使用私网时应通过 Grants 限制节点与端口，不启用 Funnel。
+- 不关闭 Kimi API 认证，不默认绕过 Claude/Kimi 权限。
 - 所有执行结果记录来源 Connector 和 Worker，便于审计。
 
-## 14. Tailscale/Headscale 多机接入
+## 14. 公网部署与多机接入
 
-本机开发可使用回环地址，不要求 Tailscale 正在运行。多机部署时，Hub 只绑定本机 Tailscale IPv4，不绑定 `0.0.0.0`，不启用 Funnel。
+正式拓扑是 AWS 单实例 Hub、Caddy 公网入口和各 Mac 的出站 Connector：
 
-在中控机器确认 Tailscale 已连接目标 Headscale，并取得地址：
-
-```bash
-tailscale status
-tailscale ip -4
-agent-hub hub --host <本机-tailscale-ip> --port 8787 --data-dir .runtime/hub
+```text
+Admin Browser ── HTTPS/WSS ─┐
+                            ▼
+                  Caddy :443 → 127.0.0.1:8787
+                            │  AWS 单 Hub + SQLite
+Mac Connector ──────────────┘
+Mac Connector ──────────────┘
 ```
 
-尚未配置 Headscale 时，可按自己的认证流程使用 `tailscale up --login-server="https://<headscale-address>"`。已有非默认 Tailscale 设置时按 CLI 提示显式保留，不使用 `--reset` 覆盖配置。Headscale 策略需允许其他节点访问中控 TCP `8787`，本工具不修改服务端策略。
+服务器使用 Amazon Linux 2023、隔离的 Node 24 LTS 和 `agent-hub-hub.service`。服务以无登录权限的 `agent-hub` 账户运行，代码在 `/opt/agent-hub/app`，正式数据在 `/var/lib/agent-hub/hub`。Hub 不保存模型账号；中央大脑仍是某台 Mac 上通过 Connector 接入的 managed Worker，Hub 内置协调器负责状态机、权限和持久化。
 
-其他 Mac 加入同一 Headscale 网络后，通过环境变量临时提供 Enrollment Token，避免把 Token 写进命令历史：
+Caddy 站点配置：
+
+```caddy
+hub.findu.work {
+  reverse_proxy 127.0.0.1:8787
+}
+```
+
+新 Mac 不要求 Tailscale，只需能访问公网 Hub：
 
 ```bash
+curl --fail --silent https://hub.findu.work/healthz
 read -s -p "Enrollment Token: " AGENT_HUB_ENROLLMENT_TOKEN; echo
 export AGENT_HUB_ENROLLMENT_TOKEN
-
 agent-hub connector \
-  --hub-url http://<本机-tailscale-ip>:8787 \
+  --hub-url https://hub.findu.work \
   --name <机器名> \
   --data-dir ~/.agent-hub/connector
 ```
 
-首次 Enrollment 后，Connector Token 保存在本机，后续启动不需要 Enrollment Token。新增机器不需要入站 Connector 端口。安装器支持真实的 `~/.agent-hub/connector` 目录，也支持从该位置链接到其他 Connector 数据目录，不创建自指向软链接。
+首次 Enrollment 后，Connector Token 保存在本机，后续启动不需要 Enrollment Token。Worker Mac 不开放入站 Connector 端口；本地 API 继续只监听 `127.0.0.1:8788`。完整安装、Skill 和 Worker 注册步骤见项目 `README.md`。
 
-统一地址优先使用 Tailscale IPv4；MagicDNS 名称只有在实际解析验证后才使用。其他 Mac 的完整克隆、安装、Skill 和 Worker 注册步骤见项目 `README.md`。
+迁移必须先确认无活动工作，停止旧 Hub 后用 `HubStore.backup()` 生成 SQLite 一致性快照。数据库与 `credentials.json` 一起迁移，以保留 Connector/Worker 身份和 Admin 登录状态；接收端校验 SHA-256、SQLite 完整性、记录数量与文件权限。凭证经加密管理通道传输，不能进入 SSM 参数、日志、聊天、Git 或公网对象存储。任何时刻只有一个 Hub 接收正式工作，旧目录与 Caddy 配置备份用于回滚。
+
+本机开发仍可绑定 `127.0.0.1`。既有 Headscale 私网也可作为备用入口，此时显式绑定本机 Tailscale IPv4，Connector 改用对应私网地址；不要求为 Agent Hub 修改已有网络账号、DNS 或策略。
 
 ## 15. 验证标准
 
@@ -724,7 +751,7 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：59 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：82 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
@@ -734,7 +761,7 @@ MVP 完成必须满足：
 - 本机三 Runtime 真实闭环：2026-10-26 使用独立 Hub/Connector 数据目录和随机回环端口，通过真实 Local REST、Admin REST、Connector WebSocket 与 Dashboard WebSocket 注册并触发 Claude、Kimi、Codex 三个 managed Worker。三者分别返回 `AGENT_HUB_CLAUDE_OK`、`AGENT_HUB_KIMI_OK`、`AGENT_HUB_CODEX_OK`；同 Worker 第二次命令分别返回对应的 `_RESUME_OK` 标记，原生 Session ID 均保持不变。六个 Command 全部 `succeeded`，三个 Task 均标记为 `done`，Dashboard 收到全部六个成功事件；重新打开 Hub 数据库后任务和命令结果仍可读取。Codex 使用本机已登录的 `codex-cli 0.164.0`、全新线程和只读沙箱，其稳定注册 ID 与原生线程 ID 按第 10.3 节分别保存。报告位于 `.runtime/local-triad-smoke/result.json`，不含访问令牌；测试后隔离服务已关闭。
 - Agent Skill 与首批注册：2026-10-26 新增 `skills/agent-hub/SKILL.md` 和安全本机安装器，安装器测试覆盖软链接、真实目录、幂等和冲突不覆盖。实际安装到 Kimi/Codex 共享的 `~/.agents/skills` 与 Claude 的 `~/.claude/skills`，当前 Kimi 会话已识别并加载 Skill；`agent-hub` CLI 可从项目外目录使用。通过真实 CLI 在常驻 Connector 注册 `claude-agent-hub-01`、`kimi-agent-hub-01`、`codex-agent-hub-01` 三个新 managed Worker，均在线、空闲且 `push_capable=true`，能力标签和自描述已保存；本次仅注册，未额外调用模型。网页与 Connector 健康检查通过，未修改现有 hooks 或接管交互 Session。
 - Agent 自然语言任务流：新增 Local Token 任务创建、命令派发与事件等待、验收后状态更新；Hub 对 Worker 和 Task 的 Connector 归属做服务端校验。自动化测试覆盖完整任务、超时后继续执行、external 立即返回人工状态、跨 Connector 拒绝、完成时间戳和 CLI 布尔参数。2026-10-26 通过当前 Kimi 按新版 Skill 流程选择 `claude-agent-hub-01`，不使用 Admin Token 或网页表单创建并执行任务，真实回执为 `AGENT_HUB_TASK_OK`，验收后任务更新为 `done`，Worker 恢复空闲。已打开的 Skill 调用如果缓存旧版，需要刷新或重新打开 Session。
-- 当前交互 Session 接入：新增 `session start` 与 `worker register-current`，通过可信环境绑定当前原生 ID，未修改已有 hooks 或接管旧 Session。真实 smoke 使用隔离 Hub/Connector 和全新 Session：Claude 的启动器 ID、注册 ID 与 Hub 恢复 ID 完全一致，交互进程退出后显式选择 managed，返回 `AGENT_HUB_CURRENT_CLAUDE_OK`，任务验收后为 `done`。Kimi 首次暴露出 Web/CLI 对同一 Session 的排他占用，启动器已修正为在打开 CLI 前关闭临时 Server，随后原生启动和 ID 核对通过；当前 Session 默认 external，真实回执为 `waiting_manual`，未宣称支持当前 TUI 主动推送。共享 Web/ACP 桥接和交互并发控制仍未实现。
+- 当前交互 Session 接入：新增 `session start` 与 `worker register-current`，通过可信环境绑定当前原生 ID，未修改已有 hooks 或接管旧 Session。真实 smoke 使用隔离 Hub/Connector 和全新 Session：Claude 的启动器 ID、注册 ID 与 Hub 恢复 ID 完全一致，交互进程退出后显式选择 managed，返回 `AGENT_HUB_CURRENT_CLAUDE_OK`，任务验收后为 `done`。Kimi 首次暴露出 Web/CLI 对同一 Session 的排他占用，启动器已修正为在打开 CLI 前关闭临时 Server，随后原生启动和 ID 核对通过；当时当前 Session 默认 external，真实回执为 `waiting_manual`，未宣称支持当前 TUI 主动推送。后续交互推送改由 10.8 的单连接 ACP 窗口实现。
 - 中央大脑：管理员启用独立 managed `kimi-coordinator-01` 后，通过真实 `--orchestrate` 创建两步依赖任务。协调者生成合法计划并选择 Claude 与 Kimi 执行 Worker，第一步返回 `AGENT_HUB_BRAIN_FIRST_OK`，第二步在依赖完成后返回 `AGENT_HUB_BRAIN_SECOND_OK`，终审全部通过，父任务和两个步骤均为 `done`。真实浏览器中的中央大脑视图已验证协调者、依赖、状态和评审原因，截图保存在 `.runtime/central-brain-dashboard.png`。排查并修复了 Kimi 的心跳、`session_event` 解包和持久化 Session 的 `not_found` 订阅问题：每次执行前 `:reload`，ACK 拒绝立即失败；早期失败和卡住记录保留为 `blocked`/`outcome_unknown`，未改写成成功。
 - 中央对话工作台：2026-10-27 使用独立 Hub/Connector、测试凭证与可控执行器，通过真实 Chrome 验证管理员登录、默认中央页、对话只规划且无执行命令、确认后启动、任务归组、员工实时输出、终审展示、刷新后对话保留及 390px 窄屏；最新完成进展在对话视口内可见，无浏览器脚本异常。截图位于 `.runtime/ui-smoke/`，此结果验证页面与 Hub 流程，不代替真实模型验收。
 - 真实 Kimi 对话闭环：2026-10-27 在隔离 Hub/Connector 中注册两个新的 managed Kimi Session，通过真实 Chrome 先请求只规划，确认计划为 `ready` 且没有执行 Command，再通过对话启动同一计划。执行 Worker 实际返回 `AGENT_HUB_CHAT_UI_OK`，单步与父任务终审均为 `done`；随后验证对话终审、任务状态、员工实际返回、刷新保留及窄屏。结果与截图位于 `.runtime/real-chat-smoke/`，未读写业务文件，未混入正式任务，隔离服务已关闭。正式 Hub 随后已按原 Tailscale 地址和原数据目录重启，健康检查通过，原凭证与 Worker 注册保留；尚未进行第二台 Mac 的跨机验收。
@@ -754,5 +781,8 @@ MVP 完成必须满足：
 - Worker 软注销正式部署与原 external 撤下：2026-10-27 先创建备份 `.runtime/hub/backups/pre-worker-retirement-2026-10-27T12-37-26-011Z.db`，确认无活动工作后按原地址和凭证重启，数据库迁移到 `user_version=6`。通过 `worker unregister worker_3ea75be5de22474bb16981355eb24a4c` 将原 external“有闲 QA · Codex”软注销，默认列表和 @已移除，原 Worker ID 与历史保留；managed“有闲 QA · Codex 执行”仍在线可调度。正式页面升级为 `v=8` 并重载，未删除任务或重发 Token。第二台 Mac 的自注销需更新仓库后复测。
 - Tailscale/Headscale：2026-10-26 按用户明确要求启动现有 Tailscale，使用已保存的 Headscale 配置并保留非默认设置。Hub 已绑定本机 Tailscale IPv4 的 `8787` 端口，本机通过该私网地址完成健康检查和 Dashboard HTTP 200 验证；Connector 已重连，三个 managed Worker 均在线、空闲且可推送。未启用 Funnel，未修改 Headscale 服务端或 ACL，未访问其他机器；跨机注册仍需实际第二台 Mac 验收。公开文档不记录真实私网地址或凭证。
 - Connector 断线自愈、版本握手与常驻服务：2026-10-27 实测 Node 内置 WebSocket 在握手无响应时永久停留 `CONNECTING`、在链路被静默丢弃时永久停留 `OPEN`，均不触发 error/close，与正式 Connector 两次「Hub 可达但不再重连」的现象一致。新增握手超时与应用层 heartbeat 看门狗、断线原因与重连日志、握手交换 git commit、只做 fast-forward 的自更新、launchd 服务安装（`service install|uninstall|status`）和 `agent-hub update`。自动化 68 项全部通过，其中可控 TCP 代理覆盖握手挂起、静默断链、旧 Hub heartbeat 兼容、版本不一致只处理一次和重启等待活动命令；去掉看门狗后两项重连用例按预期失败。自更新用临时 git 仓库覆盖快进、依赖变化安装、脏/分叉跳过和 Hub commit 未发布提示。
+- 常驻服务兼容复核：2026-10-27 在保留上述设计的前提下，修复 launchd 丢失 Kimi/Codex 模型、自动更新开关和自定义 Local 端口的问题；plist 仅继承白名单非密钥配置。68 项自动化、语法/差异检查及 macOS `plutil -lint` 通过。此次仅更新本地代码与隔离验证，未重启正式 Hub、安装本机 launchd 服务或操作第二台 Mac。
+- 任务编号与中央自动修正：2026-10-27 新增持久化 `task_number`（数据库 `user_version=7`）和最多两轮终审修正，失败步骤及其下游保留历史后重做，并关联每轮 review Command。72 项自动化、语法和差异检查通过；真实 Chrome 隔离验证编号搜索、两轮执行、依赖重做、历史证据和移动布局，报告位于 `.runtime/recovery-ui-smoke/browser-result.json`。正式任务 #0004 经两轮修正后，QA 使用完整转交的 28,219 字符材料完成实质审查，开发员工在临时 worktree 对 `720226893` 实跑 61 条测试（60 通过、1 跳过），父任务与两步终审均为 `done`；发现的问题和修复建议尚未落实到业务代码。正式页面升级为 `v=9` 并重载，部署前备份为 `.runtime/hub/backups/pre-task-recovery-2026-10-27T14-47-16-151Z.db` 与 `.runtime/hub/backups/pre-material-recovery-2026-10-27T14-56-50-391Z.db`，未清理历史或修改业务仓库。
+- AWS 公网正式迁移：2026-10-28 将唯一正式 Hub 部署到 AWS `findu-staging-router`，systemd 以无登录账户运行，Caddy 提供 `https://hub.findu.work` 的 HTTPS/WSS，8787 仍只绑定服务器回环地址。空环境完成公网 Connector 握手与断线重连，本机和 AWS 各通过 72 项自动化及语法检查。确认无活动工作后停止旧 Hub，以 SQLite 一致性快照和原凭证迁移 3 个 Connector、8 个 Worker（含 1 个已撤下）、6 个历史任务、对话和中央协调者配置；迁移前后 ID、任务编号和凭证保持一致。三台 Mac 已改为 launchd 并通过公网重连，Mac mini 的旧 `com.xemaya.agent-hub.connector` 已禁用，避免双 Connector 抢端口。重启 AWS Hub 后三台均自动恢复在线；真实任务 #0007 由 Codex 返回 `AGENT_HUB_AWS_OK` 并经中央终审完成，直接 @Codex 返回 `AGENT_HUB_DIRECT_OK` 且未创建额外任务，Dashboard WSS 验证通过，结果位于 `.runtime/aws-migration/e2e-result.json`。迁移快照与原 Hub 数据目录保留用于回滚，未开放公网 8787、未修改 Headscale 账号或策略。
 - Claude 交互窗口实时推送：2026-10-27 新增 `session start --push/--resume`、`agent-hub channel` MCP 服务、Connector SSE 接通与投递、`worker.channel` 协议和可推送 external 员工的 @/直接问答。自动化 74 项全部通过，覆盖 MCP 握手与工具、接通前 `waiting_manual` 不转推、投递与回执、重复回执拒绝、执行中关窗为 `outcome_unknown`、先开窗后注册、Connector 重启后重新接通、managed 拒绝接通和启动器参数。真实验证使用隔离 Hub/Connector（18787/18788）与 Claude Code 2.1.311 交互 TUI：启动器打开窗口、开发版 Channel 横幅出现、register-current 后 Hub 显示可推送，Admin 派发的命令以 `← agent-hub:` 送入窗口，Claude 调用 ack 与 report，命令 14 秒内 `succeeded`，结果 `CHANNEL_E2E_OK` 且 `delivery=channel`。首轮未在正文重申回执要求时，模型只在终端作答而未调用 report，因此改为每条消息附带回执提示。`--mcp-config` 提供的服务器会让横幅提示 `no MCP server configured with that name`，但不影响送达。隔离服务已清理，正式 Hub/Connector 未参与。
-
+- Kimi ACP 交互窗口实时推送：2026-10-28 先实测共享 Web Server 虽能返回成功回执，但原生 TUI 只有手动 `/reload` 后才能看到外部结果，因此未把该路径当作交互验收通过；改为用户与 Hub 共用单条 ACP 连接，保留 Session 锁且不调用 `:takeover`。82 项自动化、语法和差异检查通过。真实 Kimi 2.3.3 ACP 窗口连续返回 `KIMI_ACP_CHANNEL_OK_1` 与 `KIMI_ACP_RESUME_OK`，三条 Hub Command 均 `succeeded`、`delivery=channel`、`outcome_unknown=false`；`--resume` 后原生 Session ID 不变，用户直接输入返回 `KIMI_ACP_MANUAL_OK` 且不产生额外 Hub Command。窗口退出后 `push_capable=false`，证据位于 `.runtime/kimi-acp-smoke/`，隔离服务已清理。

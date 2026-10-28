@@ -15,57 +15,23 @@
 
 ## 前置条件
 
-- macOS（当前验证环境），Node.js **22.5+**，pnpm。
-- 多机接入时，各机器已安装并连接同一个 Tailscale/Headscale 网络。
+- Worker Mac：macOS、Node.js **22.5+**、pnpm。
+- Hub：已在 Amazon Linux 2023 上验证；开发时也可在 macOS 运行。
 - 使用 managed Worker 时，相应的 Claude、Kimi 或 Codex CLI 已安装并完成自己的模型鉴权。
-- 中控机器的 Headscale 策略允许其他节点访问其 TCP `8787` 端口。
 
-本工具不会替代各 Runtime 的登录，也不会自动配置 Tailscale 或 Headscale。
+本工具不会替代各 Runtime 的登录。公网接入不要求 Tailscale/Headscale，也不会自动修改已有网络配置。
 
 ## 其他 Mac：接入已有中控
 
-以下假设中控地址为 `http://<中控TailscaleIPv4>:8787`。在中控机器上执行 `tailscale ip -4` 可查看地址；用实际地址替换占位符，不要照抄尖括号。
+正式 Hub 地址为 `https://hub.findu.work`。管理员使用其他部署时，以管理员提供的 HTTPS 地址为准。
 
-### 1. 安装并连接私网
-
-先检查是否已经安装：
+### 1. 验证 Hub
 
 ```bash
-command -v tailscale
-tailscale status
+curl --fail --silent --show-error --max-time 10 "https://hub.findu.work/healthz"
 ```
 
-如果命令不存在，不要继续启动 Connector。macOS 推荐使用 Tailscale 官方 Standalone 安装包：<https://tailscale.com/download/mac>。已有 Homebrew 时也可以执行：
-
-```bash
-brew install --cask tailscale-app
-open -a Tailscale
-```
-
-首次启动需要用户在 macOS 图形界面中允许系统扩展和 VPN 配置。不要同时安装 Standalone 和 App Store 两个版本；没有 Homebrew 时使用官方安装包，不必为了 Agent Hub 安装 Homebrew。如果 App 已安装但终端仍找不到命令，可用 `/Applications/Tailscale.app/Contents/MacOS/Tailscale` 代替下面的 `tailscale`。
-
-确认这台 Mac **尚未加入其他 Tailscale/Headscale 网络**后，使用管理员提供的控制服务器地址登录：
-
-```bash
-tailscale up --login-server="https://<你的Headscale地址>"
-```
-
-浏览器会打开登录或节点注册页面。若页面给出 `headscale auth register --user <USER> --auth-id <AUTH_ID>`，将注册信息交给中控管理员，由管理员在 Headscale 服务端批准；不要把 Auth ID 当成长期凭证，也不要在 Worker Mac 上假装已经批准。需要新建用户或使用 pre-auth key 时，也由管理员处理并通过安全方式传递。
-
-**已有另一个账号或控制服务器时不要直接执行上面的登录命令。** 先报告 `tailscale switch --list` 和 `tailscale debug prefs` 中的 `ControlURL`，由管理员决定授权或接入方式。普通账号切换不能同时连接两个网络；不要擅自 `logout`、`switch` 或使用 `--reset`。
-
-连接成功后验证：
-
-```bash
-tailscale status
-tailscale ip -4
-tailscale ping --c 2 "<中控TailscaleIPv4>"
-curl --fail --silent --max-time 10 "http://<中控TailscaleIPv4>:8787/healthz"
-```
-
-只有 Hub 健康检查成功后才继续。已有非默认 Tailscale 设置时，按 CLI 提示显式保留；不要使用 Funnel 暴露 Agent Hub。
-
-同时开着 Clash Verge 等 TUN 代理（fake-ip DNS）时，Tailscale 默认的「Use Tailscale DNS settings」会接管系统 DNS，导致境外站点解析失败。这种机器执行 `tailscale set --accept-dns=false`（或在菜单中取消该项）；Agent Hub 只用私网 IP，不依赖 MagicDNS。
+健康检查成功后再继续。Connector 只向 Hub 发起出站连接，Worker Mac 不需要开放入站端口，也不需要安装 Tailscale。
 
 ### 2. 克隆并安装依赖
 
@@ -86,7 +52,7 @@ read -s -p "Enrollment Token: " AGENT_HUB_ENROLLMENT_TOKEN; echo
 export AGENT_HUB_ENROLLMENT_TOKEN
 
 node bin/agent-hub.js connector \
-  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --hub-url "https://hub.findu.work" \
   --name "<这台Mac的名称>" \
   --data-dir "$HOME/.agent-hub/connector"
 ```
@@ -101,13 +67,13 @@ Connector 的本地 API 默认只监听 `127.0.0.1:8788`，其他机器不需要
 
 ```bash
 node bin/agent-hub.js service install \
-  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --hub-url "https://hub.findu.work" \
   --name "<这台Mac的名称>" \
   --data-dir "$HOME/.agent-hub/connector"
 agent-hub service status
 ```
 
-服务开机自启、异常退出自动拉起，日志写入 `~/.agent-hub/connector.log`；plist 只记录地址与数据目录，不含任何 Token。安装时会记下当前 shell 的 `PATH`，保证 managed Worker 能找到 `claude`、`kimi`、`codex`；这些 CLI 换了安装位置后重新执行一次 `service install`。卸载用 `agent-hub service uninstall`。
+服务开机自启、异常退出自动拉起，日志写入 `~/.agent-hub/connector.log`；plist 只记录地址、数据目录和非密钥运行配置，不含任何 Token。安装时会记下当前 shell 的 `PATH`，保证 managed Worker 能找到 `claude`、`kimi`、`codex`；已设置的 `AGENT_HUB_KIMI_MODEL`、`AGENT_HUB_CODEX_MODEL` 和 `AGENT_HUB_AUTO_UPDATE` 也会保留。自定义本地端口时在安装命令中传入同一个 `--local-port`。这些配置变化后重新执行一次 `service install`。卸载用 `agent-hub service uninstall`。
 
 Connector 会自己维持连接：握手 20 秒内未完成、或已连接时 heartbeat 10 秒无应答，都会主动断开重连，不再依赖系统上报断线。
 
@@ -115,7 +81,7 @@ Connector 会自己维持连接：握手 20 秒内未完成、或已连接时 he
 
 Hub 与 Connector 在握手时交换各自的 git commit（`/healthz` 和 Admin `GET /api/v1/connectors` 也能看到）。发现与 Hub 不一致时，Connector 会 `git fetch` 并把自己的检出快进到上游；`package.json` 或 `pnpm-lock.yaml` 有变化时执行 `pnpm install --frozen-lockfile`。作为服务运行时，等正在执行的 managed 命令结束后自动重启加载新代码；前台运行时只提示手动重启。
 
-只做 fast-forward：本地有未提交修改、领先或分叉于上游时不动代码，只在日志中说明原因。如果 Hub 运行的是尚未推送到 GitHub 的 commit，日志会提示先更新 Hub 机器。关闭自动更新：启动参数 `--no-auto-update` 或环境变量 `AGENT_HUB_AUTO_UPDATE=0`。任何机器都可以手动执行 `agent-hub update`，Hub 更新后需重启 Hub 进程。
+只做 fast-forward：本地有未提交修改、领先或分叉于上游时不动代码，只在日志中说明原因。如果 Hub 运行的是尚未推送到 GitHub 的 commit，日志会提示先更新 Hub 机器。Hub 只触发更新检查，实际代码来自 Connector 本机配置的 Git upstream；该 upstream 属于信任边界，因为更新后会运行其中的新代码。开发检出或不允许自动变更的机器应通过启动参数 `--no-auto-update` 或环境变量 `AGENT_HUB_AUTO_UPDATE=0` 关闭自动更新。任何机器都可以手动执行 `agent-hub update`，Hub 更新后需重启 Hub 进程。
 
 ### 4. 安装 Skill 和全局 CLI
 
@@ -162,9 +128,9 @@ agent-hub session start --runtime codex --cwd /path/to/project
 
 Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。Agent 会执行 `worker register-current`，从启动器环境或 Codex 原生工具环境取得真实 ID，你不需要再提供 `--session-id`。重复注册同一个原生 ID 会复用 Worker。
 
-当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`：Claude/Codex 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt；Kimi CLI 与 Web Server 对同一 Session 有排他占用，不能用第二个 Web Server 接管当前 CLI 窗口，当前交互主动推送需要后续的共享 Web/ACP 桥接。
+当前交互窗口默认登记为 **external**，不会虚报主动推送。只有明确要求主动执行，并确认交互实例已退出或 Runtime 支持共享时，才使用 `--mode managed`。Claude/Codex 可以在交互进程退出后按同一 ID 恢复，但不要同时手动发送另一条 Prompt。普通 Kimi TUI 与 Web Server 不能实时共享输入；需要 Kimi 交互推送时，使用下面的 ACP `--push` 启动器。
 
-#### 方式 A+：让中控直接把任务推进打开的 Claude 窗口
+#### 方式 A+：让中控直接把任务推进 Claude/Kimi 交互窗口
 
 Claude Code 可以加 `--push` 打开，中控派来的任务和 @ 提问会直接出现在这个交互窗口里，Claude 做完后把结果交回中控：
 
@@ -183,7 +149,17 @@ agent-hub session start --runtime claude --push --resume <session-id> --cwd /pat
 - 这是 Claude Code 的研究预览功能，需要 claude.ai 或 Console 登录；Team/Enterprise 组织要由管理员开启 Channels。每次启动都会弹一次开发版警告。
 - 任务执行中关闭窗口，命令记为 `failed` 且 `outcome_unknown=true`，不会自动重跑。
 - 工具权限确认仍只在终端里出现，暂未转到中控；中央大脑的自动拆解只派给 managed 员工，不会自动往你的交互窗口塞步骤。
-- 只支持 Claude。Kimi 需要共享 Web/ACP 桥接，Codex 需要 app-server 适配，后续再做。
+
+Kimi 使用同一启动方式，已在 Kimi Code **2.3.3** 验证：
+
+```bash
+agent-hub session start --runtime kimi --push --cwd /path/to/project
+agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/to/project
+```
+
+启动器打开的是轻量 **ACP 交互窗口**，不是 Kimi 原生全屏 TUI。用户输入与 Hub 命令共用一条 ACP 连接和同一个原生 Session，命令串行执行；正常回复由桥接自动回传，不需要模型调用回执工具。权限询问也在这个窗口处理。输入 `/exit` 退出，退出后自动退回 `waiting_manual`。该路径不关闭 Session 锁、不调用 `:takeover`，也不需要常驻 Web Server；Kimi `--push` 不接受 `--` 后的 Runtime 参数。
+
+Codex 交互推送仍需要 app-server 适配。
 
 未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 
@@ -251,7 +227,7 @@ Claude/Kimi 使用启动器身份，Codex 使用原生 `CODEX_SESSION_ID`，不�
 
 ```bash
 agent-hub worker unregister WORKER_ID \
-  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --hub-url "https://hub.findu.work" \
   --hub-data-dir .runtime/hub
 ```
 
@@ -299,10 +275,10 @@ agent-hub task update --local TASK_ID --status done \
   --data-dir "$HOME/.agent-hub/connector"
 ```
 
-打开 `http://<中控TailscaleIPv4>:8787/`，输入中控的 Admin Token。工作台有两个视图：
+打开 `https://hub.findu.work/`，输入中控的 Admin Token。工作台有两个视图：
 
 - **操作台**：中央对话与数字员工。员工默认只显示状态、名称、一句简介和 `@`，点击条目展开能力、当前工作和真实输出；栏目标题在列表滚动时保持固定。
-- **任务看板**：默认展示全部总任务，可按状态筛选。卡片区分等待开始、正在验收、验收未通过和已完成，点击“查看结果 / 计划 / 进展”打开详情。
+- **任务看板**：每个任务显示稳定的 `#0001` 编号，默认展示全部总任务，可按状态或编号查找。卡片区分等待开始、正在验收、验收未通过和已完成，点击“查看结果 / 计划 / 进展”打开详情。
 
 完成任务的详情优先展示完整交付正文和整体验收结论，支持 Markdown 阅读、单步复制和复制全部结果；执行过程默认收起。结果由 Agent 以不可信文本返回，页面不会渲染其中的原始 HTML 或危险链接。对话只保留简明进展和下一步，不用截断的执行日志代替交付。
 
@@ -381,7 +357,7 @@ agent-hub orchestration list --local \
 - 一步能完成就不硬拆，最多 4 步，依赖不能成环。
 - 命令成功后步骤先进入 `review`，终审明确通过才进入 `done`。
 - 执行失败会进入 `blocked`；计划无效或证据不足会进入 `blocked` 或 `review`，不会自动完成。
-- 每个编排只有一次规划和一次终审，不自动重试或扩写计划。终审只根据返回证据判断，不虚构独立测试。
+- 每个编排只有一次初始规划，不自动扩写计划。终审明确不通过且能定位失败步骤时，中央大脑最多自动修正两轮：重做失败步骤及依赖其结果的后续步骤，保留上轮证据后再终审；仍不通过会明确停止并提示下一步。执行失败或无法定位修正目标时不盲目重试。
 - 中控在同一个页面显示管理员对话、可 @ 的数字员工和按总目标归组的任务。任务详情在弹层中展示；对话、引用、关联任务和计划保存在 Hub，刷新后仍可查看。
 
 ### 清理历史，保留团队接入
@@ -390,7 +366,7 @@ agent-hub orchestration list --local \
 
 ```bash
 agent-hub history clear --yes \
-  --hub-url "http://<中控TailscaleIPv4>:8787" \
+  --hub-url "https://hub.findu.work" \
   --hub-data-dir .runtime/hub
 ```
 
@@ -400,29 +376,47 @@ agent-hub history clear --yes \
 
 Kimi Driver 会在每次执行前通过官方 `:reload` 恢复持久化 Session 的活动状态，回复应用层 `ping` 的相同 `nonce` `pong`，解包 `session_event`，并处理 `turn.ended` 与 `prompt.completed`。订阅 ACK 返回 `not_found` 时会立即失败，而不是无限等待。`AGENT_HUB_KIMI_DEBUG=1` 可输出事件类型和 ACK 诊断（不含 Token），默认关闭。
 
-## 部署新的中控
+## 部署中控
 
-通常只需一台中控机器。不要在每台 Worker Mac 上重复启动 Hub。
+整个团队只运行一个 Hub，不要在每台 Worker Mac 上重复启动。
 
-在中控机器完成克隆和依赖安装后：
+### 正式公网部署
 
-```bash
-tailscale ip -4
-node bin/agent-hub.js hub \
-  --host <本机TailscaleIPv4> \
-  --port 8787 \
-  --data-dir .runtime/hub
+当前 Hub 在 AWS `findu-staging-router`（Amazon Linux 2023）运行，中央大脑仍是本机 Mac 上的 managed Kimi Worker；服务器不需要模型账号或 Runtime 凭证。
+
+- 代码与隔离的 Node 24 LTS：`/opt/agent-hub/app`、`/opt/agent-hub/node`。
+- systemd：`agent-hub-hub.service`，以无登录权限的 `agent-hub` 账户运行，开机自启。
+- 持久化：`/var/lib/agent-hub/hub`，数据库与凭证均为 `0600`。
+- Hub 仅监听 `127.0.0.1:8787`，不对公网开放该端口。
+- Caddy 将 `https://hub.findu.work` 反向代理到回环地址，并自动维护 TLS 证书；Connector 使用同一域名的 WSS。公网只需开放 80/443。
+
+Caddy 站点配置为：
+
+```caddy
+hub.findu.work {
+  reverse_proxy 127.0.0.1:8787
+}
 ```
 
-首次启动会生成 Admin Token 和 Enrollment Token，并写入 `.runtime/hub/credentials.json`。保护好这个文件，不要提交或公开。
-
-另开终端，按上面的 Connector 步骤启动本机 Connector，将 `--name` 改为本机名称，`--hub-url` 指向同一 Tailscale 地址。随后运行安装器：
+服务器管理通过 AWS SSM，不依赖开放 SSH。修改 Caddy 前备份 `/opt/caddy/Caddyfile`，先执行 `docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`，通过后再 reload。Headscale 只保留为管理通道和可选私网，不是 Worker 接入 Hub 的前置条件。
 
 ```bash
-node scripts/install-local.js --connector-data-dir "$HOME/.agent-hub/connector"
+systemctl status agent-hub-hub.service
+curl --fail --silent http://127.0.0.1:8787/healthz
+curl --fail --silent https://hub.findu.work/healthz
 ```
 
-本机开发不使用 Tailscale 时，也可让 Hub 绑定 `127.0.0.1`，其他机器则不能通过该地址接入。
+迁移或清理前确认没有活动工作，通过 `HubStore.backup()` 创建 SQLite 一致性快照，不能只复制仍在写入的 db/WAL 文件。数据库与 `credentials.json` 必须一起迁移，才能保留 Worker/Connector 身份和网页登录 Token。凭证不得出现在 SSM 参数、命令日志、聊天、Git 或公网对象存储中。切换期间保持单写者，旧 Hub 不得同时接任务。
+
+### 本机或私网部署
+
+开发时绑定回环地址：
+
+```bash
+node bin/agent-hub.js hub --host 127.0.0.1 --port 8787 --data-dir .runtime/hub
+```
+
+首次启动会生成 Admin Token 和 Enrollment Token，保护好数据目录。其他机器无法通过回环地址接入。使用既有 Headscale 私网时，可显式绑定本机 Tailscale IPv4，并让 Connector 使用该私网地址；不启用 Funnel，不修改现有网络账号或策略。
 
 ## 验证
 
@@ -432,13 +426,13 @@ pnpm test
 pnpm check
 ```
 
-已验证真实 Claude、Kimi、Codex 的本机注册、任务推送、结果回传和会话续接。其他 Mac 的实际接入仍需按上述流程在对应机器上验证。
+已验证真实 Claude、Kimi、Codex 的注册、任务推送、结果回传和会话续接。正式公网部署已完成三台 Mac 接入、Hub 重启自动重连、中央大脑派发与终审、直接 @Worker 问答和 Dashboard WebSocket 验收。
 
 ## 当前边界
 
-- 不接管任意已打开的 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。
-- external Worker 只提供人工协作登记，命令为 `waiting_manual`。
-- 当前交互 Session 默认 external；主动执行不是向 TUI 模拟输入。Kimi CLI 与 Web Server 对同一 Session 有排他占用，当前 Kimi 交互主动推送需要共享 Web/ACP 桥接，尚未实现。
+- 不接管任意已打开的原生 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。Claude 交互推送使用原生 Channel，Kimi 交互推送使用启动器提供的 ACP 窗口。
+- 未接通的 external Worker 只提供人工协作登记，命令为 `waiting_manual`；只有 `--push` 窗口在线时才可主动推送。
+- 当前交互 Session 默认 external；主动执行不是向 TUI 模拟输入。普通 Kimi TUI 仍需通过 `--push` 改为 ACP 交互窗口，不能用第二个 Web Server 接管。
 - 中央大脑需管理员显式启用，规划和终审都有边界；不包含无限重试、自由群聊或 Worker 自主跨机互派。普通任务仍可由调用 Skill 的 Agent 选择本机 Worker。
-- Hub 的 HTTP 传输位于 Tailscale 加密私网内，但仍必须使用 Admin/Connector/Local Token，并建议通过 Headscale Grants 限制可访问节点和端口。
-- 不启用 Funnel，不默认放开模型工具权限，不把 Runtime 数据目录或凭证作为网页静态资源公开。
+- 公网传输使用 HTTPS/WSS 和应用层 Admin/Connector/Local Token；TLS 不替代权限校验。不得把 8787 直接暴露公网，Headscale 可继续用于管理和私网备用通道。
+- 不默认放开模型工具权限，不把 Runtime 数据目录或凭证作为网页静态资源公开。

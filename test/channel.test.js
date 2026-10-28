@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { PassThrough } from 'node:stream';
 import path from 'node:path';
 import { ChannelServer } from '../src/channel.js';
+import { KimiChannel } from '../src/kimi-channel.js';
 import { startSession } from '../src/session-launcher.js';
 import { createTestContext, waitFor } from './helpers.js';
 import { EventEmitter } from 'node:events';
@@ -138,6 +139,8 @@ test('A channel opened before registration attaches once the Session registers, 
   await channel.server.start();
   await waitFor(() => channel.server.state === 'waiting_registration');
   const worker = await context.registerWorker({ name: 'late', runtime: 'claude', mode: 'external', runtime_session_id: 'live-late' });
+  assert.equal(worker.push_capable, true);
+  assert.equal(context.connector.store.getWorker(worker.worker_id).push_capable, true);
   await waitFor(() => channel.server.state === 'attached');
   await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === true);
 
@@ -155,6 +158,78 @@ test('Managed Workers cannot be driven through an interactive channel', async (t
   t.after(() => channel.close());
   await channel.server.start();
   await waitFor(() => channel.server.state === 'rejected');
+});
+
+test('Kimi Channel drives the same external Session and preserves output gaps', async (t) => {
+  const context = await createTestContext(t);
+  const worker = await context.registerWorker({ name: 'live-kimi', runtime: 'kimi', mode: 'external', runtime_session_id: 'live-kimi-1' });
+  const executions = [];
+  const driver = {
+    async execute(input) {
+      executions.push(input);
+      await input.onState({ started: true, prompt_id: input.command.command_id });
+      return { text: 'Kimi Channel result', session_id: 'live-kimi-1', output_gap: true };
+    },
+  };
+  const channel = new KimiChannel({
+    connectorUrl: context.connector.localUrl,
+    token: context.connector.store.credentials.localToken,
+    sessionId: 'live-kimi-1',
+    driver,
+    retryMs: 50,
+  });
+  t.after(() => channel.stop());
+  channel.start();
+  await waitFor(() => channel.state === 'attached');
+  await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === true);
+
+  const created = await context.admin('/api/v1/commands', { method: 'POST', body: { worker_id: worker.worker_id, input: 'answer in this window' } });
+  const commandId = created.payload.command.command_id;
+  const finished = await waitFor(async () => {
+    const { payload } = await context.admin(`/api/v1/commands/${commandId}`);
+    return payload.command.status === 'succeeded' && payload.command;
+  });
+  assert.equal(executions.length, 1);
+  assert.equal(executions[0].worker.runtime_session_id, 'live-kimi-1');
+  assert.deepEqual(executions[0].command, { command_id: commandId, kind: 'prompt', input: 'answer in this window' });
+  assert.equal(finished.result.text, 'Kimi Channel result');
+  assert.equal(finished.result.delivery, 'channel');
+  assert.equal(finished.result.output_gap, true);
+  assert.match(finished.output_text, /accepted by the interactive session/);
+
+  channel.stop();
+  await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === false);
+  const later = await context.admin('/api/v1/commands', { method: 'POST', body: { worker_id: worker.worker_id, input: 'after close' } });
+  assert.equal(later.payload.command.status, 'waiting_manual');
+});
+
+test('Kimi Channel reports occupied or failed execution without a takeover', async (t) => {
+  const context = await createTestContext(t);
+  const worker = await context.registerWorker({ name: 'busy-kimi', runtime: 'kimi', mode: 'external', runtime_session_id: 'live-kimi-busy' });
+  const driver = {
+    async execute() {
+      throw Object.assign(new Error('Session is occupied by another client'), { code: 40931 });
+    },
+  };
+  const channel = new KimiChannel({
+    connectorUrl: context.connector.localUrl,
+    token: context.connector.store.credentials.localToken,
+    sessionId: 'live-kimi-busy',
+    driver,
+    retryMs: 50,
+  });
+  t.after(() => channel.stop());
+  channel.start();
+  await waitFor(() => channel.state === 'attached');
+  const created = await context.admin('/api/v1/commands', { method: 'POST', body: { worker_id: worker.worker_id, input: 'do not steal this session' } });
+  const commandId = created.payload.command.command_id;
+  const failed = await waitFor(async () => {
+    const { payload } = await context.admin(`/api/v1/commands/${commandId}`);
+    return payload.command.status === 'failed' && payload.command;
+  });
+  assert.equal(failed.outcome_unknown, false);
+  assert.equal(failed.error.code, 'reported_failure');
+  assert.match(failed.error.message, /occupied/);
 });
 
 test('Claude push launcher wires the channel config, tool allowance and native identity', async (t) => {
@@ -187,5 +262,5 @@ test('Claude push launcher wires the channel config, tool allowance and native i
   assert.equal(config.mcpServers['agent-hub'].command, '/opt/node');
   assert.deepEqual(config.mcpServers['agent-hub'].env, { AGENT_HUB_RUNTIME: 'claude', AGENT_HUB_SESSION_ID: 'resume-me' });
   assert.equal(calls[0].options.env.AGENT_HUB_SESSION_ID, 'resume-me');
-  await assert.rejects(startSession({ runtime: 'codex', push: true, spawn: fakeChild }), /only supported for claude/);
+  await assert.rejects(startSession({ runtime: 'codex', push: true, spawn: fakeChild }), /only supported for claude or kimi/);
 });

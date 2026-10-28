@@ -89,6 +89,14 @@ function taskStatus(entry) {
   return entry.orchestration?.status ?? entry.task.status;
 }
 
+function taskRef(task) {
+  return Number.isInteger(task.task_number) ? `#${String(task.task_number).padStart(4, '0')}` : '';
+}
+
+function taskName(task) {
+  return [taskRef(task), task.title].filter(Boolean).join(' · ');
+}
+
 function taskBadge(entry) {
   const status = taskStatus(entry);
   if (status === 'review' && entry.orchestration) {
@@ -151,20 +159,25 @@ function taskStage(entry) {
     : '已经记录，等待制定计划。';
   if (status === 'in_progress') {
     const running = orchestration.steps.find((step) => step.status === 'running');
-    if (running) return `${running.worker_name ?? '数字员工'} 正在执行「${running.title}」`;
-    if (orchestration.steps.some((step) => step.status === 'ready')) return '正在等待前置步骤完成，或合适的员工空闲。';
+    if (running) return `${orchestration.recovery_count ? '修正中 · ' : ''}${running.worker_name ?? '数字员工'} 正在执行「${running.title}」`;
+    if (orchestration.steps.some((step) => step.status === 'ready')) {
+      return orchestration.recovery_count
+        ? '中央大脑已根据终审意见安排修正，正在等待前置步骤或员工。'
+        : '正在等待前置步骤完成，或合适的员工空闲。';
+    }
     return '执行结果正在汇集，准备核对验收。';
   }
   if (status === 'review') return orchestration.error
-    ? `验收未通过：${orchestration.error.message}。任务尚未完成。`
+    ? `${orchestration.recovery_count ? '自动修正后仍未通过' : '验收未通过'}：${orchestration.error.message}。可在对话中 @任务 补充信息或调整验收。`
     : '执行结果已返回，中央大脑正在核对每一步与整体验收。';
   if (status === 'blocked') return `未完成：${orchestration.error?.message ?? '存在未解决的问题'}。不会自动重试。`;
   if (status === 'done') {
     const count = deliverableSteps(entry).length;
     const criteria = task.acceptance.length;
+    const recovery = orchestration.recovery_count ? ` · 经 ${orchestration.recovery_count} 轮修正` : '';
     return count
-      ? `${count} 项交付结果${criteria ? ` · ${criteria} 条整体验收通过` : ' · 终审通过'}`
-      : `终审通过${criteria ? ` · ${criteria} 条整体验收符合要求` : ''}`;
+      ? `${count} 项交付结果${criteria ? ` · ${criteria} 条整体验收通过` : ' · 终审通过'}${recovery}`
+      : `终审通过${criteria ? ` · ${criteria} 条整体验收符合要求` : ''}${recovery}`;
   }
   return task.status;
 }
@@ -218,12 +231,13 @@ function renderTaskDetail(entry) {
           <span class="step-index">${String(index + 1).padStart(2, '0')}</span>
           <div class="step-body">
             <div class="step-title"><h4>${escapeHtml(step.title)}</h4>${badge(step.status, step.status === 'review' ? '等待验收' : undefined)}</div>
-            <p class="step-owner">${escapeHtml(step.worker_name ?? '等待匹配员工')}${step.depends_on.length
+            <p class="step-owner">${escapeHtml(step.worker_name ?? '等待匹配员工')}${(step.attempt ?? 1) > 1 ? ` · 第 ${step.attempt} 次执行` : ''}${step.depends_on.length
               ? ` · 需先完成 ${escapeHtml(step.depends_on.map((key) => stepTitles.get(key) ?? key).join('、'))}`
               : ''}</p>
             <p>${escapeHtml(step.goal)}</p>
             ${step.rationale ? `<p class="step-rationale">为什么交给 TA：${escapeHtml(step.rationale)}</p>` : ''}
             ${step.error?.message ? `<p class="inline-error">${escapeHtml(step.error.message)}</p>` : ''}
+            ${(step.previous_attempts ?? []).map((attempt) => `<details class="evidence previous-attempt"><summary>第 ${attempt.attempt ?? 1} 次执行结果</summary>${attempt.review?.reason ? `<p class="review-note ${attempt.review.pass ? '' : 'rejected'}">${attempt.review.pass ? '上轮验收通过' : '上轮验收未通过'}：${escapeHtml(attempt.review.reason)}</p>` : ''}${renderMarkdown(resultText(attempt.result))}</details>`).join('')}
             ${step.review?.reason ? `<p class="review-note ${step.review.pass ? '' : 'rejected'}">${step.review.pass ? '验收通过' : '验收未通过'}：${escapeHtml(step.review.reason)}</p>` : ''}
             ${!complete && resultText(step.result).trim() ? `<details class="evidence" open><summary>此步实际返回</summary>${renderMarkdown(resultText(step.result))}</details>` : ''}
           </div>
@@ -265,10 +279,11 @@ function renderTaskCard(entry) {
   const { task, orchestration } = entry;
   const group = taskGroup(entry);
   const steps = orchestration?.steps ?? [];
+  const category = orchestration ? orchestration.auto_start ? '中央编排' : '对话计划' : '独立任务';
   return `
     <article class="task-card task-${group}" data-task-card="${escapeHtml(task.task_id)}">
       <div class="task-heading">
-        <div><p class="section-index">${orchestration ? orchestration.auto_start ? '中央编排' : '对话计划' : '独立任务'}</p><h3>${escapeHtml(task.title)}</h3></div>
+        <div><p class="section-index">${[taskRef(task), category].filter(Boolean).join(' · ')}</p><h3>${escapeHtml(task.title)}</h3></div>
         ${taskBadge(entry)}
       </div>
       ${task.goal ? `<p class="task-goal">${escapeHtml(clip(task.goal))}</p>` : ''}
@@ -286,7 +301,7 @@ function renderInlineTask(taskId) {
   return `
     <article class="chat-task ${complete ? 'is-complete' : ''}" data-inline-task="${escapeHtml(taskId)}">
       <div class="chat-task-top"><span>${complete ? '任务完成' : '工作进展'}</span>${taskBadge(entry)}</div>
-      <button class="chat-task-title" type="button" data-task-detail="${escapeHtml(taskId)}">${escapeHtml(entry.task.title)}</button>
+      <button class="chat-task-title" type="button" data-task-detail="${escapeHtml(taskId)}">${escapeHtml(taskName(entry.task))}</button>
       <p class="chat-task-stage">${escapeHtml(taskStage(entry))}</p>
       ${renderProgress(entry)}
       ${taskActions(taskId)}
@@ -369,11 +384,11 @@ function mentionCandidates() {
     status: labels[worker.activity?.phase] ?? labels[worker.work_state] ?? worker.work_state,
   }));
   const tasks = taskEntries().filter((entry) => (
-    matches(entry.task.title, entry.task.goal, entry.task.task_id)
+    matches(taskRef(entry.task), entry.task.title, entry.task.goal, entry.task.task_id)
   )).sort((a, b) => rank(a.task.title) - rank(b.task.title)).slice(0, 6).map((entry) => ({
     type: 'task',
     id: entry.task.task_id,
-    label: entry.task.title,
+    label: taskName(entry.task),
     secondary: clip(entry.task.goal || '没有补充目标', 100),
     status: labels[taskStatus(entry)] ?? taskStatus(entry),
   }));
@@ -584,7 +599,7 @@ function renderChat(forceScroll = false) {
     if (message.role === 'activity') {
       const phase = message.source_key?.endsWith(':completed')
         ? 'completed'
-        : message.source_key?.endsWith(':blocked') || message.source_key?.endsWith(':review-required')
+        : message.source_key?.endsWith(':blocked') || message.source_key?.includes(':review-required')
           ? 'attention'
           : '';
       const label = phase === 'completed' ? '任务完成' : phase === 'attention' ? '需要处理' : '任务进展';
@@ -730,7 +745,7 @@ function renderTaskDialog() {
   const expanded = new Map(preserve
     ? [...content.querySelectorAll('details')].map((element, index) => [detailKey(element, index), element.open])
     : []);
-  $('#task-dialog-title').textContent = entry.task.title;
+  $('#task-dialog-title').textContent = taskName(entry.task);
   $('#task-dialog-status').innerHTML = taskBadge(entry);
   content.innerHTML = renderTaskDetail(entry);
   [...content.querySelectorAll('details')].forEach((element, index) => {
@@ -956,7 +971,7 @@ function taskResultCopy(taskId, stepTaskId = null) {
   const steps = deliverableSteps(entry).filter((step) => !stepTaskId || step.task_id === stepTaskId);
   if (stepTaskId) return steps.length ? resultText(steps[0].result) : '';
   return [
-    `# ${entry.task.title}`,
+    `# ${taskName(entry.task)}`,
     entry.orchestration?.review_reason ? `整体验收：${entry.orchestration.review_reason}` : '',
     ...steps.map((step, index) => `## ${index + 1}. ${step.title}\n负责人：${step.worker_name ?? '数字员工'}\n\n${resultText(step.result)}`),
   ].filter(Boolean).join('\n\n');
@@ -996,7 +1011,7 @@ async function startTask(taskId) {
   if (!entry || entry.orchestration?.status !== 'ready' || !entry.orchestration.steps.length || state.sending) return;
   setView('operations');
   if ($('#task-dialog').open) $('#task-dialog').close();
-  await sendChatMessage(`@${entry.task.title} 开始执行，只启动这份已有计划。`, {
+  await sendChatMessage(`@${taskName(entry.task)} 开始执行，只启动这份已有计划。`, {
     mentions: [{ type: 'task', id: taskId }],
   });
 }

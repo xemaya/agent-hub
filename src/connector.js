@@ -401,6 +401,7 @@ export class Connector {
       if (previous && previous !== channel) previous.response.end();
       channel.workerId = worker.worker_id;
       this.channels.set(worker.worker_id, channel);
+      this.store.setWorkerPushCapability(worker.worker_id, true);
       this.writeChannelEvent(channel, { type: 'attached', worker_id: worker.worker_id, name: worker.name });
       this.announceChannel(worker.worker_id, true).catch((error) => this.logger.error?.(error));
       this.scheduleWorker(worker.worker_id);
@@ -411,6 +412,7 @@ export class Connector {
     this.pendingChannels.delete(channel);
     if (!channel.workerId || this.channels.get(channel.workerId) !== channel) return;
     this.channels.delete(channel.workerId);
+    this.store.setWorkerPushCapability(channel.workerId, false);
     for (const delivery of channel.deliveries.values()) {
       delivery.reject(Object.assign(new Error('Interactive session closed before reporting a result'), {
         code: 'channel_closed',
@@ -432,7 +434,9 @@ export class Connector {
   async syncChannels() {
     for (const worker of this.store.listWorkers()) {
       if (worker.mode !== 'external') continue;
-      await this.announceChannel(worker.worker_id, this.channels.has(worker.worker_id));
+      const attached = this.channels.has(worker.worker_id);
+      this.store.setWorkerPushCapability(worker.worker_id, attached);
+      await this.announceChannel(worker.worker_id, attached);
     }
   }
 
@@ -463,7 +467,12 @@ export class Connector {
     channel.deliveries.delete(commandId);
     if (text) this.emitOutput(commandId, `${text}\n`);
     if (body.status === 'succeeded') {
-      delivery.resolve({ text, session_id: channel.sessionId, delivery: 'channel' });
+      delivery.resolve({
+        text,
+        session_id: channel.sessionId,
+        delivery: 'channel',
+        ...(body.output_gap === true ? { output_gap: true } : {}),
+      });
     } else {
       delivery.reject(Object.assign(new Error(text || 'Interactive session reported failure'), { code: 'reported_failure' }));
     }

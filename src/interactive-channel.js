@@ -12,6 +12,7 @@ export class InteractiveChannel {
     cwd = process.cwd(),
     logger = {},
     retryMs = 2000,
+    onState = null,
   }) {
     this.runtime = runtime;
     this.connectorUrl = connectorUrl.replace(/\/$/, '');
@@ -21,6 +22,7 @@ export class InteractiveChannel {
     this.worker = { runtime_session_id: sessionId, cwd, metadata: {} };
     this.logger = logger;
     this.retryMs = retryMs;
+    this.onState = onState;
     this.state = 'connecting';
     this.stopped = false;
     this.abort = null;
@@ -97,6 +99,7 @@ export class InteractiveChannel {
   async handleEvent(event) {
     if (['attached', 'waiting_registration', 'rejected'].includes(event.type)) {
       this.state = event.type;
+      this.onState?.(event);
       this.logger.error?.(`Agent Hub channel: ${event.type}${event.reason ? ` (${event.reason})` : ''}`);
       return;
     }

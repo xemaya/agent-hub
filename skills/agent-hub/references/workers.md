@@ -40,7 +40,33 @@ agent-hub session start --runtime codex --push --cwd /path/to/project
 # 使用该线程的其他客户端已退出时，才能增加 --resume <真实-thread-id>
 ```
 
-启动后在窗口内执行 `worker register-current`。该窗口将用户输入和 Hub 命令串行送入同一条原生线程，正常回复自动回传，`/exit` 后恢复人工等待。默认只读；权限请求需要本地选择，不自动批准，也不接受 `--` 后的 Runtime 参数。已有桌面聊天的 external 登记不会挂接桌面推送；不能用第二个 app-server 恢复仍在桌面运行的线程或冒充当前聊天。
+启动后在窗口内执行 `worker register-current`。该窗口将用户输入和 Hub 命令串行送入同一条原生线程，正常回复自动回传，`/exit` 后恢复人工等待。默认只读；权限请求需要本地选择，不自动批准，也不接受 `--` 后的 Runtime 参数。普通 stdio 桌面聊天的 external 登记不会挂接桌面推送；桌面适配见下一节，不能用第二个 app-server 恢复仍在桌面运行的线程或冒充当前聊天。
+
+
+## Codex 桌面版推送（实验性）
+
+桌面 App 必须先连接本机共享 app-server，桥接才可以附着在同一条活线程上。可生成双击启动图标：
+
+```bash
+agent-hub desktop install-launcher \
+  --output "$HOME/Applications/Codex Hub.app" \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+这不会退出或重启桌面，也不会覆盖已有 .app。当前桌面还有工作时不要强制退出；在适合的时机完全退出后，双击 Codex Hub，打开的仍是实际桌面 App。后续退出后也应使用这个图标启动，以保留 `CODEX_APP_SERVER_WS_URL`。底层 `desktop start-server` 只准备后端并输出一次性的启动命令。客户端接口依赖安装版本，必须验证连接状态。
+
+在目标桌面聊天本人内部执行（原生 `CODEX_SESSION_ID` 必须存在）：
+
+```bash
+agent-hub desktop attach --push \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --name "<职责名称>" --cwd "$PWD" --capabilities "coding,review,analysis" \
+  --metadata '{"description":"<职责、范围与真实限制>"}'
+```
+
+同义命令为 `worker register-current --desktop --push`。不手填或猜测 Session ID，不自动创建新线程。命令先验证该原生线程已在同一后端加载，再登记 external 员工并启动后台 SSE 桥接；不需要终端交互窗口。以 `worker list` 的真实 `push_capable` 为准。
+
+原生队列先处理已在进行的桌面工作；桥接只回传自己那条命令所属 turn 的最终答案。用户向同一 Hub turn 追加输入导致结果归属不明、连接丢失或投递回执丢失时，撤下通道并保留未知结果，不重放命令。权限询问仍需桌面 UI；如果运行时把交互请求路由给桥接，它会断开，不代批或代拒。桥接会跟踪实际桌面 PID，App 退出、共享后端断开或桥接退出都会撤销推送；仅关闭一个窗口不等于退出 App。多实例时必须显式核实 --desktop-pid，不随意选择。
 
 只有用户明确要求主动执行，且交互实例已退出或 Runtime 支持共享，才可把当前窗口设为 managed。不要同时向同一 Session 发另一条 Prompt。
 

@@ -7,6 +7,9 @@ import { readBuildInfo, shortCommit } from './build-info.js';
 import { selfUpdate } from './updater.js';
 import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
 import { ChannelServer } from './channel.js';
+import { CodexDesktopDriver } from './drivers/codex-desktop.js';
+import { desktopServerOptions, runDesktopBridge, startDesktopBridge, startDesktopServer } from './desktop-session.js';
+import { installDesktopLauncher, openHubDesktop, verifiedDesktopPid } from './desktop-launcher.js';
 
 const HELP = `Agent Hub
 
@@ -22,6 +25,11 @@ Usage:
   agent-hub session start --runtime claude|kimi|codex --push [--resume SESSION_ID] [--data-dir DIR]
                          [--sandbox read-only|workspace-write] (Codex --push only)
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
+  agent-hub desktop start-server [--app-server-url ws://127.0.0.1:45123] [--data-dir DIR]
+  agent-hub desktop install-launcher --output /absolute/path/CodexHub.app [--data-dir DIR]
+  agent-hub desktop open [--data-dir DIR] (never closes an existing desktop App)
+  agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
+                           [--app-server-url URL] (run inside the actual desktop chat)
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
                             [--capabilities a,b] [--metadata JSON]
@@ -52,7 +60,7 @@ Environment:
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -332,7 +340,19 @@ async function workerCommand(positionals, flags) {
         session_origin: identity.origin,
       });
     }
-    print(await localRequest(flags, '/local/v1/workers/register', {
+    let desktop = null;
+    const dataDir = path.resolve(flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'));
+    if (flags.desktop) {
+      if (action !== 'register-current' || runtime !== 'codex' || flags.push !== true || (flags.mode && flags.mode !== 'external')) {
+        throw new Error('Desktop push requires worker register-current --desktop --push in a Codex desktop chat, with external mode');
+      }
+      desktop = await desktopServerOptions({ dataDir, url: flags['app-server-url'] });
+      const probe = new CodexDesktopDriver({ sessionId, url: desktop.url });
+      try { await probe.start(); } finally { probe.close(); }
+      desktop.desktopPid = await verifiedDesktopPid(flags['desktop-pid'], flags['app-path']);
+      Object.assign(metadata, { desktop: true, desktop_server_url: desktop.url });
+    }
+    const payload = await localRequest(desktop ? { ...flags, 'data-dir': dataDir } : flags, '/local/v1/workers/register', {
       method: 'POST',
       body: {
         name: flags.name,
@@ -343,7 +363,15 @@ async function workerCommand(positionals, flags) {
         cwd: flags.cwd ?? process.cwd(),
         metadata,
       },
-    }));
+    });
+    if (desktop) {
+      const bridge = await startDesktopBridge({ dataDir, url: desktop.url, sessionId,
+        connectorUrl: flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL,
+        cwd: path.resolve(flags.cwd ?? process.cwd()),
+        desktopPid: desktop.desktopPid,
+      });
+      print({ ...payload, desktop_bridge: bridge });
+    } else print(payload);
     return;
   }
   if (action === 'list') {
@@ -382,6 +410,44 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
     },
   });
   process.exitCode = result.exitCode;
+}
+
+async function desktopCommand(positionals, flags) {
+  const dataDir = path.resolve(flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'));
+  if (positionals[0] === 'install-launcher') {
+    print(await installDesktopLauncher({ output: flags.output, dataDir, appPath: flags['app-path'] }));
+    return;
+  }
+  if (positionals[0] === 'open') {
+    print(await openHubDesktop({ dataDir, url: flags['app-server-url'], appPath: flags['app-path'] }));
+    return;
+  }
+  if (positionals[0] === 'start-server') {
+    const server = await startDesktopServer({ dataDir, url: flags['app-server-url'], executable: flags.executable });
+    print({ ...server, desktop_restart_required: true,
+      next_step: 'Fully quit the desktop app when current work is safe, then launch it with CODEX_APP_SERVER_WS_URL set to this URL. This command did not quit or restart the app.',
+      desktop_launch_command: `open -a /Applications/ChatGPT.app --env 'CODEX_APP_SERVER_WS_URL=${server.url}'`,
+    });
+    return;
+  }
+  if (positionals[0] === 'attach') {
+    await workerCommand(['register-current'], { ...flags, 'data-dir': dataDir, desktop: true });
+    return;
+  }
+  if (positionals[0] === 'bridge') {
+    if (typeof flags['session-id'] !== 'string' || typeof flags['app-server-url'] !== 'string') throw new Error('Desktop bridge needs a verified --session-id and explicit --app-server-url');
+    const local = await localOptions({ ...flags, 'data-dir': dataDir });
+    const desktopPid = await verifiedDesktopPid(flags['desktop-pid'], flags['app-path']);
+    try {
+      process.exitCode = await runDesktopBridge({ dataDir, url: flags['app-server-url'], sessionId: flags['session-id'],
+        connectorUrl: local.baseUrl, token: local.token, cwd: flags.cwd ?? process.cwd(),
+        desktopPid,
+        onReady: ready => { if (process.connected) process.send({ type: 'ready', ...ready }); },
+      });
+    } catch (error) { if (process.connected) process.send({ type: 'failed', message: error.message }); throw error; }
+    return;
+  }
+  throw new Error('Usage: agent-hub desktop start-server|attach');
 }
 
 // stdout carries MCP JSON-RPC, so everything human-readable goes to stderr.
@@ -490,6 +556,10 @@ export async function run(argv) {
   }
   if (command === 'channel') {
     await channelCommand(flags);
+    return;
+  }
+  if (command === 'desktop') {
+    await desktopCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'service') {

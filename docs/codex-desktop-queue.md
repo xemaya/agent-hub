@@ -15,9 +15,9 @@ removed from the proposed change. It remains recoverable in Git history.
 ## Use inside the existing desktop chat
 
 ```bash
-agent-hub worker register-current --push \\
-  --data-dir "$HOME/.agent-hub/connector" \\
-  --name "Codex desktop developer" --cwd "$PWD" \\
+agent-hub worker register-current --push \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --name "Codex desktop developer" --cwd "$PWD" \
   --capabilities coding,review,analysis
 ```
 
@@ -36,7 +36,7 @@ The desktop can finish its current work before processing the queued message.
 When the instruction is complete, the native session invokes:
 
 ```bash
-agent-hub desktop report --command-id COMMAND_ID --status succeeded \\
+agent-hub desktop report --command-id COMMAND_ID --status succeeded \
   --data-dir "$HOME/.agent-hub/connector" < complete-result.txt
 ```
 

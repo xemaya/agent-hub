@@ -1,0 +1,140 @@
+import { execFile, spawn } from 'node:child_process';
+import { mkdir, open, readFile, unlink } from 'node:fs/promises';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import { readServerSentEvents } from './channel.js';
+import { PROJECT_ROOT } from './build-info.js';
+
+const execute = promisify(execFile);
+export async function checkNativeQueue(executable = 'codex') {
+  const { stdout } = await execute(executable, ['queue', '--help'], { timeout: 10000 });
+  if (!stdout.includes('--thread') || !stdout.includes('--message')) throw new Error('Installed Codex does not expose native queue delivery');
+}
+export const queueDirectory = (dataDir, sessionId) => path.join(dataDir, 'codex-queue', encodeURIComponent(sessionId));
+export function commandRecord(dataDir, sessionId, commandId) {
+  if (typeof commandId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(commandId)) throw new Error('Invalid command_id');
+  return path.join(queueDirectory(dataDir, sessionId), `${commandId}.json`);
+}
+function alive(pid) { if (!Number.isInteger(pid) || pid < 2) return false; try { process.kill(pid, 0); return true; } catch { return false; } }
+
+// Native identity is supplied by Codex; identify its actual desktop ancestor,
+// without choosing a recent session or a random App instance.
+export async function currentDesktopPid() {
+  let pid = process.ppid;
+  for (let depth = 0; pid > 1 && depth < 32; depth++) {
+    const { stdout } = await execute('/bin/ps', ['-p', String(pid), '-o', 'ppid=,comm=']);
+    const match = /^\s*(\d+)\s+(.+)$/s.exec(stdout.trim());
+    if (!match) break;
+    if (/\.app\/Contents\/MacOS\/(ChatGPT|Codex)$/.test(match[2].trim())) return pid;
+    pid = Number(match[1]);
+  }
+  throw new Error('Current process is not running inside the Codex desktop App');
+}
+
+export class CodexQueueChannel {
+  constructor({ connectorUrl, token, sessionId, dataDir, cwd = process.cwd(), executable = 'codex',
+    queue = execute, desktopPid, onReady, logger = console }) {
+    Object.assign(this, { connectorUrl: connectorUrl.replace(/\/$/, ''), token, sessionId, dataDir, cwd, executable, queue, desktopPid, onReady, logger });
+    this.stopped = false;
+    this.state = 'connecting';
+  }
+  async call(commandId, action, body = {}) {
+    const response = await fetch(`${this.connectorUrl}/local/v1/channel/commands/${encodeURIComponent(commandId)}/${action}`, {
+      method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!response.ok && !(action === 'ack' && response.status === 404)) throw new Error(`Connector ${action} failed (${response.status})`);
+    // A fast in-session report can finish before the queue subprocess returns.
+  }
+  prompt(event) {
+    const report = [process.execPath, path.join(PROJECT_ROOT, 'bin/agent-hub.js'), 'desktop', 'report',
+      '--data-dir', this.dataDir, '--command-id', event.command_id];
+    return `Agent Hub 指令，投递到当前既有 Codex 桌面会话。\n原生会话 ID 必须为 ${this.sessionId}；若不一致，停止，不代替其他会话执行。\ncommand_id: ${event.command_id}\n\n${event.content}\n\n` +
+      `完成后必须在当前会话内提交一次回执，不能只在桌面文字回答。用参数数组调用以下本地 CLI：\n${JSON.stringify(report)}\n追加 --status succeeded 或 --status failed，完整结果通过 stdin 传入；本机令牌由 CLI 自动读取，不读取或打印 Admin Token。\n` +
+      '只完成本条指令，沿用当前会话权限和人类约束。回执超时或失败时如实说明，不重投原任务、不改发其他会话。';
+  }
+  async deliver(event) {
+    const file = commandRecord(this.dataDir, this.sessionId, event.command_id);
+    const record = await open(file, 'wx', 0o600); // A delivery is never queued twice.
+    await record.writeFile(JSON.stringify({ command_id: event.command_id, session_id: this.sessionId, connector_url: this.connectorUrl }));
+    await record.close();
+    const pending = this.queue(this.executable, ['queue', '--thread', this.sessionId, '--message', this.prompt(event)],
+      { cwd: this.cwd, timeout: 45000, maxBuffer: 256 * 1024 });
+    this.queueChild = pending.child;
+    let result;
+    try { result = await pending; }
+    catch (error) { throw new Error(`Native Codex queue acceptance is unknown (${error.killed ? 'timeout' : error.code ?? 'error'}); do not replay`); }
+    this.queueChild = null;
+    if (!result.stdout?.trim().startsWith('Queued message ') || !result.stdout.trim().endsWith(` for thread ${this.sessionId}.`)) {
+      throw new Error('Native queue acceptance was not confirmed; outcome is unknown');
+    }
+    if (!this.stopped) await this.call(event.command_id, 'ack');
+  }
+  async start() {
+    await mkdir(queueDirectory(this.dataDir, this.sessionId), { recursive: true, mode: 0o700 });
+    this.abort = new AbortController();
+    if (this.desktopPid) {
+      this.monitor = setInterval(() => { if (!alive(this.desktopPid)) this.stop(); }, 1000);
+      this.monitor.unref();
+    }
+    const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId });
+    try {
+      const response = await fetch(`${this.connectorUrl}/local/v1/channel?${query}`, {
+        headers: { authorization: `Bearer ${this.token}` }, signal: this.abort.signal,
+      });
+      if (!response.ok) throw new Error(`Connector refused desktop queue channel (${response.status})`);
+      for await (const event of readServerSentEvents(response.body)) {
+        if (this.stopped) break;
+        if (event.type === 'attached') { this.state = 'attached'; this.onReady?.(event); }
+        if (event.type === 'rejected') throw new Error(event.reason ?? 'Desktop Worker rejected');
+        if (event.type === 'command') await this.deliver(event);
+      }
+    } catch (error) {
+      if (!this.stopped) throw error;
+    } finally { this.stop(); }
+  }
+  stop() { this.stopped = true; this.abort?.abort(); clearInterval(this.monitor); this.queueChild?.kill('SIGTERM'); }
+}
+
+export async function startQueueBridge({ dataDir, sessionId, connectorUrl, cwd, desktopPid, executable = 'codex' }) {
+  const directory = queueDirectory(dataDir, sessionId);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  try {
+    const previous = JSON.parse(await readFile(path.join(directory, 'bridge.lock'), 'utf8'));
+    if (alive(previous.pid)) return { status: 'already_running', session_id: sessionId, pid: previous.pid };
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const log = await open(path.join(directory, 'bridge.log'), 'a', 0o600);
+  const args = [path.join(PROJECT_ROOT, 'bin/agent-hub.js'), 'desktop', 'bridge', '--data-dir', dataDir,
+    '--session-id', sessionId, '--cwd', cwd, '--desktop-pid', String(desktopPid), '--executable', executable];
+  if (connectorUrl) args.push('--connector-url', connectorUrl);
+  const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', log.fd, log.fd, 'ipc'] });
+  await log.close();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (child.connected) child.disconnect();
+      child.unref();
+      if (error) { child.kill('SIGTERM'); reject(error); } else resolve(value);
+    };
+    const timer = setTimeout(() => finish(new Error('Desktop queue bridge did not attach')), 15000);
+    child.once('error', error => finish(error));
+    child.once('exit', () => finish(new Error('Desktop queue bridge exited before attaching')));
+    child.on('message', value => value?.type === 'ready' ? finish(null, value) : value?.type === 'failed' && finish(new Error(value.message)));
+  });
+}
+
+export async function bridgeLock(dataDir, sessionId) {
+  const file = path.join(queueDirectory(dataDir, sessionId), 'bridge.lock');
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  let handle;
+  try { handle = await open(file, 'wx', 0o600); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const previous = JSON.parse(await readFile(file, 'utf8'));
+    if (alive(previous.pid)) throw new Error(`Desktop queue bridge already runs as PID ${previous.pid}`);
+    await unlink(file); handle = await open(file, 'wx', 0o600);
+  }
+  await handle.writeFile(JSON.stringify({ pid: process.pid })); await handle.close();
+  return () => unlink(file);
+}

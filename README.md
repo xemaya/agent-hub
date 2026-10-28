@@ -173,19 +173,17 @@ agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/
 
 启动器打开的是轻量 **ACP 交互窗口**，不是 Kimi 原生全屏 TUI。用户输入与 Hub 命令共用一条 ACP 连接和同一个原生 Session，命令串行执行；正常回复由桥接自动回传，不需要模型调用回执工具。权限询问也在这个窗口处理。输入 `/exit` 退出，退出后自动退回 `waiting_manual`。该路径不关闭 Session 锁、不调用 `:takeover`，也不需要常驻 Web Server；Kimi `--push` 不接受 `--` 后的 Runtime 参数。
 
-Codex 使用持久 app-server 交互窗口接收推送：
+Codex 桌面版使用现有原生会话队列接收 Hub 推送。在当前桌面聊天内部执行：
 
 ```bash
-agent-hub session start --runtime codex --push --cwd /path/to/project
-# 只有明确允许修改项目文件时：
-agent-hub session start --runtime codex --push --sandbox workspace-write --cwd /path/to/project
-# 关闭使用该线程的其他客户端后，才可续接真实原生 ID：
-agent-hub session start --runtime codex --push --resume <thread-id> --cwd /path/to/project
+agent-hub worker register-current --push \
+  --data-dir "$HOME/.agent-hub/connector" \
+  --name "Codex 桌面开发者" --cwd "$PWD" --capabilities coding,review,analysis
 ```
 
-这是轻量 app-server 交互窗口，不是桌面 App 或原生全屏 TUI。窗口启动后，告诉 Codex 职责并让它执行 `worker register-current`；启动器不会自动登记员工。原生线程 ID 来自 app-server，用户输入与 Hub 命令在同一个进程、同一个线程中串行执行，完成后自动回传结果；`/exit` 或进程退出会撤销推送能力。默认只读沙箱，权限询问需要本地选择，不自动批准。`--push` 不接受 `--` 后的任意 Runtime 参数。
+也可用 `agent-hub desktop attach --push`。这会连接已有 Connector 的 SSE 通道，后台调用 `codex queue --thread <真实原生 ID> --message ...`。无需新 App、共享 app-server、修改桌面启动方式或重启桌面，也不使用 `exec resume` 在另一运行时处理当前线程。
 
-已有桌面聊天可以登记 external，但该登记不能给运行中的桌面聊天补上推送通道。不要另起 app-server 恢复一个仍在桌面运行的线程，也不要把新窗口当成原桌面聊天。详见 [Codex 适配边界与验收](docs/codex-push.md)。
+入队只表示接受投递；任务成功必须由收到指令的当前会话通过 `agent-hub desktop report` 提交结果。回执命令由桥接写入消息，完整结果走 stdin，本机令牌由 CLI 读取。重复、超时或断线结果不明时不重投。详见 [原生队列接入与验收](docs/codex-desktop-queue.md)。
 
 未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 

@@ -12,5 +12,11 @@
   },
   "ack_observed": true,
   "hub": "isolated localhost Hub; not production",
-  "after_close_status": "waiting_manual"
+  "after_close_status": "waiting_manual",
+  "real_resume": {
+    "status": "passed",
+    "session_id": "01a18188-6eb3-7220-b17d-e7f47c30d869",
+    "result": "HUB_CODEX_E2E_OK",
+    "elapsed_ms": 23841
+  }
 }

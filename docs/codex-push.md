@@ -42,11 +42,12 @@ client using that thread has exited.
   `HUB_CODEX_E2E_OK` final result, native session ID, and `delivery: channel`
   all passed. Client exit revoked push and a later command was `waiting_manual`.
   See [sanitized evidence](codex-push-evidence.json).
-- Real `thread/resume` returned the expected native ID, but two subsequent model
-  generation attempts timed out after 80 seconds (one asked for a read-only tool,
-  the other a text-only response). They were interrupted and were not counted
-  as success. Fresh-thread end-to-end generation passed. Resume completion still
-  needs investigation; automated resume protocol tests alone do not settle it.
+- Real `thread/resume` plus model generation passed on the completed end-to-end
+  test thread: the same native ID returned `HUB_CODEX_E2E_OK` in 23.8 seconds.
+  Two earlier attempts on the initial smoke thread timed out after 80 seconds
+  (one asked for a read-only tool, the other a text-only response). They were
+  interrupted and were not counted as success; the cause of those timeouts is
+  unknown. Tool-executing real turns have not been accepted by this smoke test.
 - The existing macOS bootstrap test now creates its own main branch and reuses
   the suite's installed ws package. This removes an assumption about the working
   branch and external package-registry availability from the lifecycle test.

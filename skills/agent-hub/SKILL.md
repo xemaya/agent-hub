@@ -30,11 +30,11 @@ agent-hub worker list --data-dir "$HOME/.agent-hub/connector"
 
 `hub_connected` 必须为 `true`。只下载 Skill、克隆仓库或启动服务不等于接入完成。Connector 不可达时报告实际情况，不擅自启动第二个 Connector。
 
-重新打开一个 Agent Session 以发现新 Skill。Kimi 使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。
+新安装的 Skill 可能需要重新打开 Agent Session 才能发现。Kimi 使用 `/skill:agent-hub`，Claude 使用 `/agent-hub`，Codex 使用 `$agent-hub`。这不等于必须把当前窗口登记为员工。仅安装接入时不要执行 `register-current`；用户只描述职责或要求创建员工时，默认新建 managed Worker。
 
 ## 注册数字员工
 
-先确认用户要登记**当前窗口**，还是新建**独立可调度员工**。所有命令使用：
+先确认用户要登记**当前窗口本人**，还是新建**独立可调度员工**。只有用户明确提到“当前窗口/当前 Session 本人”才走启动器流程。所有命令使用：
 
 ```bash
 --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
@@ -44,11 +44,12 @@ CLI 自行读取 Local Token，不要直接读取或打印凭证文件。
 
 ### 当前窗口
 
-建议用启动器重新打开，再让用户说明职责：
+Kimi/Claude 必须使用启动器重新打开，已运行的普通窗口不能事后补发可信身份。已有 Codex 窗口可使用自身注入的原生身份。需要中控主动推送到当前 Kimi/Claude 窗口时，在启动命令中增加 `--push`；Kimi 此时打开 ACP 交互窗口，不是原生 TUI。
 
 ```bash
 agent-hub session start --runtime kimi --cwd /path/to/project
-# 将 kimi 换成 claude 或 codex
+# Claude 同样通过启动器；已有 Codex 窗口可直接登记
+agent-hub session start --runtime claude --cwd /path/to/project
 ```
 
 在当前窗口执行：

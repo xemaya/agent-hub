@@ -37,7 +37,7 @@ bash agent-hub/scripts/bootstrap.sh
 
 按提示由用户在本机终端输入管理员另行安全提供的 Enrollment Token。脚本检查 macOS、Node.js 22.5+、pnpm 和 Git，默认把仓库安装到 `~/.agent-hub/agent-hub`，完成首次 Connector enrollment 后安装常驻服务、全局 CLI 和 Skill。重复运行幂等，已有修改或冲突会停止，不自动注册 Worker，不要求或修改 Tailscale。公网只发布固定说明和脚本，不公开 Hub/Connector 数据目录或任何 Token。
 
-安装后重新打开 Agent Session，通过 `agent-hub` Skill 注册数字员工并添加任务。下面是手动安装的备选步骤。
+安装后可通过 `agent-hub` Skill 新建独立 managed Worker，不需要重启当前 Agent。只有明确要求登记当前 Kimi/Claude 窗口本人时，才通过 `agent-hub session start` 启动器重新打开；需要中控主动推送到窗口时增加 `--push`。下面是手动安装的备选步骤。
 
 ### 1. 验证 Hub
 

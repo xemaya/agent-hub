@@ -185,6 +185,15 @@ agent-hub worker register-current --push \
 
 入队只表示接受投递；任务成功必须由收到指令的当前会话通过 `agent-hub desktop report` 提交结果。回执命令由桥接写入消息，完整结果走 stdin，本机令牌由 CLI 读取。重复、超时或断线结果不明时不重投。详见 [原生队列接入与验收](docs/codex-desktop-queue.md)。
 
+如果 Kimi 构建已经包含实验性 `tui_channel`，也可以让 Hub 直接进入**原生 TUI**：
+
+```bash
+agent-hub session start --runtime kimi --push --native-tui --cwd /path/to/project
+agent-hub session start --runtime kimi --push --native-tui --resume <session-id> --cwd /path/to/project
+```
+
+`--native-tui` 为子进程开启 `KIMI_CODE_EXPERIMENTAL_TUI_CHANNEL=1`，Hub 消息通过本机 Unix Socket 进入原生发送队列和权限面板，不启动 ACP 或第二个 Runtime。当前官方 Kimi 版本尚未包含此能力时，需要用 `AGENT_HUB_KIMI_EXECUTABLE` 指向支持该 flag 的构建；默认仍使用上述 ACP 路径。原生模式接受 Runtime 原生参数，真实身份注册方式不变。
+
 未通过启动器打开的 Claude/Kimi 旧窗口仍需真实原生 Session ID 才能 external；现有 Codex 窗口则使用 Codex 注入工具进程的 `CODEX_SESSION_ID`。都不能猜测 ID、选择最近会话或手工伪造环境变量。
 
 #### 方式 B：另建独立 managed Worker
@@ -456,7 +465,7 @@ pnpm check
 
 ## 当前边界
 
-- 不接管任意已打开的原生 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。Claude 交互推送使用原生 Channel，Kimi 交互推送使用启动器提供的 ACP 窗口。
+- 不接管任意已打开的原生 TUI；managed Driver 在命令到达时创建或恢复独立 Runtime Session。Claude 交互推送使用原生 Channel，Kimi 默认使用 ACP 窗口，也可通过支持 `tui_channel` 的 Kimi 构建和 `--native-tui` 使用原生 TUI。
 - 未接通的 external Worker 只提供人工协作登记，命令为 `waiting_manual`；只有 `--push` 窗口在线时才可主动推送。
 - 当前交互 Session 默认 external；主动执行不是向 TUI 模拟输入。普通 Kimi TUI 仍需通过 `--push` 改为 ACP 交互窗口，不能用第二个 Web Server 接管。
 - 中央大脑需管理员显式启用，规划和终审都有边界；不包含无限重试、自由群聊或 Worker 自主跨机互派。普通任务仍可由调用 Skill 的 Agent 选择本机 Worker。

@@ -34,6 +34,10 @@ agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/
 
 收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执会核对原生会话并保护重复调用。桌面进程退出后通道会关闭。
 
+这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。
+
+如果当前 Kimi 构建明确支持实验性 `tui_channel`，可在上述命令中增加 `--native-tui` 打开真正的原生 TUI。此时 Hub 通过本机 Unix Socket 进入原生发送队列和审批面板，不启动 ACP；启动器自动开启实验开关。不要用官方未支持该 flag 的版本强行尝试，也不要把它与 ACP 同时启动。需要自定义构建时通过 `AGENT_HUB_KIMI_EXECUTABLE` 指定，不替换用户已有二进制。
+
 只有用户明确要求主动执行，且交互实例已退出或 Runtime 支持共享，才可把当前窗口设为 managed。不要同时向同一 Session 发另一条 Prompt。
 
 ## 独立 managed Worker

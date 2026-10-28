@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { KimiDriver } from './drivers/kimi.js';
 import { KimiAcpDriver } from './drivers/kimi-acp.js';
+import { KimiNativeChannelDriver } from './drivers/kimi-native-channel.js';
 import { KimiChannel } from './kimi-channel.js';
 import { PROJECT_ROOT } from './build-info.js';
 import { CHANNEL_SERVER_NAME, CHANNEL_TOOLS } from './channel.js';
@@ -40,11 +42,14 @@ export async function prepareSessionLaunch(options = {}) {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const runtimeArgs = [...(options.runtimeArgs ?? [])];
   const env = options.env ?? process.env;
+  const nativeTui = runtime === 'kimi' && options.push === true && options.nativeTui === true;
+  if (options.nativeTui === true && !nativeTui) throw new Error('--native-tui requires --runtime kimi --push');
   let sessionId = null;
   let executable;
   let args;
   let driver = null;
   let channel = null;
+  let socketPath = null;
   if ((options.push || options.resumeSessionId) && !['claude', 'kimi'].includes(runtime)) {
     const error = new Error('--push and --resume are only supported for claude or kimi');
     error.code = 'unsupported_session_option';
@@ -73,7 +78,7 @@ export async function prepareSessionLaunch(options = {}) {
     if (options.push && !options.kimiChannel && (!options.channel?.connectorUrl || !options.channel?.token)) {
       throw new Error('Kimi push requires Connector connection details');
     }
-    if (options.push && runtimeArgs.length) throw new Error('Kimi --push does not accept runtime arguments');
+    if (options.push && !nativeTui && runtimeArgs.length) throw new Error('Kimi --push does not accept runtime arguments');
     driver = options.kimiDriver ?? new KimiDriver({ env });
     const prepared = await driver.prepareWorker({
       cwd,
@@ -81,21 +86,32 @@ export async function prepareSessionLaunch(options = {}) {
     });
     sessionId = prepared.runtime_session_id;
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('Kimi did not return a valid session id');
-    executable = 'kimi';
-    args = options.push ? ['acp'] : ['--session', sessionId, ...runtimeArgs];
+    if (nativeTui) {
+      socketPath = options.nativeChannelPath ?? path.join(os.homedir(), '.agent-hub', 'channels', `${sessionId}.sock`);
+      await mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+    }
+    executable = nativeTui ? env.AGENT_HUB_KIMI_EXECUTABLE ?? 'kimi' : 'kimi';
+    args = options.push
+      ? nativeTui
+        ? ['--session', sessionId, '--channel', socketPath, ...runtimeArgs]
+        : ['acp']
+      : ['--session', sessionId, ...runtimeArgs];
     if (options.push) {
       await driver.close();
-      driver = options.kimiAcpDriver ?? new KimiAcpDriver({
-        sessionId,
-        cwd,
-        env: { ...env, AGENT_HUB_RUNTIME: 'kimi', AGENT_HUB_SESSION_ID: sessionId },
-      });
+      driver = nativeTui
+        ? options.kimiNativeDriver ?? new KimiNativeChannelDriver({ socketPath, sessionId })
+        : options.kimiAcpDriver ?? new KimiAcpDriver({
+          sessionId,
+          cwd,
+          env: { ...env, AGENT_HUB_RUNTIME: 'kimi', AGENT_HUB_SESSION_ID: sessionId },
+        });
       channel = options.kimiChannel ?? new KimiChannel({
         ...options.channel,
         sessionId,
         driver,
         cwd,
       });
+      if (nativeTui) driver.onClosed = () => channel.stop();
     }
   } else {
     executable = 'codex';
@@ -113,6 +129,7 @@ export async function prepareSessionLaunch(options = {}) {
   };
   if (runtime === 'kimi' && !options.push) await close();
   const launchEnv = { ...env, AGENT_HUB_RUNTIME: runtime };
+  if (nativeTui) launchEnv.KIMI_CODE_EXPERIMENTAL_TUI_CHANNEL = '1';
   // Launched from inside another Claude Code session, the marker would turn off transcripts and break --resume.
   if (runtime === 'claude' && launchEnv.CLAUDE_CODE_CHILD_SESSION) launchEnv.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1';
   if (sessionId) launchEnv.AGENT_HUB_SESSION_ID = sessionId;
@@ -126,6 +143,7 @@ export async function prepareSessionLaunch(options = {}) {
     env: launchEnv,
     close,
     ...(channel ? { kimiChannel: channel } : {}),
+    ...(nativeTui ? { nativeTui: true, socketPath } : {}),
   };
 }
 
@@ -133,12 +151,13 @@ export async function startSession(options = {}) {
   const launch = await prepareSessionLaunch(options);
   const spawnProcess = options.spawn ?? spawn;
   try {
-    if (launch.kimiChannel) {
+    if (launch.kimiChannel && !launch.nativeTui) {
       await launch.kimiChannel.start();
       await options.onReady?.(launch);
       const exitCode = await launch.kimiChannel.run();
       return { ...launch, exitCode, signal: null };
     }
+    if (launch.kimiChannel) await launch.kimiChannel.start();
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: launch.cwd,
       env: launch.env,

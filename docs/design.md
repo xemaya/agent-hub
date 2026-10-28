@@ -760,8 +760,9 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：87 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：97 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
+- 原生 Kimi TUI Channel：使用独立源码构建、隔离 Hub/Connector、全新 Session 和 tmux 真实 TTY，验证 `--native-tui` 通过 Unix Socket 将 Hub 命令送入原生 TUI，不启动第二个 Runtime。连续命令均返回真实结果；人工输入与 Hub 命令按序完成；原生权限面板批准 `pwd` 后返回正确工作目录；`--resume` 恢复原身份并继续执行；执行中关闭记录 `outcome_unknown=true`，未自动重放或伪装成功。
 - 公网 Skill：验证固定下载路由、ZIP 一致性、标准解压与脚本执行权限，管理 API 和凭证路径不匿名开放。使用真实下载包、临时 HOME、独立 Hub/端口和模拟 launchctl 完成首次 enrollment、CLI/Skill 安装、重复运行和本地修改保护；未替换本机正在运行的 Connector。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。

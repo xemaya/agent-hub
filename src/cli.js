@@ -21,6 +21,7 @@ Usage:
   agent-hub update
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
   agent-hub session start --runtime claude|kimi --push [--resume SESSION_ID] [--data-dir DIR]
+  agent-hub session start --runtime kimi --push --native-tui [--resume SESSION_ID] [--cwd DIR]
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
   agent-hub desktop report --command-id ID --status succeeded|failed [--data-dir DIR] < result.txt
@@ -54,7 +55,7 @@ Environment:
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'allow-test-driver', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -390,6 +391,7 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
     cwd: flags.cwd ?? process.cwd(),
     runtimeArgs,
     push: flags.push === true,
+    nativeTui: flags['native-tui'] === true,
     resumeSessionId: typeof flags.resume === 'string' ? flags.resume : undefined,
     dataDir,
     connectorUrl,

@@ -152,3 +152,53 @@ test('Codex launcher opens a fresh client and leaves native identity to Codex', 
   assert.equal(Object.hasOwn(calls[0].options.env, 'AGENT_HUB_SESSION_ID'), false);
   assert.equal(calls[0].options.env.EXISTING, 'preserved');
 });
+
+test('Kimi native TUI launcher opens the real client with a local Channel', async () => {
+  const socketPath = path.join(process.cwd(), '.test-tmp', 'native-launcher.sock');
+  const calls = [];
+  let nativeDriverClosed = 0;
+  let channelStarted = 0;
+  let channelStopped = 0;
+  const kimiDriver = {
+    async prepareWorker(input) {
+      return { runtime_session_id: input.runtime_session_id, driver_state: {} };
+    },
+    async close() {},
+  };
+  const kimiNativeDriver = {
+    async close() { nativeDriverClosed += 1; },
+  };
+  const kimiChannel = {
+    async start() { channelStarted += 1; },
+    async stop() { channelStopped += 1; },
+    async run() { throw new Error('Native TUI must not run the ACP interface'); },
+  };
+  const result = await startSession({
+    runtime: 'kimi',
+    cwd: process.cwd(),
+    push: true,
+    nativeTui: true,
+    resumeSessionId: 'session-native-tui',
+    runtimeArgs: ['--model', 'kimi-code/kimi-for-coding'],
+    nativeChannelPath: socketPath,
+    env: { AGENT_HUB_KIMI_EXECUTABLE: '/opt/kimi-dev' },
+    kimiDriver,
+    kimiNativeDriver,
+    kimiChannel,
+    spawn(executable, args, options) {
+      calls.push({ executable, args, options });
+      return fakeChild();
+    },
+  });
+  assert.equal(result.nativeTui, true);
+  assert.equal(result.env.KIMI_CODE_EXPERIMENTAL_TUI_CHANNEL, '1');
+  assert.equal(result.socketPath, socketPath);
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[0].executable, '/opt/kimi-dev');
+  assert.deepEqual(calls[0].args, ['--session', 'session-native-tui', '--channel', socketPath, '--model', 'kimi-code/kimi-for-coding']);
+  assert.equal(calls[0].options.env.AGENT_HUB_SESSION_ID, 'session-native-tui');
+  assert.equal(channelStarted, 1);
+  assert.equal(channelStopped, 1);
+  assert.equal(nativeDriverClosed, 1);
+  await assert.rejects(startSession({ runtime: 'kimi', nativeTui: true }), /--native-tui requires --runtime kimi --push/);
+});

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Hub · 接入 Skill</title>
+  <link rel="stylesheet" href="/style.css?v=12">
+</head>
+<body>
+  <main class="auth-shell skill-shell">
+    <section class="auth-manifest">
+      <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <h1>AGENT<br>HUB</h1>
+    </section>
+    <section class="auth-form skill-content">
+      <h2>接入 Agent Hub</h2>
+      <p>适用于 macOS 上的 Claude Code、Kimi Code 和 Codex。</p>
+      <a class="button button-primary skill-download" href="/skill/agent-hub.zip" download>下载 Agent Skill</a>
+      <a class="text-button" href="/skill/SKILL.md">查看 SKILL.md ↗</a>
+      <h3>在 Mac 终端安装</h3>
+      <pre class="skill-install"><code>curl -fsSL https://hub.findu.work/skill/agent-hub.zip -o agent-hub.zip
+unzip agent-hub.zip
+bash agent-hub/scripts/bootstrap.sh</code></pre>
+      <p class="security-note">脚本会检查 Node.js 22.5+、pnpm 和 Git，安装常驻 Connector、CLI 和 Skill。输入提示出现时，填写管理员另行提供的 Enrollment Token。Token 不要发送到聊天中。无需 Tailscale。</p>
+      <h3>发给其他 Mac 的 Agent</h3>
+      <pre class="skill-prompt">请从 https://hub.findu.work/skill 下载 Agent Hub Skill，按其中的 SKILL.md 完成这台 Mac 的接入。需要输入 Enrollment Token 时停下来，让我在本机终端安全输入，不要索取或打印 Admin Token。接入完成后先报告 Connector 状态，等我说明职责后再注册数字员工。</pre>
+      <a class="text-button" href="/">管理员登录 →</a>
+    </section>
+  </main>
+</body>
+</html>

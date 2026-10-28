@@ -25,6 +25,20 @@
 
 正式 Hub 地址为 `https://hub.findu.work`。管理员使用其他部署时，以管理员提供的 HTTPS 地址为准。
 
+### 推荐：通过公网 Skill 接入
+
+其他 Mac 的 Agent 可打开 `https://hub.findu.work/skill`，或下载 `https://hub.findu.work/skill/agent-hub.zip`。压缩包包含 SKILL.md、接入脚本以及 Worker/任务操作说明，无需登录 Dashboard。Shell 安装方式：
+
+```bash
+curl -fsSL https://hub.findu.work/skill/agent-hub.zip -o agent-hub.zip
+unzip agent-hub.zip
+bash agent-hub/scripts/bootstrap.sh
+```
+
+按提示由用户在本机终端输入管理员另行安全提供的 Enrollment Token。脚本检查 macOS、Node.js 22.5+、pnpm 和 Git，默认把仓库安装到 `~/.agent-hub/agent-hub`，完成首次 Connector enrollment 后安装常驻服务、全局 CLI 和 Skill。重复运行幂等，已有修改或冲突会停止，不自动注册 Worker，不要求或修改 Tailscale。公网只发布固定说明和脚本，不公开 Hub/Connector 数据目录或任何 Token。
+
+安装后重新打开 Agent Session，通过 `agent-hub` Skill 注册数字员工并添加任务。下面是手动安装的备选步骤。
+
 ### 1. 验证 Hub
 
 ```bash

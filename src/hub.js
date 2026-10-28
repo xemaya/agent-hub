@@ -10,6 +10,7 @@ import { loadHubCredentials } from './credentials.js';
 import { createId, createToken } from './ids.js';
 import { readJsonBody, sendJson, sendText } from './json.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
+import { createSkillArchive, readSkillFile } from './skill-package.js';
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
 const STATIC_FILES = new Map([
@@ -309,6 +310,30 @@ export class Hub {
     const pathname = url.pathname;
     if (request.method === 'GET' && pathname === '/healthz') {
       sendJson(response, 200, { ok: true, service: 'agent-hub', version: this.build.version, commit: this.build.commit });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/skill') {
+      const body = await readFile(path.join(PUBLIC_DIR, 'skill.html'));
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      response.end(body);
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/skill/SKILL.md') {
+      const { body, contentType } = await readSkillFile('SKILL.md');
+      response.writeHead(200, { 'content-type': contentType, 'content-length': body.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      response.end(body);
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/skill/agent-hub.zip') {
+      const body = await createSkillArchive();
+      response.writeHead(200, {
+        'content-type': 'application/zip',
+        'content-length': body.length,
+        'content-disposition': 'attachment; filename="agent-hub.zip"',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+      });
+      response.end(body);
       return;
     }
     if (request.method === 'GET' && STATIC_FILES.has(pathname)) {

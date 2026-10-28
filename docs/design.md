@@ -649,9 +649,11 @@ agent-hub list commands
 
 Admin CLI 从 `AGENT_HUB_URL` 和 `AGENT_HUB_ADMIN_TOKEN` 获取 Hub 地址与凭证；Worker CLI 和 `--local` 任务/命令操作从本地 Connector 数据目录获取 Local Token。`--wait` 只能与 `--local` 一起使用，由完成事件唤醒，默认最长等待 10 分钟；`waiting_manual` 和 `wait_timed_out` 都不是成功。`task update --local` 只允许修改状态，且任务必须分配给当前 Connector。Kimi 的默认模型也可在启动 Connector 前通过 `AGENT_HUB_KIMI_MODEL` 设置，Worker 的 `metadata.kimi_model` 优先于该全局默认值。
 
-### Agent Skill（本机配套）
+### Agent Skill（公网分发与本机配套）
 
-`skills/agent-hub/SKILL.md` 为 Agent 提供按需加载的注册、自描述、状态回报和任务处理流程。Kimi 与 Codex 共享 `~/.agents/skills`，Claude 使用 `~/.claude/skills`。本机安装器只创建链接，不复制凭证，也不覆盖已有文件：
+正式 Hub 匿名提供固定的 `GET /skill`、`GET /skill/SKILL.md` 和 `GET /skill/agent-hub.zip`。`src/skill-package.js` 只读取 `skills/agent-hub` 白名单中的 Skill、参考文档和接入脚本，以 Node 内置模块生成 ZIP，不读取数据目录或凭证。公开下载与管理 API 的鉴权边界互不影响。
+
+`skills/agent-hub/SKILL.md` 为 Agent 提供首次接入、注册、自描述、状态回报和任务处理流程；`scripts/bootstrap.sh` 在 macOS 上检查公网 Hub 与依赖，默认将仓库安装到 `~/.agent-hub/agent-hub`，由用户在终端安全输入 Enrollment Token 完成首次 enrollment，然后安装 launchd Connector。重复执行幂等，已有未提交修改或冲突会停止，不自动注册 Worker，不修改 Tailscale 或其他 hooks。Kimi 与 Codex 共享 `~/.agents/skills`，Claude 使用 `~/.claude/skills`。本机安装器只创建链接，不复制凭证，也不覆盖已有文件：
 
 ```bash
 node scripts/install-local.js --connector-data-dir .runtime/connector
@@ -758,8 +760,9 @@ MVP 完成必须满足：
 
 ## 16. 当前实现验证记录
 
-- `pnpm test`：85 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
+- `pnpm test`：87 项测试全部通过，覆盖凭证、自注册、任务派发、Dashboard 事件、离线重放、命令去重、串行执行、崩溃恢复、Claude/Kimi/Codex 协议适配、Kimi ACP 单连接交互、Channel 回执与不完整结果标记、本机 Skill 安装器、Local 任务全流程、等待超时、跨 Connector 权限、CLI 布尔参数、当前 Session 启动器、中央编排、规划校验、执行失败和终审拒绝；包括管理员对话、只规划后启动、请求去重、Hub 重启恢复、旧库迁移、Worker 实况、未知结果保护及管理员聊天隔离；覆盖结构化 @ 引用、指定 Worker 不可改派、任务引用上下文、历史清理备份、活动工作保护、对话 epoch 清空及旧计划继续执行。新增直接依赖结果交接、长结果截断标记、@任务完整历史产物交接、不重跑原任务、运行中 Command 优先于后续排队命令、任务软删除和编排家族保护，以及交付 Markdown 结构、长文不截断和 HTML/危险链接防护。
 - `pnpm check`：通过。
+- 公网 Skill：验证固定下载路由、ZIP 一致性、标准解压与脚本执行权限，管理 API 和凭证路径不匿名开放。使用真实下载包、临时 HOME、独立 Hub/端口和模拟 launchctl 完成首次 enrollment、CLI/Skill 安装、重复运行和本地修改保护；未替换本机正在运行的 Connector。
 - 真实 CLI 进程：使用独立测试凭证和 Test Driver 完成 `Hub → Connector → Worker 注册 → Task → Command → succeeded`，Dashboard 静态资源可访问。
 - 真实 Chrome：使用临时浏览器 Profile 完成登录、创建任务、派发命令，确认实时连接、渲染结果和命令成功，无浏览器异常。
 - Kimi 真实 smoke：在全新的隔离 Session 中，显式设置 `kimi-code/kimi-for-coding` 后返回 `AGENT_HUB_OK`。未显式设置模型时，本机新 Session 曾返回 `Model not set`，因此保留 Worker/环境两级模型配置。

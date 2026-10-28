@@ -1,0 +1,16 @@
+{
+  "runtime": "codex",
+  "cliVersion": "0.164.0",
+  "native_thread_id": "01a18188-6eb3-7220-b17d-e7f47c30d869",
+  "resumed_previous_smoke_thread": false,
+  "command_id": "cmd_b10c874f0a724341af4d9f5d039f4c4a",
+  "status": "succeeded",
+  "result": {
+    "text": "HUB_CODEX_E2E_OK",
+    "session_id": "01a18188-6eb3-7220-b17d-e7f47c30d869",
+    "delivery": "channel"
+  },
+  "ack_observed": true,
+  "hub": "isolated localhost Hub; not production",
+  "after_close_status": "waiting_manual"
+}

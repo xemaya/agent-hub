@@ -30,7 +30,17 @@ agent-hub session start --runtime kimi --push --cwd /path/to/project
 agent-hub session start --runtime kimi --push --resume <session-id> --cwd /path/to/project
 ```
 
-这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。Codex 交互推送仍需 app-server 适配，不能声称已支持。
+这是 ACP 交互窗口，不是原生全屏 TUI。正常回答即可，桥接自动回执；用户输入与 Hub 命令串行使用同一条连接。`/exit` 退出后退回 `waiting_manual`，不接受 `--` 后的 Runtime 参数。
+
+Codex 使用持久 app-server 交互窗口：
+
+```bash
+agent-hub session start --runtime codex --push --cwd /path/to/project
+# 明确授权项目写入后才能增加 --sandbox workspace-write
+# 使用该线程的其他客户端已退出时，才能增加 --resume <真实-thread-id>
+```
+
+启动后在窗口内执行 `worker register-current`。该窗口将用户输入和 Hub 命令串行送入同一条原生线程，正常回复自动回传，`/exit` 后恢复人工等待。默认只读；权限请求需要本地选择，不自动批准，也不接受 `--` 后的 Runtime 参数。已有桌面聊天的 external 登记不会挂接桌面推送；不能用第二个 app-server 恢复仍在桌面运行的线程或冒充当前聊天。
 
 只有用户明确要求主动执行，且交互实例已退出或 Runtime 支持共享，才可把当前窗口设为 managed。不要同时向同一 Session 发另一条 Prompt。
 

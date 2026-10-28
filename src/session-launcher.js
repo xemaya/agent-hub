@@ -4,6 +4,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { KimiDriver } from './drivers/kimi.js';
 import { KimiAcpDriver } from './drivers/kimi-acp.js';
+import { CodexAppServerDriver } from './drivers/codex-app-server.js';
+import { InteractiveChannel } from './interactive-channel.js';
 import { KimiChannel } from './kimi-channel.js';
 import { PROJECT_ROOT } from './build-info.js';
 import { CHANNEL_SERVER_NAME, CHANNEL_TOOLS } from './channel.js';
@@ -45,8 +47,8 @@ export async function prepareSessionLaunch(options = {}) {
   let args;
   let driver = null;
   let channel = null;
-  if ((options.push || options.resumeSessionId) && !['claude', 'kimi'].includes(runtime)) {
-    const error = new Error('--push and --resume are only supported for claude or kimi');
+  if (runtime === 'codex' && options.resumeSessionId && !options.push) {
+    const error = new Error('Codex --resume requires --push; close other clients using this thread first');
     error.code = 'unsupported_session_option';
     throw error;
   }
@@ -100,6 +102,25 @@ export async function prepareSessionLaunch(options = {}) {
   } else {
     executable = 'codex';
     args = [...runtimeArgs];
+    if (options.push) {
+      if (runtimeArgs.length) throw new Error('Codex --push does not accept runtime arguments; use --sandbox');
+      if (!options.codexChannel && (!options.channel?.connectorUrl || !options.channel?.token)) {
+        throw new Error('Codex push requires Connector connection details');
+      }
+      driver = options.codexAppServerDriver ?? new CodexAppServerDriver({
+        sessionId: options.resumeSessionId, cwd, env, sandbox: options.sandbox,
+      });
+      await driver.start();
+      sessionId = driver.sessionId;
+      if (typeof sessionId !== 'string' || !sessionId) {
+        await driver.close();
+        throw new Error('Codex did not return a native thread id');
+      }
+      args = ['app-server', '--listen', 'stdio://'];
+      channel = options.codexChannel ?? new InteractiveChannel({
+        ...options.channel, runtime: 'codex', sessionId, driver, cwd,
+      });
+    }
   }
   let closed = false;
   const close = async () => {
@@ -125,18 +146,23 @@ export async function prepareSessionLaunch(options = {}) {
     cwd,
     env: launchEnv,
     close,
-    ...(channel ? { kimiChannel: channel } : {}),
+    ...(channel ? { interactiveChannel: channel, ...(runtime === 'kimi' ? { kimiChannel: channel } : {}) } : {}),
   };
 }
 
 export async function startSession(options = {}) {
   const launch = await prepareSessionLaunch(options);
   const spawnProcess = options.spawn ?? spawn;
+  const onSignal = () => { void launch.close(); };
+  if (launch.interactiveChannel && launch.runtime === 'codex') {
+    process.once('SIGTERM', onSignal);
+    process.once('SIGINT', onSignal);
+  }
   try {
-    if (launch.kimiChannel) {
-      await launch.kimiChannel.start();
+    if (launch.interactiveChannel) {
+      await launch.interactiveChannel.start();
       await options.onReady?.(launch);
-      const exitCode = await launch.kimiChannel.run();
+      const exitCode = await launch.interactiveChannel.run();
       return { ...launch, exitCode, signal: null };
     }
     const child = spawnProcess(launch.executable, launch.args, {
@@ -153,6 +179,8 @@ export async function startSession(options = {}) {
     });
     return { ...launch, exitCode: code ?? 1, signal };
   } finally {
+    process.removeListener('SIGTERM', onSignal);
+    process.removeListener('SIGINT', onSignal);
     await launch.close();
   }
 }

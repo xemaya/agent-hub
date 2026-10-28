@@ -262,5 +262,5 @@ test('Claude push launcher wires the channel config, tool allowance and native i
   assert.equal(config.mcpServers['agent-hub'].command, '/opt/node');
   assert.deepEqual(config.mcpServers['agent-hub'].env, { AGENT_HUB_RUNTIME: 'claude', AGENT_HUB_SESSION_ID: 'resume-me' });
   assert.equal(calls[0].options.env.AGENT_HUB_SESSION_ID, 'resume-me');
-  await assert.rejects(startSession({ runtime: 'codex', push: true, spawn: fakeChild }), /only supported for claude or kimi/);
+  await assert.rejects(startSession({ runtime: 'codex', push: true, spawn: fakeChild }), /requires Connector connection details/);
 });

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { Hub } from '../src/hub.js';
@@ -101,6 +101,18 @@ test('downloaded macOS bootstrap completes enrollment and local Skill installati
   const mockBin = path.join(directory, 'mock-bin');
   await mkdir(mockBin, { recursive: true });
   await execute('git', ['clone', '--quiet', '--no-hardlinks', PROJECT_ROOT, source]);
+  // Bootstrap clones main; a linked worktree clone may expose only its feature branch.
+  await execute('git', ['-C', source, 'checkout', '--quiet', '-B', 'main']);
+  // This is a bootstrap lifecycle test, not a registry availability test. Reuse
+  // the dependency already installed for this suite in the isolated checkout.
+  const pnpm = path.join(mockBin, 'pnpm');
+  await writeFile(pnpm, `#!/bin/bash
+set -eu
+[[ "$*" == "install --frozen-lockfile" ]]
+mkdir -p node_modules
+[[ -e node_modules/ws ]] || ln -s "$AGENT_HUB_TEST_WS_ROOT" node_modules/ws
+`);
+  await chmod(pnpm, 0o755);
   const hub = await Hub.create({
     host: '127.0.0.1', port: 0, dataDir: path.join(directory, 'hub'),
     credentials: { adminToken: 'test-admin', enrollmentToken: 'test-enroll', generated: [], file: path.join(directory, 'credentials.json') },
@@ -143,6 +155,7 @@ esac
     AGENT_HUB_LOCAL_PORT: String(localPort),
     AGENT_HUB_NAME: 'bootstrap-test-mac',
     AGENT_HUB_AUTO_UPDATE: '0',
+    AGENT_HUB_TEST_WS_ROOT: await realpath(path.join(PROJECT_ROOT, 'node_modules', 'ws')),
   };
   delete env.AGENT_HUB_ENROLLMENT_TOKEN;
   const stopConnector = async () => {

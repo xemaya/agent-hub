@@ -19,7 +19,8 @@ Usage:
   agent-hub service uninstall|status
   agent-hub update
   agent-hub session start --runtime claude|kimi|codex [--cwd DIR] [-- RUNTIME_ARGS...]
-  agent-hub session start --runtime claude|kimi --push [--resume SESSION_ID] [--data-dir DIR]
+  agent-hub session start --runtime claude|kimi|codex --push [--resume SESSION_ID] [--data-dir DIR]
+                         [--sandbox read-only|workspace-write] (Codex --push only)
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub worker register --runtime claude|kimi|codex|test|other --mode managed|external
                             [--name NAME] [--cwd DIR] [--session-id ID]
@@ -363,7 +364,7 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
   if (positionals[0] !== 'start') throw new Error('Usage: agent-hub session start --runtime claude|kimi|codex');
   const dataDir = flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector');
   const connectorUrl = flags['connector-url'] ?? process.env.AGENT_HUB_CONNECTOR_URL;
-  const channel = flags.push === true && flags.runtime === 'kimi'
+  const channel = flags.push === true && ['kimi', 'codex'].includes(flags.runtime)
     ? await localOptions({ 'data-dir': dataDir, 'connector-url': connectorUrl })
     : null;
   const result = await startSession({
@@ -371,6 +372,7 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
     cwd: flags.cwd ?? process.cwd(),
     runtimeArgs,
     push: flags.push === true,
+    sandbox: flags.sandbox,
     resumeSessionId: typeof flags.resume === 'string' ? flags.resume : undefined,
     dataDir,
     connectorUrl,

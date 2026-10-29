@@ -406,7 +406,8 @@ export class HubStore {
       ON CONFLICT(connector_id, runtime, runtime_session_id) DO UPDATE SET
         name = excluded.name, mode = excluded.mode, capabilities_json = excluded.capabilities_json,
         cwd = excluded.cwd, metadata_json = excluded.metadata_json,
-        push_capable = excluded.push_capable, updated_at = excluded.updated_at,
+        push_capable = CASE WHEN workers.retired_at IS NULL THEN workers.push_capable ELSE excluded.push_capable END,
+        updated_at = excluded.updated_at,
         last_seen_at = excluded.last_seen_at, retired_at = NULL
     `).run(
       workerId,

@@ -33,8 +33,8 @@ export async function currentDesktopPid() {
 
 export class CodexQueueChannel {
   constructor({ connectorUrl, token, sessionId, dataDir, cwd = process.cwd(), executable = 'codex',
-    queue = execute, desktopPid, onReady, logger = console }) {
-    Object.assign(this, { connectorUrl: connectorUrl.replace(/\/$/, ''), token, sessionId, dataDir, cwd, executable, queue, desktopPid, onReady, logger });
+    queue = execute, desktopPid, onReady, logger = console, retryMs = 1000 }) {
+    Object.assign(this, { connectorUrl: connectorUrl.replace(/\/$/, ''), token, sessionId, dataDir, cwd, executable, queue, desktopPid, onReady, logger, retryMs });
     this.stopped = false;
     this.state = 'connecting';
   }
@@ -42,7 +42,9 @@ export class CodexQueueChannel {
     const response = await fetch(`${this.connectorUrl}/local/v1/channel/commands/${encodeURIComponent(commandId)}/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
-    if (!response.ok && !(action === 'ack' && response.status === 404)) throw new Error(`Connector ${action} failed (${response.status})`);
+    if (!response.ok && !(action === 'ack' && response.status === 404)) {
+      throw Object.assign(new Error(`Connector ${action} failed (${response.status})`), { fatal: [400, 401, 403].includes(response.status) });
+    }
     // A fast in-session report can finish before the queue subprocess returns.
   }
   prompt(event) {
@@ -68,32 +70,59 @@ export class CodexQueueChannel {
     if (!result.stdout?.trim().startsWith('Queued message ') || !result.stdout.trim().endsWith(` for thread ${this.sessionId}.`)) {
       throw new Error('Native queue acceptance was not confirmed; outcome is unknown');
     }
-    if (!this.stopped) await this.call(event.command_id, 'ack');
+    if (!this.stopped) {
+      try { await this.call(event.command_id, 'ack'); }
+      catch (error) { error.transportOnly = true; throw error; }
+    }
   }
   async start() {
     await mkdir(queueDirectory(this.dataDir, this.sessionId), { recursive: true, mode: 0o700 });
-    this.abort = new AbortController();
     if (this.desktopPid) {
       this.monitor = setInterval(() => { if (!alive(this.desktopPid)) this.stop(); }, 1000);
       this.monitor.unref();
     }
     const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId });
     try {
-      const response = await fetch(`${this.connectorUrl}/local/v1/channel?${query}`, {
-        headers: { authorization: `Bearer ${this.token}` }, signal: this.abort.signal,
-      });
-      if (!response.ok) throw new Error(`Connector refused desktop queue channel (${response.status})`);
-      for await (const event of readServerSentEvents(response.body)) {
+      while (!this.stopped) {
+        this.abort = new AbortController();
+        let deliveryFailed = false;
+        try {
+          const response = await fetch(`${this.connectorUrl}/local/v1/channel?${query}`, {
+            headers: { authorization: `Bearer ${this.token}` }, signal: this.abort.signal,
+          });
+          if (!response.ok) {
+            const error = new Error(`Connector refused desktop queue channel (${response.status})`);
+            error.fatal = [400, 401, 403].includes(response.status);
+            throw error;
+          }
+          for await (const event of readServerSentEvents(response.body)) {
+            if (this.stopped) break;
+            if (event.type === 'attached') { this.state = 'attached'; this.onReady?.(event); }
+            if (event.type === 'rejected') throw Object.assign(new Error(event.reason ?? 'Desktop Worker rejected'), { fatal: true });
+            if (event.type === 'command') {
+              try { await this.deliver(event); }
+              catch (error) { deliveryFailed = !error.transportOnly; throw error; }
+            }
+          }
+        } catch (error) {
+          if (this.stopped) break;
+          // Reconnect the transport only. A queue call or receipt with an
+          // uncertain outcome must never become an automatic command replay.
+          if (deliveryFailed || error.fatal) throw error;
+        } finally { this.abort.abort(); }
         if (this.stopped) break;
-        if (event.type === 'attached') { this.state = 'attached'; this.onReady?.(event); }
-        if (event.type === 'rejected') throw new Error(event.reason ?? 'Desktop Worker rejected');
-        if (event.type === 'command') await this.deliver(event);
+        this.state = 'connecting';
+        this.logger.error?.('Desktop queue channel disconnected; reconnecting to Connector without replaying commands');
+        await new Promise(resolve => {
+          this.finishRetry = () => { clearTimeout(this.retryTimer); this.finishRetry = null; resolve(); };
+          this.retryTimer = setTimeout(this.finishRetry, this.retryMs);
+        });
       }
     } catch (error) {
       if (!this.stopped) throw error;
     } finally { this.stop(); }
   }
-  stop() { this.stopped = true; this.abort?.abort(); clearInterval(this.monitor); this.queueChild?.kill('SIGTERM'); }
+  stop() { this.stopped = true; this.abort?.abort(); clearInterval(this.monitor); this.finishRetry?.(); this.queueChild?.kill('SIGTERM'); }
 }
 
 export async function startQueueBridge({ dataDir, sessionId, connectorUrl, cwd, desktopPid, executable = 'codex' }) {

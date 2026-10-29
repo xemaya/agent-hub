@@ -16,6 +16,7 @@ async function setup(t, queue) {
   const attempts = [];
   const channel = new CodexQueueChannel({ connectorUrl: context.connector.localUrl, token: context.connector.store.credentials.localToken,
     dataDir: path.join(context.root, 'connector'), sessionId: 'native-queue-session', cwd: context.root,
+    retryMs: 20,
     queue: async (...args) => { attempts.push(args); return queue ? queue(channel, ...args) : { stdout: 'Queued message queued-native-id for thread native-queue-session.' }; },
     logger: { error() {} },
   });
@@ -104,4 +105,66 @@ test('A fast in-session completion before queue returns remains successful', asy
     return payload.command.status === 'succeeded' && payload.command;
   });
   assert.equal(done.result.text, 'FAST_QUEUE_RESULT');
+});
+
+test('Connector restart restores local and Hub push state without replaying an uncertain command', async t => {
+  const { context, worker, channel, attempts } = await setup(t);
+  const first = await send(context, worker);
+  await waitFor(() => attempts.length === 1);
+  await context.restartConnector({ reuseLocalPort: true });
+  await waitFor(() => context.connector.store.getWorker(worker.worker_id)?.push_capable === true);
+  await waitFor(() => context.hub.store.getWorker(worker.worker_id)?.push_capable === true);
+  assert.equal(channel.stopped, false);
+  assert.equal(attempts.length, 1, 'the old queue invocation must not be repeated');
+  const failed = (await context.admin(`/api/v1/commands/${first.command_id}`)).payload.command;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.outcome_unknown, true);
+
+  const second = await send(context, worker);
+  await waitFor(() => attempts.length === 2);
+  await report(context, second.command_id);
+  await waitFor(async () => (await context.admin(`/api/v1/commands/${second.command_id}`)).payload.command.status === 'succeeded');
+});
+
+test('Renaming a live Worker preserves its Hub and local push flags without replacing its channel', async t => {
+  const { context, worker, channel, attempts } = await setup(t);
+  await waitFor(() => context.hub.store.getWorker(worker.worker_id)?.push_capable);
+  const renamed = await context.registerWorker({ runtime: 'codex', attach: false,
+    runtime_session_id: 'native-queue-session', name: 'renamed-desktop',
+  });
+  assert.equal(renamed.worker_id, worker.worker_id);
+  assert.equal(renamed.name, 'renamed-desktop');
+  assert.equal(renamed.push_capable, true);
+  assert.equal(context.connector.store.getWorker(worker.worker_id).push_capable, true);
+  assert.equal(context.hub.store.getWorker(worker.worker_id).push_capable, true);
+  assert.equal(channel.stopped, false);
+  assert.equal(attempts.length, 0);
+});
+
+test('An acknowledgement transport failure reconnects without repeating the accepted native queue call', async t => {
+  let acceptQueue;
+  const accepted = new Promise(resolve => { acceptQueue = resolve; });
+  const { context, worker, channel, attempts } = await setup(t, async () => {
+    await accepted;
+    return { stdout: 'Queued message accepted-once for thread native-queue-session.' };
+  });
+  await send(context, worker);
+  await waitFor(() => attempts.length === 1);
+  await context.connector.close();
+  acceptQueue();
+  await waitFor(() => channel.state === 'connecting');
+  assert.equal(channel.stopped, false);
+  await context.restartConnector({ reuseLocalPort: true });
+  await waitFor(() => context.connector.store.getWorker(worker.worker_id)?.push_capable === true);
+  await waitFor(() => context.hub.store.getWorker(worker.worker_id)?.push_capable === true);
+  assert.equal(attempts.length, 1);
+});
+
+test('Authentication rejection is terminal rather than a reconnect loop', async t => {
+  const context = await createTestContext(t);
+  const channel = new CodexQueueChannel({ connectorUrl: context.connector.localUrl, token: 'invalid-local-token',
+    dataDir: path.join(context.root, 'connector'), sessionId: 'not-attached', retryMs: 10,
+  });
+  await assert.rejects(channel.start(), /401/);
+  assert.equal(channel.stopped, true);
 });

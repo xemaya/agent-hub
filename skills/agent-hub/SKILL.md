@@ -64,7 +64,27 @@ agent-hub worker register-current \
 
 当前窗口统一登记为 external，不虚报主动推送。Claude/Kimi 使用启动器注入的可信身份，Codex 使用自身注入的 `CODEX_SESSION_ID`。缺少可信身份时停止并说明，**不能随机生成、选择最近会话、手工伪造身份或用另一个 Session 冒充当前窗口**。
 
-Codex 桌面需要推送时，使用 `worker register-current --push`（或 `desktop attach --push`），接通原生 `codex queue`。入队成功不等于任务完成，当前会话必须按消息参数调用 `desktop report`。
+### Codex 桌面：当前窗口直接接入
+
+已有 Codex 桌面聊天不需要再执行 `session start`，也不需要终端版或后台 Worker。在打开目标项目目录的当前聊天中执行，`--push` 必须保留：
+
+```bash
+agent-hub worker register-current --push \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}" \
+  --name "<体现职责的名称>" --cwd "$PWD" \
+  --capabilities "coding,review,analysis" \
+  --metadata '{"description":"<用户定义的职责与真实限制>"}'
+```
+
+登记、下面的列表查询以及后续 `desktop report` 都是本机命令。直接为每条命令使用 Codex 工具自带的单次提升权限，不必先故意触发权限错误；不使用 sudo，不修改全局沙箱，也不切换终端或后台模式。
+
+```bash
+agent-hub worker list --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+保存登记返回的 `worker_id`，核对其 `presence=online`、`push_capable=true` 和 `desktop_bridge=ready`，再用列表确认同一 Worker 的真实状态。若登记成功而列表报 `fetch failed`，保留 `worker_id` 并如实报告原始错误；不能据此声称未接入，也不要重复登记或改换运行模式。Skill 不能代替 Connector、桌面桥接或工具权限。
+
+入队成功不等于任务完成，当前会话必须按消息参数调用 `desktop report` 提交真实结果。接入登记本身不创建验收任务，也不自动指定中央大脑。
 
 只有实际 `presence=online` 且 `push_capable=true` 的 Worker 才能被 @、接收直接命令、担任中央大脑或参与自动编排。各 Runtime 的 Channel、回执与旧窗口登记细节见 [references/workers.md](references/workers.md)。
 

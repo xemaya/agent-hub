@@ -50,6 +50,7 @@ export class CodexQueueChannel {
       '--data-dir', this.dataDir, '--command-id', event.command_id];
     return `Agent Hub 指令，投递到当前既有 Codex 桌面会话。\n原生会话 ID 必须为 ${this.sessionId}；若不一致，停止，不代替其他会话执行。\ncommand_id: ${event.command_id}\n\n${event.content}\n\n` +
       `完成后必须在当前会话内提交一次回执，不能只在桌面文字回答。用参数数组调用以下本地 CLI：\n${JSON.stringify(report)}\n追加 --status succeeded 或 --status failed，完整结果通过 stdin 传入；本机令牌由 CLI 自动读取，不读取或打印 Admin Token。\n` +
+      '提交回执时，仅对这条本地 CLI 使用 Codex 工具自带的单次提升权限机制，不要 sudo，不要修改全局沙箱。若回执返回 fetch failed 或结果不明，不重复执行，先核对 Hub 的真实命令状态。\n' +
       '只完成本条指令，沿用当前会话权限和人类约束。回执超时或失败时如实说明，不重投原任务、不改发其他会话。';
   }
   async deliver(event) {

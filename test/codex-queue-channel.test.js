@@ -46,6 +46,8 @@ test('Native desktop queue uses the real session ID and waits for an explicit in
   assert.equal(attempts[0][1].includes('exec'), false);
   assert.match(attempts[0][1][4], /desktop.*report/);
   assert.match(attempts[0][1][4], /command_id:/);
+  assert.match(attempts[0][1][4], /本地 CLI.*单次提升权限机制/);
+  assert.match(attempts[0][1][4], /fetch failed.*不重复执行/);
   const record = JSON.parse(await readFile(commandRecord(channel.dataDir, channel.sessionId, command.command_id), 'utf8'));
   assert.equal(record.session_id, 'native-queue-session');
   assert.equal((await context.admin(`/api/v1/commands/${command.command_id}`)).payload.command.status, 'running');

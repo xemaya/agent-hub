@@ -48,6 +48,10 @@ ACP 是轻量交互窗口，不是原生全屏 TUI。正常回答即可，桥接
 
 收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执核对原生会话并保护重复调用。桌面进程退出后通道关闭。
 
+Skill 只是操作说明，不能绕过桌面权限或代替 Connector 和桥接保持连接。登记、`worker list` 和回执是分别授权的本机命令，直接为每条命令使用 Codex 工具自带的单次提升权限，不必先等待 `spawn EPERM` 或 `fetch failed`。不要 sudo、修改全局沙箱、切换终端或改用后台 Worker。回执需要访问本机 Connector，登记成功不代表后续命令可以不加权限地执行。
+
+登记后保存返回的 `worker_id`，核对 `presence=online`、`push_capable=true`、`desktop_bridge=ready`，并用同一数据目录的 `worker list` 复核。登记成功但列表失败时，保留登记结果并报告原始错误，不能仅凭列表错误口述未接入。只在桌面回答不会提交 Hub 回执；回执结果不明时不要重复执行或重投任务，应先核对 Hub 的真实命令状态。
+
 ## 状态与恢复
 
 注册前核实：名称体现角色，`cwd` 是真实工作目录，能力和简介反映实际范围。同一 `runtime + runtime_session_id` 重复注册幂等，不要把同一身份分给多个员工。

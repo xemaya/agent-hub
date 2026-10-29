@@ -28,6 +28,20 @@ enrolled Connector. It never picks a recent session or creates another model
 session. Repeated attachment reuses a live bridge. Desktop process exit closes
 the channel and revokes push capability.
 
+The Skill provides the procedure but cannot bypass desktop permissions. Use
+Codex's native elevated-permission mechanism directly for each registration,
+list, or receipt command instead of deliberately triggering a sandbox error
+first. Do not use sudo, change the global sandbox, or fall back to a terminal or
+background Worker. `spawn EPERM` and `fetch failed` do not by themselves prove
+that an earlier registration or receipt failed.
+
+Save the registration response's `worker_id` and verify its online,
+push-capable, ready-bridge state before running `worker list` with the same
+Connector data directory. If that separate list command fails, report its exact
+error without claiming that registration failed or registering again. When a
+receipt outcome is uncertain, check the Hub's command state rather than
+reporting or delivering the work twice.
+
 Each Hub command is durably recorded before one native queue invocation. The
 queued text contains the instruction, native ID, command ID, and exact callback
 arguments. `codex queue` acceptance is acknowledged but is not task success.

@@ -159,7 +159,7 @@ agent-hub desktop report --command-id COMMAND_ID --status succeeded \
   --data-dir "$HOME/.agent-hub/connector" < complete-result.txt
 ```
 
-完整结果走 stdin，本机令牌由 CLI 读取。重复、超时或断线结果不明时不重投。详见 [原生队列接入与验收](docs/codex-desktop-queue.md)。
+完整结果走 stdin，本机令牌由 CLI 读取。登记、列表查询和回执分别使用 Codex 工具自带的单次提升权限执行，不必先触发 `spawn EPERM` 或 `fetch failed`；不使用 sudo，不修改全局沙箱。登记后保存返回的 `worker_id` 并核对在线、推送和桥接状态；后续列表失败不等于登记失败，不要重复登记或改换运行模式。重复、超时或断线结果不明时不重投。详见 [原生队列接入与验收](docs/codex-desktop-queue.md)。
 
 ### 登记已有旧窗口
 

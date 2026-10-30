@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { connect } from 'node:net';
 import { createTestContext, waitFor } from './helpers.js';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -149,4 +150,31 @@ test('Channel reattachment wakes a ready step without retrying a blocked orchest
   await ctx.attachWorker(worker);
   await waitFor(() => ctx.hub.store.listCommands({ taskId: waiting.steps[0].task_id }).some(command => command.status === 'succeeded'));
   assert.equal(ctx.hub.store.listCommands({ taskId: blocked.steps[0].task_id }).length, 0);
+});
+
+test('Final-state synchronization repairs stale Worker state without replaying a result', async t => {
+  const ctx = await createTestContext(t);
+  const worker = await ctx.registerWorker();
+  const command = await send(ctx, worker);
+  await waitFor(() => ctx.hub.store.getCommand(command.command_id).status === 'succeeded');
+  ctx.hub.store.updateWorkerStatus(worker.connector_id, worker.worker_id, { work_state: 'working' });
+  const events = ctx.hub.store.listEvents().filter(event => event.command_id === command.command_id).length;
+  ctx.connector.send('command.sync', { command_id: command.command_id, status: 'succeeded', result: ctx.connector.store.getCommand(command.command_id).result });
+  await waitFor(() => ctx.hub.store.getWorker(worker.worker_id).work_state === 'idle');
+  assert.equal(ctx.hub.store.listEvents().filter(event => event.command_id === command.command_id).length, events);
+});
+
+test('Hub shutdown is bounded even when a client leaves HTTP headers incomplete', async t => {
+  const ctx = await createTestContext(t, { hub: { shutdownGraceMs: 30 } });
+  const socket = connect({ host: '127.0.0.1', port: ctx.hub.port });
+  t.after(() => socket.destroy());
+  await new Promise(resolve => socket.once('connect', resolve));
+  socket.write('GET /healthz HTTP/1.1\r\nHost: localhost\r\n');
+  // Simulate a WebSocket peer that never completes its close handshake too.
+  for (const peer of ctx.hub.wss.clients) peer.close = () => {};
+  await pause(15);
+  const started = Date.now();
+  await ctx.hub.close();
+  assert.ok(Date.now() - started < 1000);
+  await ctx.hub.close();
 });

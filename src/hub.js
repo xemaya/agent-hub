@@ -141,6 +141,7 @@ export class Hub {
     coordinatorInactivityTimeoutMs = 15 * 60 * 1000,
     commandInactivityTimeoutMs = 60 * 60 * 1000,
     watchdogIntervalMs = 30000,
+    shutdownGraceMs = 2000,
   }) {
     this.host = host;
     this.build = build ?? { version: null, commit: null, dirty: false };
@@ -159,6 +160,7 @@ export class Hub {
     this.workerMessageWaiters = new Map();
     this.coordinatorScheduled = false;
     this.closing = false;
+    this.shutdownGraceMs = shutdownGraceMs;
     this.coordinator = new Coordinator({
       store: this.store,
       emit: (...args) => this.emit(...args),
@@ -241,6 +243,11 @@ export class Hub {
   }
 
   async close() {
+    this.closePromise ??= this.closeResources();
+    return this.closePromise;
+  }
+
+  async closeResources() {
     this.closing = true;
     clearInterval(this.heartbeat);
     clearInterval(this.inactivityWatchdog);
@@ -248,15 +255,28 @@ export class Hub {
       for (const waiter of waiters) clearTimeout(waiter.timer);
     }
     this.workerMessageWaiters.clear();
+    // Slow HTTP peers or half-open WebSockets must not hold a supervised
+    // restart indefinitely. Commands remain durable and are reconciled later.
+    const forceClose = setTimeout(() => {
+      for (const socket of this.wss.clients) socket.terminate();
+      this.server.closeAllConnections();
+    }, this.shutdownGraceMs);
+    forceClose.unref();
     for (const socket of this.wss.clients) socket.close(1001, 'Hub shutting down');
     this.connectors.clear();
     this.dashboards.clear();
     this.connectorFeatures.clear();
-    if (this.server.listening) {
-      await new Promise((resolve) => this.server.close(resolve));
+    const socketsClosed = new Promise(resolve => this.wss.close(resolve));
+    try {
+      if (this.server.listening) {
+        await Promise.all([new Promise(resolve => this.server.close(resolve)), socketsClosed]);
+      } else {
+        await socketsClosed;
+      }
+    } finally {
+      clearTimeout(forceClose);
+      this.store.close();
     }
-    this.wss.close();
-    this.store.close();
   }
 
   async clearHistory() {
@@ -1181,6 +1201,12 @@ export class Hub {
         });
         if (updated.kind === 'worker_message') this.settleWorkerMessageWaiters(updated);
         else await this.coordinator.onCommandFinished(updated);
+        this.refreshWorkerState(command.worker_id);
+        this.scheduleCoordinator();
+      }
+      if (wasFinal && ['succeeded', 'failed'].includes(payload.status)) {
+        // A previous Hub may already have persisted the result but lost the
+        // corresponding Worker update during shutdown. Re-derive it safely.
         this.refreshWorkerState(command.worker_id);
         this.scheduleCoordinator();
       }

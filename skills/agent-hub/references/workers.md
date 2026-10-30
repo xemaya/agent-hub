@@ -52,6 +52,21 @@ Skill 只是操作说明，不能绕过桌面权限或代替 Connector 和桥接
 
 登记后保存返回的 `worker_id`，核对 `presence=online`、`push_capable=true`、`desktop_bridge=ready`，并用同一数据目录的 `worker list` 复核。登记成功但列表失败时，保留登记结果并报告原始错误，不能仅凭列表错误口述未接入。只在桌面回答不会提交 Hub 回执；回执结果不明时不要重复执行或重投任务，应先核对 Hub 的真实命令状态。
 
+## Worker 通信录与直连
+
+`worker directory` 使用当前原生 Session 获取同一 Hub 内其他未注销 Worker 的脱敏目录；普通工作指令也会收到当次目录快照。目录可用于选择真实 `worker_id`，但不能从中获取 Session ID、cwd、完整 metadata、任务上下文或凭证。
+
+```bash
+agent-hub worker directory --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+agent-hub message send --to WORKER_ID --prompt "<请求>" --wait \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+agent-hub message wait COMMAND_ID --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+消息经过 Hub 的持久化 Command 路由，不经过中央大脑。Hub 根据 Connector 和原生 Session 确定发送方，接收方看到核验后的 sender；普通 `command.create` 和 Admin API 不能伪造 `worker_message`。发送方不能给自己发消息，也不能借此修改任务或获得 Admin 权限。
+
+接收方完成当前 Command 的正常回执就是回复。`message send --wait` 与 `message wait` 由 Hub 完成事件唤醒；已结束的结果可再次等待，不会重新执行。`wait_timed_out` 保留真实 command_id 和状态，不取消工作。断线、超时或结果不明时用原 command_id 再等待，不要重新发送；每个接收方仍串行执行。Codex 桌面逐条使用原生单次提升权限执行这些 CLI，不 sudo、不修改全局沙箱。旧 Connector 未声明直连能力时会返回明确错误，不会降级成来源不明的普通指令。第一版只支持单条请求/回复，不做广播或自动多轮对话。
+
 ## 状态与恢复
 
 注册前核实：名称体现角色，`cwd` 是真实工作目录，能力和简介反映实际范围。同一 `runtime + runtime_session_id` 重复注册幂等，不要把同一身份分给多个员工。

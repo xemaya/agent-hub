@@ -926,7 +926,8 @@ test('Follow-up work receives the complete referenced deliverable without rerunn
   await waitForOrchestration(context, context.hub.store.getOrchestrationByTask(followUpReply.task_id).orchestration_id, 'done');
   const work = driver.executions.filter((execution) => execution.kind === 'prompt');
   assert.equal(work.length, 2);
-  const referenceJson = work[1].input.split('对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:\n')[1];
+  const referenceJson = work[1].input.split('对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:\n')[1]
+    .split('\n\nAgent Hub Worker directory (JSON)')[0];
   const [reference] = JSON.parse(referenceJson);
   assert.equal(reference.orchestration.steps[0].result, artifact);
   assert.equal(reference.orchestration.steps[0].result_truncated, false);

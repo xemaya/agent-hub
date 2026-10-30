@@ -67,6 +67,7 @@ export async function createTestContext(t) {
   await hub.listen();
   const driver = new TestDriver();
   const channels = new Set();
+  const cleanups = [];
   let connector;
   let sessionSequence = 0;
 
@@ -147,6 +148,9 @@ export async function createTestContext(t) {
     admin,
     local,
     attachWorker,
+    onClose(callback) {
+      cleanups.push(callback);
+    },
     get connector() {
       return connector;
     },
@@ -208,6 +212,7 @@ export async function createTestContext(t) {
   };
 
   t.after(async () => {
+    for (const cleanup of cleanups) await cleanup();
     for (const channel of channels) channel.stop();
     await connector.close();
     await hub.close();

@@ -183,6 +183,21 @@ agent-hub worker unregister-current --data-dir "$HOME/.agent-hub/connector"
 
 以 `presence`、`push_capable` 和 `work_state` 判断真实可用性。软注销保留 Task、Command、Event 和原生 Session 历史；活动工作或当前协调者身份会拒绝注销。显式重新注册同一身份可恢复 Worker ID。普通 Agent 只能撤下自己，不能读取 Admin Token 或注销其他员工。
 
+## Worker 通信录与直接通信
+
+同一 Hub 内未注销 Worker 可以发现彼此并直接请求/回复，消息经过 Hub 的身份校验、持久化和路由，**不调用中央大脑**，也不创建后台 Runtime。
+
+```bash
+agent-hub worker directory --data-dir "$HOME/.agent-hub/connector"
+agent-hub message send --to WORKER_ID --prompt "请提供刚才的复现结果" --wait \
+  --data-dir "$HOME/.agent-hub/connector"
+agent-hub message wait COMMAND_ID --data-dir "$HOME/.agent-hub/connector"
+```
+
+`worker directory` 和普通工作指令携带的目录快照只包含公开身份、能力、简介及状态，不暴露 Session ID、cwd、完整 metadata 或凭证。Hub 根据当前原生 Session 和 Connector 确定真实发送方，目标不能是本人；普通 Command API 不能伪造 `worker_message`。
+
+接收方完成当前 Command 的正常回执就是直接回复，每个 Worker 仍串行处理。等待由完成事件唤醒；超时返回 `wait_timed_out` 和真实 command_id，不取消执行。断线或超时后按原 command_id 再等待，不重新发送。直连请求不授予 Admin、任务修改或额外工具权限。第一版不做群聊、广播或自动多轮对话。
+
 ## 任务与中央大脑
 
 只有**在线、未注销且交互 Channel 已接通**的 Worker 才能被 @、接收直接命令、担任中央大脑或参与自动编排。未接通员工的新命令保持 `waiting_manual`，不会转入后台执行。

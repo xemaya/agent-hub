@@ -26,8 +26,9 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - Workers、Connectors、Tasks、Commands、Events 的持久化和展示。
 - Connector 与 Hub 之间使用出站 WebSocket 推送命令。
 - 命令持久化、ACK、重连重放、重复命令去重、每 Worker 串行执行。
-- Claude、Kimi、Codex 托管 Worker 的实际触发适配器。
+- Claude、Kimi、Codex 可见交互 Session 的实际触发适配器。
 - 外部 Session 的登记和人工协作模式。
+- Worker 脱敏通信录和经过 Hub、无需中央模型的单条直连消息。
 - 一个无构建步骤的 Web 中控页面和通用 CLI。
 - 管理员启用的中央协调器：全局规划、Worker 匹配、依赖编排与最终证据评审。
 - systemd 常驻、Caddy TLS 和 SQLite 一致性备份；Headscale 作为可选管理或私网通道。
@@ -37,8 +38,7 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 - Agent 自由群聊、无限自动重试、跨 Hub 多主调度。
 - 多 Hub、多主写入、分布式锁和消息队列集群。
 - 双向文件同步、自动解决 Git 冲突、向量数据库。
-- 直接控制任意已经打开的交互式 TUI。
-- MCP 工具服务和 Codex 桌面端自动化的首版适配。Claude 交互窗口已通过 Channel 接入（见 10.7），Kimi 通过 ACP 交互窗口接入（见 10.8）；Codex 的交互推送仍未实现。
+- 未经启动器或原生 Channel 接管的任意旧窗口自动控制。
 - 自动安装或修改 Tailscale/Headscale。
 - Tailscale Funnel、多租户和细粒度用户权限。
 
@@ -251,7 +251,7 @@ external Worker: queued → waiting_manual
 - `running`：Runtime 已开始执行。
 - `succeeded`：Runtime 正常结束并返回结果，不等于业务验收自动通过。
 - `failed`：执行失败或结果未知，保留错误。
-- `waiting_manual`：首版没有主动交付通道，需要人工处理。
+- `waiting_manual`：交互 Channel 未接通，需要等待接通或人工处理，不能伪装成已主动送达。
 
 ### 6.3 输出与结果
 
@@ -259,6 +259,14 @@ external Worker: queued → waiting_manual
 - 增量输出写入 Command 的输出字段并实时广播，不为每个 token 写一条 Event。
 - 输出总量设置上限；达到上限后保留尾部并标记 truncated。
 - 最终结果与错误单独保存，避免只能翻完整终端日志。
+
+### 6.4 Worker 通信录与直连消息
+
+- `worker directory` 根据当前 Connector 与原生 Session 识别请求者，返回其他未注销 Worker 的实时目录。普通工作、直接问答和直连消息的 dispatch 也携带当次目录快照，协调者内部指令不注入直连能力。
+- 目录仅含 Worker ID、名称、runtime、能力、简介、Connector 名称、presence、push_capable 和 work_state；不包含 Session ID、cwd、完整 metadata、任务上下文或凭证。
+- `worker_message` 是带 `sender_worker_id` 的定向 Command，数据库 schema 为 `user_version=10`。Hub 根据 Connector 与原生 Session 映射确定发送方，目标不能是本人或已注销员工；通用 Admin/Connector `command.create` 不接受此类型。目标 Connector 必须在 hello 中声明 `worker_message_v1` 能力，滚动升级期间对旧 Connector 返回明确错误，不降级为来源不明的普通指令。
+- 接收方在可见交互 Session 中处理并提交正常回执，该结果就是发送方的直接回复。每个 Worker 仍串行执行，未接通时保留 `waiting_manual`；此类型不进入 Coordinator，不创建任务或后台 Runtime，也不授予 Admin 权限。
+- `message send --wait` 和 `message wait` 由 Hub 完成事件唤醒。已结束结果可重复等待而不重新执行；bounded timeout 只返回 `wait_timed_out` 和真实状态，不取消工作。断线清理旧等待者，恢复后使用原 command_id 再等待，不重发消息。第一版不做群聊、广播或自动多轮对话。
 
 ## 7. WebSocket 协议
 
@@ -280,11 +288,11 @@ external Worker: queued → waiting_manual
 首条消息必须认证：
 
 ```text
-connector.hello { token, build: { version, commit, dirty } }
+connector.hello { token, build: { version, commit, dirty }, features: ["worker_message_v1"] }
 → connector.ready { connector, hub: { version, commit, dirty } }
 ```
 
-认证前不接受其他消息，认证失败立即关闭。令牌不放在 URL 查询参数中。`build` 是可选字段，旧 Connector 不带也能认证。
+认证前不接受其他消息，认证失败立即关闭。令牌不放在 URL 查询参数中。`build` 和 `features` 是可选字段，旧 Connector 不带也能认证；缺少直连能力声明时只影响 Worker 直连消息，不影响原有任务通道。
 
 主要消息：
 
@@ -294,6 +302,9 @@ Connector → Hub:
   worker.register
   worker.channel
   worker.status
+  worker.directory
+  worker_message.create
+  worker_message.wait
   task.create
   task.update
   command.create
@@ -305,6 +316,9 @@ Connector → Hub:
 
 Hub → Connector:
   worker.registered
+  worker.directory
+  worker_message.created
+  worker_message.result
   task.created
   task.updated
   command.created
@@ -312,7 +326,7 @@ Hub → Connector:
   error
 ```
 
-Connector 的 `task.create` / `command.create` 只能使用属于该 Connector 的 Worker；`task.update` 只能修改分配给该 Connector 的任务状态，且只接受状态字段。Hub 在服务端再次校验归属，不能仅靠本地 API 限制防止越权。
+Connector 的 `task.create` / `command.create` 只能使用属于该 Connector 的 Worker；`task.update` 只能修改分配给该 Connector 的任务状态，且只接受状态字段。Hub 在服务端再次校验归属，不能仅靠本地 API 限制防止越权。直连消息额外校验发送方原生身份及消息归属，接收方 Connector 只能回报自己收到的 Command。
 
 ### 7.2 Dashboard 通道
 

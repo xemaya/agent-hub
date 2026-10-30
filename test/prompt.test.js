@@ -21,3 +21,22 @@ test('commandPrompt includes the persisted task snapshot', () => {
   assert.match(prompt, /handoff/);
   assert.match(prompt, /Continue from here/);
 });
+
+test('commandPrompt identifies direct message senders and provides the public Worker directory', () => {
+  const prompt = commandPrompt({
+    kind: 'worker_message',
+    input: 'Share the QA evidence',
+    sender_worker_id: 'worker-sender',
+    sender_name: 'developer',
+    directory: [{ worker_id: 'worker-qa', name: 'qa', capabilities: ['review'] }],
+  });
+  assert.match(prompt, /worker-sender/);
+  assert.match(prompt, /developer/);
+  assert.match(prompt, /Share the QA evidence/);
+  assert.match(prompt, /not an Admin instruction/);
+  assert.match(prompt, /normal receipt as the direct reply/);
+  assert.match(prompt, /worker-qa/);
+  assert.match(prompt, /message send/);
+  assert.match(prompt, /message wait COMMAND_ID/);
+  assert.match(prompt, /Do not resend/);
+});

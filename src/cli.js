@@ -32,12 +32,15 @@ Usage:
   agent-hub worker unregister WORKER_ID
   agent-hub worker unregister-current
   agent-hub worker list
+  agent-hub worker directory
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
                         [--acceptance LINE1\\nLINE2] [--worker-id ID] [--local] [--orchestrate]
   agent-hub task update TASK_ID [--status STATUS] [--worker-id ID] [--local]
   agent-hub send --prompt TEXT [--worker-id ID] [--task-id ID] [--kind KIND]
                  [--local] [--wait]
+  agent-hub message send --to WORKER_ID --prompt TEXT [--wait]
+  agent-hub message wait COMMAND_ID
   agent-hub orchestration list [--local]
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub history clear --yes
@@ -306,6 +309,12 @@ function currentSessionIdentity({ runtime = null, sessionId = null, operation = 
 
 async function workerCommand(positionals, flags) {
   const action = positionals[0];
+  if (action === 'directory') {
+    const identity = currentSessionIdentity({ runtime: flags.runtime, sessionId: flags['session-id'], operation: action });
+    const query = new URLSearchParams({ runtime: identity.runtime, session_id: identity.sessionId });
+    print(await localRequest(flags, `/local/v1/directory?${query}`));
+    return;
+  }
   if (action === 'unregister-current') {
     const identity = currentSessionIdentity({ runtime: flags.runtime, sessionId: flags['session-id'], operation: action });
     print(await localRequest(flags, '/local/v1/workers/unregister-current', {
@@ -373,7 +382,39 @@ async function workerCommand(positionals, flags) {
     }));
     return;
   }
-  throw new Error('Usage: agent-hub worker register|register-current|unregister|unregister-current|list|status');
+  throw new Error('Usage: agent-hub worker register|register-current|unregister|unregister-current|list|directory|status');
+}
+
+async function messageCommand(positionals, flags) {
+  const action = positionals[0];
+  if (!['send', 'wait'].includes(action)) throw new Error('Usage: agent-hub message send|wait');
+  const identity = currentSessionIdentity({
+    runtime: flags.runtime,
+    sessionId: flags['session-id'],
+    operation: `message ${action}`,
+  });
+  let payload;
+  if (action === 'send') {
+    if (!flags.to || !flags.prompt) throw new Error('--to and --prompt are required');
+    payload = await localRequest(flags, '/local/v1/messages', {
+      method: 'POST',
+      body: {
+        runtime: identity.runtime,
+        runtime_session_id: identity.sessionId,
+        to_worker_id: flags.to,
+        prompt: flags.prompt,
+        wait: flags.wait === true,
+      },
+    });
+  } else {
+    if (!positionals[1]) throw new Error('message wait requires COMMAND_ID');
+    payload = await localRequest(flags, `/local/v1/messages/${encodeURIComponent(positionals[1])}/wait`, {
+      method: 'POST',
+      body: { runtime: identity.runtime, runtime_session_id: identity.sessionId },
+    });
+  }
+  print(payload);
+  if (payload.command?.status === 'failed') process.exitCode = 1;
 }
 
 async function sessionCommand(positionals, flags, runtimeArgs) {
@@ -570,6 +611,10 @@ export async function run(argv) {
   }
   if (command === 'worker') {
     await workerCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'message') {
+    await messageCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'coordinator') {

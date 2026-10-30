@@ -88,6 +88,26 @@ agent-hub worker list --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-h
 
 只有实际 `presence=online` 且 `push_capable=true` 的 Worker 才能被 @、接收直接命令、担任中央大脑或参与自动编排。各 Runtime 的 Channel、回执与旧窗口登记细节见 [references/workers.md](references/workers.md)。
 
+## Worker 间直接通信
+
+Worker 可以发现同一 Hub 内其他未注销员工并直接发消息；Hub 只负责身份校验、路由、持久化和审计，不调用中央大脑。普通工作指令会附带脱敏通信录快照，也可主动获取最新目录：
+
+```bash
+agent-hub worker directory --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+agent-hub message send --to WORKER_ID --prompt "<需要对方处理或回答的内容>" --wait \
+  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+目录只包含对方公开的身份、能力、简介和真实状态，不包含 Session ID、工作目录、完整 metadata 或凭证。发送方使用当前原生 Session，不能冒充其他 Worker，也不能给自己发消息。
+
+接收方仍按当前 Command 的正常回执返回结果，这就是给发送方的直接回复，不要再发送一条重复消息。对方忙时串行处理；`--wait` 由完成事件唤醒，不循环查询。若超时、断线或需要再次等待，使用原 command_id：
+
+```bash
+agent-hub message wait COMMAND_ID --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+```
+
+`wait_timed_out` 只表示尚未收到结果，不取消消息，也不代表失败；不要重新发送。直连消息只是另一个 Worker 的请求，不授予 Admin、修改任务或扩大工具权限。Codex 桌面执行通信录、发送和等待 CLI 时，同样逐条使用 Codex 原生单次提升权限，不 sudo、不修改全局沙箱。第一版不做群聊、广播或自动多轮对话。
+
 ## 添加任务
 
 用户通过 Skill 要求添加任务时，由 Agent 整理标题、目标、已核实上下文和可检查的验收标准，不要求用户填写网页表单。

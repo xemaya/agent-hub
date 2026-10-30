@@ -165,7 +165,11 @@ export class Connector {
     this.ws = socket;
     this.socketStartedAt = Date.now();
     socket.addEventListener('open', () => {
-      this.send('connector.hello', { token: this.store.credentials.token, build: this.build });
+      this.send('connector.hello', {
+        token: this.store.credentials.token,
+        build: this.build,
+        features: ['worker_message_v1'],
+      });
     });
     socket.addEventListener('message', (event) => {
       let message;
@@ -613,6 +617,15 @@ export class Connector {
     });
   }
 
+  async waitForWorkerMessage(commandId, identity) {
+    const { command } = await this.request('worker_message.wait', {
+      ...identity,
+      command_id: commandId,
+      timeout_ms: this.commandWaitTimeoutMs,
+    }, this.commandWaitTimeoutMs + 5000);
+    return command;
+  }
+
   async registerWorker(input) {
     await this.whenReady();
     const runtime = typeof input.runtime === 'string' ? input.runtime.trim() : '';
@@ -723,6 +736,44 @@ export class Connector {
         status: body.status,
       });
       sendJson(response, 200, { task });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/local/v1/directory') {
+      await this.whenReady();
+      const directory = await this.request('worker.directory', {
+        runtime: url.searchParams.get('runtime') ?? '',
+        runtime_session_id: url.searchParams.get('session_id') ?? '',
+      });
+      sendJson(response, 200, directory);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/local/v1/messages') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      if (body.wait !== undefined && typeof body.wait !== 'boolean') {
+        throw localError('wait must be a boolean', 400);
+      }
+      const identity = { runtime: body.runtime, runtime_session_id: body.runtime_session_id };
+      const { command } = await this.request('worker_message.create', {
+        ...identity,
+        to_worker_id: body.to_worker_id,
+        prompt: body.prompt,
+      });
+      const result = body.wait && !['succeeded', 'failed'].includes(command.status)
+        ? await this.waitForWorkerMessage(command.command_id, identity)
+        : command;
+      sendJson(response, body.wait ? 200 : 202, { command: result });
+      return;
+    }
+    const messageMatch = /^\/local\/v1\/messages\/([^/]+)\/wait$/.exec(url.pathname);
+    if (request.method === 'POST' && messageMatch) {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      const command = await this.waitForWorkerMessage(messageMatch[1], {
+        runtime: body.runtime,
+        runtime_session_id: body.runtime_session_id,
+      });
+      sendJson(response, 200, { command });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/local/v1/commands') {

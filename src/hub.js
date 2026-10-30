@@ -21,7 +21,7 @@ const STATIC_FILES = new Map([
 ]);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
-const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat', 'worker_chat']);
+const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat', 'worker_chat', 'worker_message']);
 const COORDINATOR_COMMAND_KINDS = new Set(['coordinator_plan', 'coordinator_review', 'coordinator_chat']);
 
 function workerActivity(store, worker) {
@@ -147,6 +147,8 @@ export class Hub {
     this.credentials = credentials;
     this.connectors = new Map();
     this.dashboards = new Set();
+    this.connectorFeatures = new Map();
+    this.workerMessageWaiters = new Map();
     this.coordinator = new Coordinator({
       store: this.store,
       emit: (...args) => this.emit(...args),
@@ -225,9 +227,14 @@ export class Hub {
 
   async close() {
     clearInterval(this.heartbeat);
+    for (const waiters of this.workerMessageWaiters.values()) {
+      for (const waiter of waiters) clearTimeout(waiter.timer);
+    }
+    this.workerMessageWaiters.clear();
     for (const socket of this.wss.clients) socket.close(1001, 'Hub shutting down');
     this.connectors.clear();
     this.dashboards.clear();
+    this.connectorFeatures.clear();
     if (this.server.listening) {
       await new Promise((resolve) => this.server.close(resolve));
     }
@@ -522,7 +529,7 @@ export class Hub {
         return;
       }
       const kind = body.kind ?? 'prompt';
-      if (!COMMAND_KINDS.has(kind)) {
+      if (kind === 'worker_message' || !COMMAND_KINDS.has(kind)) {
         sendJson(response, 400, { error: 'Unsupported command kind' });
         return;
       }
@@ -654,6 +661,11 @@ export class Hub {
           const previous = this.connectors.get(connectorId);
           if (previous && previous !== socket) previous.close(1008, 'Replaced by newer connection');
           this.connectors.set(connectorId, socket);
+          this.connectorFeatures.set(connectorId, new Set(
+            Array.isArray(message.payload.features)
+              ? message.payload.features.filter(feature => typeof feature === 'string')
+              : [],
+          ));
           this.store.setConnectorOnline(connectorId, true);
           this.recordConnectorBuild(connectorId, message.payload.build);
           this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
@@ -674,10 +686,12 @@ export class Hub {
       }
     });
     socket.on('close', () => {
+      this.clearWorkerMessageWaiters(socket);
       if (kind === 'dashboard') {
         this.dashboards.delete(socket);
       } else if (connectorId && this.connectors.get(connectorId) === socket) {
         this.connectors.delete(connectorId);
+        this.connectorFeatures.delete(connectorId);
         this.store.setConnectorOnline(connectorId, false);
         this.emit('connector.offline', { type: 'connector', id: connectorId }, { connector_id: connectorId });
       }
@@ -690,6 +704,64 @@ export class Hub {
     if (!command) return null;
     const worker = this.store.getWorkerForConnector(command.worker_id, connectorId);
     return worker ? command : null;
+  }
+
+  workerSession(connectorId, payload) {
+    const worker = this.store.getWorkerBySession(
+      connectorId,
+      requiredString(payload.runtime, 'runtime', { max: 40 }),
+      requiredString(payload.runtime_session_id, 'runtime_session_id', { max: 300 }),
+    );
+    if (!worker || worker.retired_at) throw protocolError('Current Worker identity is unavailable', 403, 'worker_forbidden');
+    return worker;
+  }
+
+  workerMessageForSender(commandId, sender) {
+    const command = this.store.getCommand(commandId);
+    if (!command || command.kind !== 'worker_message' || command.sender_worker_id !== sender.worker_id) {
+      throw protocolError('Worker message not found for this sender', 404, 'worker_message_not_found');
+    }
+    return command;
+  }
+
+  settleWorkerMessageWaiters(command) {
+    if (command?.kind !== 'worker_message' || !['succeeded', 'failed'].includes(command.status)) return;
+    const waiters = this.workerMessageWaiters.get(command.command_id);
+    if (!waiters) return;
+    this.workerMessageWaiters.delete(command.command_id);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      this.send(waiter.socket, 'worker_message.result', { command }, waiter.replyTo);
+    }
+  }
+
+  waitForWorkerMessage(socket, message, command, timeoutMs) {
+    const waiter = { socket, replyTo: message.id, timer: null };
+    waiter.timer = setTimeout(() => {
+      const waiters = this.workerMessageWaiters.get(command.command_id);
+      waiters?.delete(waiter);
+      if (waiters?.size === 0) this.workerMessageWaiters.delete(command.command_id);
+      const latest = this.store.getCommand(command.command_id);
+      this.send(socket, 'worker_message.result', {
+        command: { ...latest, wait_timed_out: true },
+      }, message.id);
+    }, timeoutMs);
+    waiter.timer.unref();
+    const waiters = this.workerMessageWaiters.get(command.command_id) ?? new Set();
+    waiters.add(waiter);
+    this.workerMessageWaiters.set(command.command_id, waiters);
+    this.settleWorkerMessageWaiters(this.store.getCommand(command.command_id));
+  }
+
+  clearWorkerMessageWaiters(socket) {
+    for (const [commandId, waiters] of this.workerMessageWaiters) {
+      for (const waiter of waiters) {
+        if (waiter.socket !== socket) continue;
+        clearTimeout(waiter.timer);
+        waiters.delete(waiter);
+      }
+      if (waiters.size === 0) this.workerMessageWaiters.delete(commandId);
+    }
   }
 
   recordConnectorBuild(connectorId, build) {
@@ -711,6 +783,57 @@ export class Hub {
       this.send(socket, 'orchestration.list', {
         orchestrations: this.coordinator.listForConnector(connectorId),
       }, message.id);
+      return;
+    }
+    if (message.type === 'worker.directory') {
+      const requester = this.workerSession(connectorId, payload);
+      this.send(socket, 'worker.directory', {
+        requester_worker_id: requester.worker_id,
+        workers: this.store.listWorkerDirectory({ excludeWorkerId: requester.worker_id }),
+      }, message.id);
+      return;
+    }
+    if (message.type === 'worker_message.create') {
+      const sender = this.workerSession(connectorId, payload);
+      const recipient = this.store.getWorker(requiredString(payload.to_worker_id, 'to_worker_id', { max: 100 }));
+      if (!recipient) throw protocolError('Recipient Worker not found', 404, 'worker_not_found');
+      if (recipient.worker_id === sender.worker_id) throw protocolError('Cannot message the same Worker', 400, 'worker_message_self');
+      if (!this.connectorFeatures.get(recipient.connector_id)?.has('worker_message_v1')) {
+        throw protocolError('Recipient Connector does not support Worker messages', 409, 'worker_message_unsupported');
+      }
+      const command = this.store.createCommand({
+        task_id: null,
+        worker_id: recipient.worker_id,
+        sender_worker_id: sender.worker_id,
+        kind: 'worker_message',
+        input: requiredString(payload.prompt, 'prompt', { max: 200000 }),
+        push_capable: recipient.push_capable,
+      });
+      this.emit('worker_message.created', { type: 'worker', id: sender.worker_id }, {
+        connector_id: recipient.connector_id,
+        worker_id: recipient.worker_id,
+        command_id: command.command_id,
+        payload: { sender_worker_id: sender.worker_id, status: command.status },
+      });
+      this.send(socket, 'worker_message.created', { command }, message.id);
+      if (command.status === 'queued') this.dispatch(command);
+      return;
+    }
+    if (message.type === 'worker_message.wait') {
+      const sender = this.workerSession(connectorId, payload);
+      const command = this.workerMessageForSender(
+        requiredString(payload.command_id, 'command_id', { max: 100 }),
+        sender,
+      );
+      if (['succeeded', 'failed'].includes(command.status)) {
+        this.send(socket, 'worker_message.result', { command }, message.id);
+        return;
+      }
+      const requestedTimeout = Number(payload.timeout_ms);
+      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? Math.min(Math.floor(requestedTimeout), 600000)
+        : 600000;
+      this.waitForWorkerMessage(socket, message, command, timeoutMs);
       return;
     }
     if (message.type === 'task.create') {
@@ -778,7 +901,7 @@ export class Hub {
       const worker = workerId ? this.store.getWorkerForConnector(workerId, connectorId) : null;
       if (!worker) throw protocolError('Worker is unavailable to this connector', 403, 'worker_forbidden');
       const kind = payload.kind ?? 'prompt';
-      if (!COMMAND_KINDS.has(kind)) throw protocolError('Unsupported command kind', 400, 'unsupported_command_kind');
+      if (kind === 'worker_message' || !COMMAND_KINDS.has(kind)) throw protocolError('Unsupported command kind', 400, 'unsupported_command_kind');
       const command = this.store.createCommand({
         task_id: taskId,
         worker_id: worker.worker_id,
@@ -908,7 +1031,8 @@ export class Hub {
       });
       this.broadcast('command.updated', { command });
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
-      await this.coordinator.onCommandFinished(command);
+      if (command.kind === 'worker_message') this.settleWorkerMessageWaiters(command);
+      else await this.coordinator.onCommandFinished(command);
       return;
     }
     if (message.type === 'command.sync') {
@@ -924,7 +1048,8 @@ export class Hub {
           error: payload.error,
           outcomeUnknown: Boolean(payload.outcome_unknown),
         });
-        await this.coordinator.onCommandFinished(updated);
+        if (updated.kind === 'worker_message') this.settleWorkerMessageWaiters(updated);
+        else await this.coordinator.onCommandFinished(updated);
       }
       this.broadcast('command.updated', { command: updated });
       return;
@@ -937,7 +1062,12 @@ export class Hub {
     const socket = worker && this.connectors.get(worker.connector_id);
     if (!socket) return false;
     const task = command.task_id ? this.store.getTask(command.task_id) : null;
-    return this.send(socket, 'command.dispatch', { command: { ...command, task } });
+    const directory = COORDINATOR_COMMAND_KINDS.has(command.kind)
+      ? null
+      : this.store.listWorkerDirectory({ excludeWorkerId: command.worker_id });
+    return this.send(socket, 'command.dispatch', {
+      command: { ...command, task, ...(directory ? { directory } : {}) },
+    });
   }
 
   replay(connectorId) {

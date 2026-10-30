@@ -17,7 +17,7 @@ test('Task deletion is an idempotent tombstone that preserves history and task n
   const dashboard = await context.openDashboard();
   const task = await createTask(context, { assignee_worker_id: worker.worker_id });
   assert.equal(context.hub.store.getWorker(worker.worker_id).current_task_id, task.task_id);
-  assert.equal(context.hub.store.db.prepare('PRAGMA user_version').get().user_version, 9);
+  assert.equal(context.hub.store.db.prepare('PRAGMA user_version').get().user_version, 10);
 
   const deleted = await context.admin(`/api/v1/tasks/${task.task_id}`, { method: 'DELETE' });
   assert.equal(deleted.response.status, 200);

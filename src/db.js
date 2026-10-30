@@ -43,6 +43,21 @@ function workerView(row) {
   };
 }
 
+function workerDirectoryView(worker) {
+  if (!worker) return null;
+  return {
+    worker_id: worker.worker_id,
+    connector_name: worker.connector_name,
+    name: worker.name,
+    runtime: worker.runtime,
+    capabilities: worker.capabilities,
+    description: typeof worker.metadata?.description === 'string' ? worker.metadata.description.slice(0, 2000) : '',
+    push_capable: worker.push_capable,
+    presence: worker.presence,
+    work_state: worker.work_state,
+  };
+}
+
 function taskView(row) {
   if (!row) return null;
   return {
@@ -69,6 +84,8 @@ function commandView(row) {
     task_id: row.task_id,
     worker_id: row.worker_id,
     worker_name: row.worker_name,
+    sender_worker_id: row.sender_worker_id ?? null,
+    sender_name: row.sender_name ?? null,
     kind: row.kind,
     input: row.input,
     status: row.status,
@@ -156,8 +173,10 @@ const TASK_SELECT = `
   FROM tasks t LEFT JOIN workers w ON w.worker_id = t.assignee_worker_id
 `;
 const COMMAND_SELECT = `
-  SELECT cmd.*, w.name AS worker_name
-  FROM commands cmd JOIN workers w ON w.worker_id = cmd.worker_id
+  SELECT cmd.*, w.name AS worker_name, sender.name AS sender_name
+  FROM commands cmd
+  JOIN workers w ON w.worker_id = cmd.worker_id
+  LEFT JOIN workers sender ON sender.worker_id = cmd.sender_worker_id
 `;
 
 export class HubStore {
@@ -211,6 +230,7 @@ export class HubStore {
         command_id TEXT PRIMARY KEY,
         task_id TEXT REFERENCES tasks(task_id),
         worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+        sender_worker_id TEXT REFERENCES workers(worker_id),
         kind TEXT NOT NULL,
         input TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -315,6 +335,10 @@ export class HubStore {
     if (!taskColumns.has('deleted_at')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN deleted_at TEXT');
     }
+    const commandColumns = new Set(this.db.prepare('PRAGMA table_info(commands)').all().map((column) => column.name));
+    if (!commandColumns.has('sender_worker_id')) {
+      this.db.exec('ALTER TABLE commands ADD COLUMN sender_worker_id TEXT REFERENCES workers(worker_id)');
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS task_number_sequence (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -330,8 +354,9 @@ export class HubStore {
         next_number = MAX(task_number_sequence.next_number, excluded.next_number);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_commands_sender ON commands(sender_worker_id);
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
-      PRAGMA user_version = 9;
+      PRAGMA user_version = 10;
     `);
   }
 
@@ -443,6 +468,12 @@ export class HubStore {
     return this.db.prepare(`${WORKER_SELECT} ${where} ORDER BY w.created_at DESC, w.rowid DESC`).all().map(workerView);
   }
 
+  listWorkerDirectory({ excludeWorkerId = null } = {}) {
+    return this.listWorkers()
+      .filter((worker) => worker.worker_id !== excludeWorkerId)
+      .map(workerDirectoryView);
+  }
+
   retireWorker(workerId, { connectorId = null } = {}) {
     return this.transaction(() => {
       const worker = this.getWorker(workerId);
@@ -460,8 +491,9 @@ export class HubStore {
       }
       const activeCommands = this.db.prepare(`
         SELECT COUNT(*) AS count FROM commands
-        WHERE worker_id = ? AND status IN ('queued', 'accepted', 'running', 'waiting_manual')
-      `).get(workerId).count;
+        WHERE (worker_id = ? OR sender_worker_id = ?)
+          AND status IN ('queued', 'accepted', 'running', 'waiting_manual')
+      `).get(workerId, workerId).count;
       const activeTasks = this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE assignee_worker_id = ? AND status = 'in_progress'").get(workerId).count;
       const activeSteps = this.listOrchestrations().filter((orchestration) => (
         ['ready', 'planning', 'in_progress'].includes(orchestration.status)
@@ -657,17 +689,32 @@ export class HubStore {
       error.statusCode = 409;
       throw error;
     }
+    const kind = data.kind ?? 'prompt';
+    if ((kind === 'worker_message') !== Boolean(data.sender_worker_id)) {
+      const error = new Error('worker_message requires a sender and other commands cannot declare one');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (data.sender_worker_id) {
+      const sender = this.getWorker(data.sender_worker_id);
+      if (!sender || sender.retired_at || sender.worker_id === worker?.worker_id) {
+        const error = new Error('Worker message sender is unavailable or matches the recipient');
+        error.statusCode = 400;
+        throw error;
+      }
+    }
     const timestamp = now();
     const commandId = createId('cmd');
     const status = data.push_capable ? 'queued' : 'waiting_manual';
     this.db.prepare(`
-      INSERT INTO commands (command_id, task_id, worker_id, kind, input, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO commands (command_id, task_id, worker_id, sender_worker_id, kind, input, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       commandId,
       data.task_id ?? null,
       data.worker_id,
-      data.kind ?? 'prompt',
+      data.sender_worker_id ?? null,
+      kind,
       data.input,
       status,
       timestamp,

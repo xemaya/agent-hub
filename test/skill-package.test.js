@@ -64,7 +64,11 @@ test('public Skill is a complete, deterministic ZIP without exposing admin APIs'
   assert.match(html, /所有 Worker 都是可见交互 Session/);
   const raw = await fetch(`${hub.url}/skill/SKILL.md`);
   assert.equal(raw.status, 200);
-  assert.match(await raw.text(), /首次接入一台新 Mac/);
+  const skill = await raw.text();
+  assert.match(skill, /首次接入一台新 Mac/);
+  assert.match(skill, /worker directory/);
+  assert.match(skill, /message send/);
+  assert.match(skill, /不调用中央大脑/);
   const first = await fetch(`${hub.url}/skill/agent-hub.zip`);
   const second = await fetch(`${hub.url}/skill/agent-hub.zip`);
   assert.equal(first.status, 200);

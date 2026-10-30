@@ -46,7 +46,7 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 11);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 12);
   assert.ok(store.db.prepare('PRAGMA table_info(tasks)').all().some((column) => column.name === 'deleted_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
@@ -198,5 +198,5 @@ test('interactive-only migration preserves Worker identity, work history and Coo
   assert.equal(store.getCommand(command.command_id).sender_worker_id, null);
   assert.equal(store.getCommand(command.command_id).last_activity_at, command.created_at);
   assert.equal(store.getCoordinatorConfig().worker_id, worker.worker_id);
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 11);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 12);
 });

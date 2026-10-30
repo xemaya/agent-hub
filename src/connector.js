@@ -170,7 +170,7 @@ export class Connector {
       this.send('connector.hello', {
         token: this.store.credentials.token,
         build: this.build,
-        features: ['worker_message_v1'],
+        features: ['worker_message_v1', 'mailbox_v1'],
       });
     });
     socket.addEventListener('message', (event) => {
@@ -344,6 +344,25 @@ export class Connector {
       await this.receiveCommand(message.payload.command);
       return;
     }
+    if (message.type === 'mail.offer') {
+      const mail = message.payload.message;
+      const worker = this.store.getWorker(mail.recipient_worker_id);
+      const channel = worker && this.channels.get(worker.worker_id);
+      if (!channel) {
+        await this.request('mail.notice', { runtime: worker?.runtime, runtime_session_id: worker?.runtime_session_id, message_id: mail.message_id, status: 'pending' });
+      } else if (!channel.features.has('mailbox_v1')) {
+        await this.request('mail.notice', { runtime: worker.runtime, runtime_session_id: worker.runtime_session_id, message_id: mail.message_id,
+          status: 'unsupported', error: 'Native bridge needs a mailbox-capable version; inbox delivery succeeded' });
+      } else {
+        const previous = this.store.getMailNotification(mail.message_id);
+        if (previous) return;
+        // Persist before handing a notification to a native session. A lost
+        // transport acknowledgement never replays the model turn.
+        await this.store.saveMailNotification(mail.message_id, { session_id: channel.sessionId, runtime: channel.runtime, status: 'offered' });
+        this.writeChannelEvent(channel, { type: 'mail', message: mail });
+      }
+      return;
+    }
     if (message.type === 'command.cancel') {
       await this.cancelCommand(message.payload.command_id, message.payload.error);
       return;
@@ -389,7 +408,7 @@ export class Connector {
     channel.response.write(`data: ${JSON.stringify(event)}\n\n`);
   }
 
-  openChannel(request, response, { runtime, sessionId }) {
+  openChannel(request, response, { runtime, sessionId, features = [] }) {
     if (this.stopping) throw localError('Connector is shutting down', 503);
     if (!runtime || !sessionId) throw localError('runtime and session_id are required');
     response.writeHead(200, {
@@ -397,7 +416,7 @@ export class Connector {
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    const channel = { runtime, sessionId, response, workerId: null, deliveries: new Map() };
+    const channel = { runtime, sessionId, response, workerId: null, deliveries: new Map(), features: new Set(features) };
     const keepalive = setInterval(() => response.write(': keepalive\n\n'), this.channelKeepaliveMs);
     keepalive.unref();
     response.on('close', () => {
@@ -444,7 +463,7 @@ export class Connector {
 
   async announceChannel(workerId, attached) {
     if (!this.ready) return;
-    await this.request('worker.channel', { worker_id: workerId, attached }).catch((error) => {
+    await this.request('worker.channel', { worker_id: workerId, attached, features: [...(this.channels.get(workerId)?.features ?? [])] }).catch((error) => {
       this.logger.error?.(`Channel state for ${workerId} not recorded: ${error.message}`);
     });
   }
@@ -789,6 +808,40 @@ export class Connector {
       return;
     }
     this.requireLocalAuth(request);
+    if (url.pathname === '/local/v1/mail' && request.method === 'POST') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      const accepted = await this.request('mail.send', body);
+      sendJson(response, 202, accepted);
+      return;
+    }
+    if (url.pathname === '/local/v1/mail' && request.method === 'GET') {
+      await this.whenReady();
+      const mailbox = await this.request('mail.list', {
+        runtime: url.searchParams.get('runtime'), runtime_session_id: url.searchParams.get('session_id'),
+        folder: url.searchParams.get('folder') ?? 'inbox',
+        limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,
+        before: url.searchParams.has('before') ? Number(url.searchParams.get('before')) : null,
+        unread: url.searchParams.get('unread') === 'true',
+      });
+      sendJson(response, 200, mailbox);
+      return;
+    }
+    const mailMatch = /^\/local\/v1\/mail\/([^/]+)\/(get|read|notice)$/.exec(url.pathname);
+    if (mailMatch && request.method === 'POST') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      if (mailMatch[2] === 'notice') {
+        const notice = this.store.getMailNotification(mailMatch[1]);
+        if (!notice || notice.runtime !== body.runtime || notice.session_id !== body.runtime_session_id) {
+          throw localError('Notification does not belong to this Session', 403);
+        }
+      }
+      const result = await this.request(`mail.${mailMatch[2]}`, { ...body, message_id: mailMatch[1] });
+      if (mailMatch[2] === 'notice') await this.store.saveMailNotification(mailMatch[1], { runtime: body.runtime, session_id: body.runtime_session_id, status: body.status });
+      sendJson(response, 200, result);
+      return;
+    }
     if (request.method === 'GET' && url.pathname === '/local/v1/orchestrations') {
       await this.whenReady();
       const { orchestrations } = await this.request('orchestration.list');
@@ -918,6 +971,7 @@ export class Connector {
       this.openChannel(request, response, {
         runtime: url.searchParams.get('runtime') ?? '',
         sessionId: url.searchParams.get('session_id') ?? '',
+        features: (url.searchParams.get('features') ?? '').split(',').filter(Boolean),
       });
       return;
     }

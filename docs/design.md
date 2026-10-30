@@ -260,13 +260,17 @@ external Worker: queued → waiting_manual
 - 输出总量设置上限；达到上限后保留尾部并标记 truncated。
 - 最终结果与错误单独保存，避免只能翻完整终端日志。
 
-### 6.4 Worker 通信录与直连消息
+### 6.4 Worker 邮箱（schema 12）
 
-- `worker directory` 根据当前 Connector 与原生 Session 识别请求者，返回其他未注销 Worker 的实时目录。普通工作、直接问答和直连消息的 dispatch 也携带当次目录快照，协调者内部指令不注入直连能力。
-- 目录仅含 Worker ID、名称、runtime、能力、简介、Connector 名称、presence、push_capable 和 work_state；不包含 Session ID、cwd、完整 metadata、任务上下文或凭证。
-- `worker_message` 是带 `sender_worker_id` 的定向 Command，数据库 schema 为 `user_version=10`。Hub 根据 Connector 与原生 Session 映射确定发送方，目标不能是本人或已注销员工；通用 Admin/Connector `command.create` 不接受此类型。目标 Connector 必须在 hello 中声明 `worker_message_v1` 能力，滚动升级期间对旧 Connector 返回明确错误，不降级为来源不明的普通指令。
-- 接收方在可见交互 Session 中处理并提交正常回执，该结果就是发送方的直接回复。每个 Worker 仍串行执行，未接通时保留 `waiting_manual`；此类型不进入 Coordinator，不创建任务或后台 Runtime，也不授予 Admin 权限。
-- `message send --wait` 和 `message wait` 由 Hub 完成事件唤醒。已结束结果可重复等待而不重新执行；bounded timeout 只返回 `wait_timed_out` 和真实状态，不取消工作。断线清理旧等待者，恢复后使用原 command_id 再等待，不重发消息。第一版不做群聊、广播或自动多轮对话。
+通信使用独立 `worker_mail` 表，不创建 Command，也不占用任务队列或调用中央大脑。单个持久化行同时是发件人的 outbox 和接收人的 inbox；发送回执表示已入箱，即使接收方离线也成功。已读、原生通知和业务回复是独立事实。
+
+协议：`mail.send` / `mail.list` / `mail.get` / `mail.read`，发送方由 Connector 与当前原生 Session 核验；邮箱仅参与者可见。`message_id` 用于邮件身份，`conversation_id` 和 `in_reply_to` 组织回复；`command_id` 可空，只引用上下文。关联任务取消或历史清理不会取消邮件或阻塞后续回复。
+
+发送方提供 `client_message_id` 作为幂等键；相同内容重试返回同一回执，不同内容冲突。分页使用自增 sequence 游标，列表只返回正文摘要。read 操作仅能标记接收人的读状态；管理员检查不会替员工标读。
+
+Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状态为 pending / offered / accepted / unknown / unsupported，accepted 仅表示原生桥接接受通知，不表示代理已读。通知前持久化本地去重记录；未知投递结果不重放模型回合，邮件始终可以从 inbox 主动读取。旧桥接升级后仅恢复明确未支持的通知，不重试 unknown 通知。
+
+旧 `worker_message` Command 及其 wait 接口保留作为显式兼容路径；普通 message send 默认使用邮箱。任务执行继续使用原有 Command 的 check/report，不将普通来信包装成任务，也不为每封来信要求业务回复。
 
 ### 6.5 命令取消与 Agent 失稳保护
 

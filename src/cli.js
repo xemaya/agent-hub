@@ -1,6 +1,7 @@
 import { open, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hub } from './hub.js';
+import { createId } from './ids.js';
 import { Connector } from './connector.js';
 import { SESSION_RUNTIMES, startSession } from './session-launcher.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
@@ -41,6 +42,10 @@ Usage:
   agent-hub send --prompt TEXT [--worker-id ID] [--task-id ID] [--kind KIND]
                  [--local] [--wait]
   agent-hub message send --to WORKER_ID --prompt TEXT [--wait]
+  agent-hub message send --to WORKER_ID --body TEXT [--subject TEXT] [--command-id ID]
+  agent-hub message inbox|outbox [--unread] [--before CURSOR] [--limit N]
+  agent-hub message read|receipt MESSAGE_ID
+  agent-hub message reply MESSAGE_ID --body TEXT
   agent-hub message wait COMMAND_ID
   agent-hub command cancel COMMAND_ID [--reason TEXT]
   agent-hub orchestration list [--local]
@@ -59,7 +64,7 @@ Environment:
   AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS      Other command timeout (default 3600000)
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -137,7 +142,7 @@ async function adminRequest(flags, pathname, { method = 'GET', body } = {}) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error ?? `Request failed with HTTP ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(payload.error ?? `Request failed with HTTP ${response.status}`), { statusCode: response.status });
   return payload;
 }
 
@@ -168,7 +173,7 @@ async function localRequest(flags, pathname, { method = 'GET', body } = {}) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error ?? `Request failed with HTTP ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(payload.error ?? `Request failed with HTTP ${response.status}`), { statusCode: response.status });
   return payload;
 }
 
@@ -399,12 +404,56 @@ async function workerCommand(positionals, flags) {
 
 async function messageCommand(positionals, flags) {
   const action = positionals[0];
-  if (!['send', 'wait'].includes(action)) throw new Error('Usage: agent-hub message send|wait');
+  if (!['send', 'wait', 'inbox', 'outbox', 'read', 'receipt', 'reply'].includes(action)) throw new Error('Usage: agent-hub message send|inbox|outbox|read|receipt|reply');
   const identity = currentSessionIdentity({
     runtime: flags.runtime,
     sessionId: flags['session-id'],
     operation: `message ${action}`,
   });
+  const current = { runtime: identity.runtime, runtime_session_id: identity.sessionId };
+  // Explicit --wait retains the old command request/reply protocol. Ordinary
+  // messages use independent durable mailboxes and always return immediately.
+  if (action !== 'wait' && !(action === 'send' && flags.wait === true)) {
+    if (['inbox', 'outbox'].includes(action)) {
+      const query = new URLSearchParams({ runtime: identity.runtime, session_id: identity.sessionId, folder: action });
+      for (const name of ['before', 'limit']) if (flags[name] !== undefined) query.set(name, flags[name]);
+      if (flags.unread === true) query.set('unread', 'true');
+      print(await localRequest(flags, `/local/v1/mail?${query}`));
+      return;
+    }
+    if (['read', 'receipt'].includes(action)) {
+      if (!positionals[1]) throw new Error('A message ID is required');
+      print(await localRequest(flags, `/local/v1/mail/${encodeURIComponent(positionals[1])}/${action === 'read' ? 'read' : 'get'}`, { method: 'POST', body: current }));
+      return;
+    }
+    let recipient = flags.to;
+    let subject = flags.subject ?? '';
+    let commandId = flags['command-id'] ?? null;
+    let replyTo = flags['reply-to'] ?? null;
+    if (action === 'reply') {
+      if (!positionals[1]) throw new Error('reply requires MESSAGE_ID');
+      const { message } = await localRequest(flags, `/local/v1/mail/${encodeURIComponent(positionals[1])}/get`, { method: 'POST', body: current });
+      const { requester_worker_id: self } = await localRequest(flags, `/local/v1/directory?${new URLSearchParams({ runtime: identity.runtime, session_id: identity.sessionId })}`);
+      recipient = message.sender_worker_id === self ? message.recipient_worker_id : message.sender_worker_id;
+      subject = flags.subject ?? (message.subject.startsWith('Re: ') ? message.subject : `Re: ${message.subject}`.slice(0, 300));
+      commandId = flags['command-id'] ?? message.command_id;
+      replyTo = message.message_id;
+    }
+    const body = flags.body ?? flags.prompt;
+    if (!recipient || !body) throw new Error('--to and --body (or --prompt) are required');
+    const clientMessageId = flags['idempotency-key'] ?? createId('mailreq');
+    try {
+      print(await localRequest(flags, '/local/v1/mail', { method: 'POST', body: {
+        ...current, to_worker_id: recipient, subject, body, command_id: commandId,
+        in_reply_to: replyTo, client_message_id: clientMessageId,
+      } }));
+    } catch (error) {
+      print({ receipt: { status: error.statusCode >= 400 && error.statusCode < 500 ? 'rejected' : 'unknown', client_message_id: clientMessageId }, error: error.message,
+        recovery: 'Inspect message outbox. Retry only with the same --idempotency-key and identical contents.' });
+      process.exitCode = 1;
+    }
+    return;
+  }
   let payload;
   if (action === 'send') {
     if (!flags.to || !flags.prompt) throw new Error('--to and --prompt are required');

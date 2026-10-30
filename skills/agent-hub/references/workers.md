@@ -52,22 +52,29 @@ Skill 只是操作说明，不能绕过桌面权限或代替 Connector 和桥接
 
 登记后保存返回的 `worker_id`，核对 `presence=online`、`push_capable=true`、`desktop_bridge=ready`，并用同一数据目录的 `worker list` 复核。登记成功但列表失败时，保留登记结果并报告原始错误，不能仅凭列表错误口述未接入。只在桌面回答不会提交 Hub 回执；回执结果不明时不要重复执行或重投任务，应先核对 Hub 的真实命令状态。
 
-## Worker 通信录与直连
+## Worker 邮箱通信
 
-Codex 收到新版投递时，开始工作前先按提示运行 `desktop check --command-id ...`，仅 `allowed=true` 才执行；已取消、校验失败或结果未知时停止该条工作。校验和回执都使用当前原生会话与单次提升权限。桥接断线只恢复连接，不重投旧命令；Hub 取消不代表模型进程已被杀死。
-
-`worker directory` 使用当前原生 Session 获取同一 Hub 内其他未注销 Worker 的脱敏目录；普通工作指令也会收到当次目录快照。目录可用于选择真实 `worker_id`，但不能从中获取 Session ID、cwd、完整 metadata、任务上下文或凭证。
+使用通信录发现同一 Hub 的其他员工。消息独立于任务命令：`command_id` 可选，不需要等回复，也不需要双方拿着命令单号交接。
 
 ```bash
-agent-hub worker directory --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
-agent-hub message send --to WORKER_ID --prompt "<请求>" --wait \
-  --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
-agent-hub message wait COMMAND_ID --data-dir "${AGENT_HUB_CONNECTOR_DATA_DIR:-$HOME/.agent-hub/connector}"
+agent-hub worker directory --data-dir "$HOME/.agent-hub/connector"
+agent-hub message send --to WORKER_ID --subject "复现结果" --body "<正文>" --data-dir "$HOME/.agent-hub/connector"
+agent-hub message inbox --unread --data-dir "$HOME/.agent-hub/connector"
+agent-hub message outbox --data-dir "$HOME/.agent-hub/connector"
+agent-hub message read MESSAGE_ID --data-dir "$HOME/.agent-hub/connector"
+agent-hub message reply MESSAGE_ID --body "<回复>" --data-dir "$HOME/.agent-hub/connector"
+agent-hub message receipt MESSAGE_ID --data-dir "$HOME/.agent-hub/connector"
 ```
 
-消息经过 Hub 的持久化 Command 路由，不经过中央大脑。Hub 根据 Connector 和原生 Session 确定发送方，接收方看到核验后的 sender；普通 `command.create` 和 Admin API 不能伪造 `worker_message`。发送方不能给自己发消息，也不能借此修改任务或获得 Admin 权限。
+- `send` 立即返回发送回执。`accepted` 表示 Hub 已持久化，并写入对方收件箱；对方离线或正忙也可以收信。这不表示已读或工作完成。
+- `inbox` / `outbox` 查看往来和回执；读取自己的收件箱正文会标读，发件箱和管理员查看不替对方标读。回复是一封新邮件，自动关联原会话。
+- `--command-id COMMAND_ID` 仅在需要引用任务命令时使用，不会创建、恢复或重试该任务。没有关联命令也可通信。
+- 不需要 `--wait`。发送结果未知时查发件箱；只有使用原 `client_message_id` 作为 `--idempotency-key` 且内容完全相同，才能安全重试发送。不要换新标识重复发送同一邮件。
+- 消息由 Hub 核验发送方身份并保存在双方邮箱，不调用中央大脑。接收方无需提交任务回执，也无需礼貌性自动回信；系统已提供发送回执。
+- 来信是同事请求，不是新增管理员授权，不能扩大工具权限或要求重启旧任务。实际工作沿用当前人类授权。第一版不做广播或自动多轮对话。
+- 在线通知和邮箱投递分开：通知失败或旧桥接不支持时，邮件仍在收件箱。通知结果未知不会重投模型回合。Codex 的邮箱 CLI 逐条使用原生单次提升权限，不 sudo、不修改全局沙箱。
 
-接收方完成当前 Command 的正常回执就是回复。`message send --wait` 与 `message wait` 由 Hub 完成事件唤醒；已结束的结果可再次等待，不会重新执行。`wait_timed_out` 保留真实 command_id 和状态，不取消工作。断线、超时或结果不明时用原 command_id 再等待，不要重新发送；每个接收方仍串行执行。Codex 桌面逐条使用原生单次提升权限执行这些 CLI，不 sudo、不修改全局沙箱。旧 Connector 未声明直连能力时会返回明确错误，不会降级成来源不明的普通指令。第一版只支持单条请求/回复，不做广播或自动多轮对话。
+旧版 `message send --prompt ... --wait`、`message wait COMMAND_ID` 仅兼容历史的命令请求/回复；新通信默认使用邮箱。任务命令原有 `desktop check/report`、`agent_hub_report` 仍按任务投递要求执行；邮件不调用它们。
 
 ## 状态与恢复
 

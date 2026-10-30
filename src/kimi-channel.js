@@ -1,4 +1,5 @@
 import { readServerSentEvents } from './channel.js';
+import { mailPrompt } from './drivers/prompt.js';
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -98,10 +99,32 @@ export class KimiChannel {
       return;
     }
     if (event.type === 'command') await this.execute(event);
+    if (event.type === 'mail') {
+      const message = event.message;
+      let notified = false;
+      const notice = async (status, error = null) => {
+        const response = await fetch(`${this.connectorUrl}/local/v1/mail/${encodeURIComponent(message.message_id)}/notice`, {
+          method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ runtime: this.runtime, runtime_session_id: this.sessionId, status, error }),
+        });
+        if (!response.ok) throw new Error(`Mail notification receipt rejected (${response.status})`);
+      };
+      try {
+        this.driver.showInbound?.(mailPrompt(message));
+        await this.driver.execute({ worker: this.worker,
+          // Native driver request correlation only: no Hub Command is created.
+          command: { command_id: message.message_id, message_id: message.message_id, kind: 'worker_mail', input: mailPrompt(message) },
+          onOutput() {}, onState: async () => { if (!notified) { notified = true; await notice('accepted'); } },
+        });
+      } catch (error) {
+        this.logger.error?.(`Mail remains in inbox: ${error.message}`);
+        if (!notified) await notice('unknown', error.message).catch(() => {});
+      }
+    }
   }
 
   async streamLoop() {
-    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId });
+    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1' });
     while (!this.stopped) {
       this.abort = new AbortController();
       try {

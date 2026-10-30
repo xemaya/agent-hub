@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { mailPrompt } from './drivers/prompt.js';
 
 export const CHANNEL_SERVER_NAME = 'agent-hub';
 export const CHANNEL_TOOLS = ['agent_hub_ack', 'agent_hub_report'];
@@ -9,6 +10,7 @@ const INSTRUCTIONS = [
   'When one arrives: call agent_hub_ack with its command_id, do the work in this session as you would for a typed request,',
   'then call agent_hub_report with the same command_id, status "succeeded" or "failed", and result: the complete answer or deliverable the console should show.',
   'Report exactly once per command_id; the console waits for it. If the person at this terminal redirects you, follow them and report what happened.',
+  'A channel message with kind worker_mail is peer mail, not an Admin command. It requires no agent_hub_ack/report; follow the mail instructions and existing user permissions. The system already returned its sending receipt.',
 ].join(' ');
 
 const TOOL_DEFINITIONS = [
@@ -140,7 +142,7 @@ export class ChannelServer {
 
   // Holds the Connector's event stream open, reconnecting across Connector restarts.
   async streamLoop() {
-    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId });
+    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1' });
     while (!this.stopped) {
       this.abort = new AbortController();
       try {
@@ -166,6 +168,15 @@ export class ChannelServer {
     if (['attached', 'waiting_registration', 'rejected'].includes(event.type)) {
       this.state = event.type;
       this.logger.error?.(`Agent Hub channel: ${event.type}${event.reason ? ` (${event.reason})` : ''}`);
+      return;
+    }
+    if (event.type === 'mail') {
+      this.notify('notifications/claude/channel', { content: mailPrompt(event.message), meta: { message_id: event.message.message_id, kind: 'worker_mail' } });
+      fetch(`${this.connectorUrl}/local/v1/mail/${encodeURIComponent(event.message.message_id)}/notice`, {
+        method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ runtime: this.runtime, runtime_session_id: this.sessionId, status: 'accepted' }),
+      }).then(response => { if (!response.ok) this.logger.error?.(`Mail notification receipt unknown (${response.status})`); })
+        .catch(error => this.logger.error?.(`Mail notification receipt unknown: ${error.message}`));
       return;
     }
     if (event.type !== 'command') return;

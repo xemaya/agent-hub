@@ -37,6 +37,6 @@ test('commandPrompt identifies direct message senders and provides the public Wo
   assert.match(prompt, /normal receipt as the direct reply/);
   assert.match(prompt, /worker-qa/);
   assert.match(prompt, /message send/);
-  assert.match(prompt, /message wait COMMAND_ID/);
-  assert.match(prompt, /Do not resend/);
+  assert.match(prompt, /message inbox \/ outbox/);
+  assert.match(prompt, /No wait is required/);
 });

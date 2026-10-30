@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createId } from './ids.js';
 import { parseJson, stringifyJson } from './json.js';
+import { MailStore } from './mail-store.js';
 
 const now = () => new Date().toISOString();
 const OUTPUT_LIMIT = 256 * 1024;
@@ -363,8 +364,9 @@ export class HubStore {
       UPDATE commands SET last_activity_at = COALESCE(started_at, accepted_at, created_at)
         WHERE last_activity_at IS NULL;
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
-      PRAGMA user_version = 11;
     `);
+    this.mailbox = new MailStore(this.db);
+    this.db.exec('PRAGMA user_version = 12');
   }
 
   close() {

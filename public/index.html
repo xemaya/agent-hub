@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Agent Hub · 中央工作台</title>
-  <link rel="stylesheet" href="/style.css?v=11">
+  <link rel="stylesheet" href="/style.css?v=13">
 </head>
 <body>
   <section id="auth-view" class="auth-shell">
@@ -41,6 +41,7 @@
       <nav class="workspace-nav" aria-label="工作台视图">
         <button class="active" type="button" data-view="operations" aria-pressed="true">操作台</button>
         <button type="button" data-view="tasks" aria-pressed="false">任务看板 <b data-count="tasks">0</b></button>
+        <button type="button" data-view="mail" aria-pressed="false">通信邮箱</button>
       </nav>
 
       <section id="view-operations" aria-label="操作台">
@@ -81,6 +82,25 @@
         </div>
         <div id="tasks-list" class="task-list"></div>
       </section>
+      <section id="view-mail" class="mail-workspace" aria-label="Worker 通信邮箱" hidden>
+        <div class="mail-toolbar">
+          <div><span class="mail-eyebrow">WORKER MAIL</span><h2>通信邮箱</h2></div>
+          <label>查看员工邮箱<select id="mail-worker" aria-label="选择员工邮箱"></select></label>
+        </div>
+        <p class="mail-caption">发送后即写入对方收件箱，离线也可收信。这里查看投递和已读状态；查看正文不会替员工标为已读。</p>
+        <div class="mail-layout">
+          <aside class="mail-index" aria-label="邮件列表">
+            <div id="mail-folders" class="mail-folders" role="group" aria-label="选择收件箱或发件箱">
+              <button type="button" data-mail-folder="inbox" class="active" aria-pressed="true">收件箱 <b id="mail-unread">0</b></button>
+              <button type="button" data-mail-folder="outbox" aria-pressed="false">发件箱</button>
+            </div>
+            <p id="mail-status" class="mail-list-status" role="status"></p>
+            <div id="mail-list"></div>
+            <button id="mail-more" class="button button-quiet" type="button" hidden>更早的邮件</button>
+          </aside>
+          <article id="mail-reader" class="mail-reader" aria-label="邮件正文"><div class="empty-state"><p>选择一封邮件，查看正文与投递记录。</p></div></article>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -108,6 +128,6 @@
     <div id="task-dialog-content" class="dialog-content"></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js?v=12"></script>
+  <script type="module" src="/app.js?v=13"></script>
 </body>
 </html>

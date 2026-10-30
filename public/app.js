@@ -20,6 +20,12 @@ const state = {
   socket: null,
   reconnectTimer: null,
   refreshTimer: null,
+  mailWorker: null,
+  mailFolder: 'inbox',
+  mailMessages: [],
+  mailCursor: null,
+  mailSelected: null,
+  mailGeneration: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -776,6 +782,70 @@ function setView(view) {
   }
   $('#view-operations').hidden = view !== 'operations';
   $('#view-tasks').hidden = view !== 'tasks';
+  $('#view-mail').hidden = view !== 'mail';
+  if (view === 'mail') refreshMailbox().catch(error => toast(error.message, true));
+}
+
+function renderMailWorkers() {
+  const select = $('#mail-worker');
+  if (!state.workers.some(worker => worker.worker_id === state.mailWorker)) {
+    state.mailWorker = state.workers[0]?.worker_id ?? null;
+  }
+  select.innerHTML = state.workers.map(worker => `<option value="${escapeHtml(worker.worker_id)}">${escapeHtml(worker.name)}</option>`).join('');
+  select.value = state.mailWorker ?? '';
+}
+
+function renderMailbox() {
+  $('#mail-list').innerHTML = state.mailMessages.length ? state.mailMessages.map(message => `
+    <button type="button" class="mail-envelope ${message.message_id === state.mailSelected ? 'selected' : ''} ${!message.read_at ? 'unread' : ''}" data-mail-id="${escapeHtml(message.message_id)}">
+      <span class="mail-envelope-line"><strong>${escapeHtml(state.mailFolder === 'inbox' ? message.sender_name : message.recipient_name)}</strong><time>${escapeHtml(time(message.accepted_at))}</time></span>
+      <span class="mail-subject">${escapeHtml(message.subject || '无主题')}</span>
+      <span class="mail-preview">${escapeHtml(message.preview)}</span>
+      <span class="mail-envelope-state">${state.mailFolder === 'outbox' ? '发送成功 · 已入箱' : '已收到'} · ${message.read_at ? '员工已标读' : '员工未标读'}</span>
+    </button>`).join('') : empty(state.mailFolder === 'inbox' ? '收件箱是空的。离线收到的邮件也会出现在这里。' : '还没有发出的邮件。');
+  $('#mail-more').hidden = !state.mailCursor;
+  for (const button of $$('#mail-folders button')) {
+    const active = button.dataset.mailFolder === state.mailFolder;
+    button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
+  }
+}
+
+async function refreshMailbox(append = false) {
+  if (!state.token || !state.mailWorker) { renderMailbox(); return; }
+  const generation = ++state.mailGeneration;
+  const query = new URLSearchParams({ worker_id: state.mailWorker, folder: state.mailFolder, limit: '30' });
+  if (append && state.mailCursor) query.set('before', String(state.mailCursor));
+  $('#mail-status').textContent = '正在读取邮箱…';
+  try {
+    const mailbox = await api(`/api/v1/mail?${query}`);
+    if (generation !== state.mailGeneration) return;
+    state.mailMessages = append ? [...state.mailMessages, ...mailbox.messages] : mailbox.messages;
+    state.mailCursor = mailbox.next_cursor;
+    $('#mail-unread').textContent = String(mailbox.unread_count);
+    $('#mail-status').textContent = `${state.mailFolder === 'inbox' ? '收件箱' : '发件箱'} · ${state.mailMessages.length} 封${mailbox.next_cursor ? '，可继续加载' : ''}`;
+    renderMailbox();
+    if (state.mailSelected && state.mailMessages.some(message => message.message_id === state.mailSelected)) {
+      await openMail(state.mailSelected, generation);
+    }
+  } catch (error) {
+    if (generation === state.mailGeneration) $('#mail-status').textContent = `读取失败：${error.message}`;
+    throw error;
+  }
+}
+
+async function openMail(messageId, generation = state.mailGeneration) {
+  state.mailSelected = messageId;
+  renderMailbox();
+  const { message } = await api(`/api/v1/mail/${encodeURIComponent(messageId)}`);
+  if (generation !== state.mailGeneration || state.mailSelected !== messageId) return;
+  const notices = { pending: '等待会话接通', offered: '通知待确认', accepted: '会话桥接已接收通知', unknown: '通知结果未知，邮件仍保存在收件箱', unsupported: '当前会话桥接需升级才能推送通知；邮件已入箱，可直接读取' };
+  $('#mail-reader').innerHTML = `
+    <span class="mail-eyebrow">${state.mailFolder === 'inbox' ? 'INBOX' : 'OUTBOX'}</span>
+    <h2>${escapeHtml(message.subject || '无主题')}</h2>
+    <dl class="mail-addresses"><dt>发件人</dt><dd>${escapeHtml(message.sender_name)}</dd><dt>收件人</dt><dd>${escapeHtml(message.recipient_name)}</dd><dt>发送时间</dt><dd>${escapeHtml(dateTime(message.accepted_at))}</dd></dl>
+    <div class="mail-receipt"><span>发送成功 · 已入箱</span><span>${message.read_at ? `员工标读于 ${escapeHtml(dateTime(message.read_at))}` : '员工尚未标读'}</span></div>
+    <pre class="mail-body">${escapeHtml(message.body)}</pre>
+    <div class="mail-transport">${escapeHtml(notices[message.notification_status] ?? message.notification_status)}${message.command_id ? `<br>关联命令：${escapeHtml(message.command_id)}` : ''}${message.in_reply_to ? '<br>这是同一会话中的一封回复。' : ''}</div>`;
 }
 
 function openTaskDetail(taskId) {
@@ -832,6 +902,7 @@ function render() {
   renderTaskDialog();
   renderMentionPicker();
   renderConnection();
+  renderMailWorkers();
 }
 
 async function refresh() {
@@ -849,6 +920,7 @@ async function refresh() {
   state.messages = chat.messages;
   state.conversationEpoch = Number(chat.epoch ?? 0);
   render();
+  if (state.view === 'mail') await refreshMailbox();
 }
 
 function scheduleRefresh() {
@@ -886,6 +958,10 @@ function connectSocket() {
     if (message.type === 'chat.updated') {
       upsertMessage(message.payload.message);
       scheduleRefresh();
+      return;
+    }
+    if (message.type === 'mail.updated') {
+      if (state.view === 'mail') refreshMailbox().catch(error => toast(error.message, true));
       return;
     }
     if (message.type === 'task.deleted') {
@@ -1009,6 +1085,23 @@ $('.workspace-nav').addEventListener('click', (event) => {
   const button = event.target.closest('[data-view]');
   if (button) setView(button.dataset.view);
 });
+$('#mail-worker').addEventListener('change', event => {
+  state.mailWorker = event.target.value; state.mailSelected = null; state.mailCursor = null;
+  $('#mail-reader').innerHTML = empty('选择一封邮件，查看正文与投递记录。');
+  refreshMailbox().catch(error => toast(error.message, true));
+});
+$('#mail-folders').addEventListener('click', event => {
+  const button = event.target.closest('[data-mail-folder]');
+  if (!button) return;
+  state.mailFolder = button.dataset.mailFolder; state.mailSelected = null; state.mailCursor = null;
+  $('#mail-reader').innerHTML = empty('选择一封邮件，查看正文与投递记录。');
+  refreshMailbox().catch(error => toast(error.message, true));
+});
+$('#mail-list').addEventListener('click', event => {
+  const button = event.target.closest('[data-mail-id]');
+  if (button) openMail(button.dataset.mailId).catch(error => toast(error.message, true));
+});
+$('#mail-more').addEventListener('click', () => refreshMailbox(true).catch(error => toast(error.message, true)));
 $('#task-filters').addEventListener('click', (event) => {
   const button = event.target.closest('[data-task-filter]');
   if (!button) return;

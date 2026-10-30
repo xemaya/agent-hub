@@ -499,6 +499,23 @@ export class Hub {
       return;
     }
     this.requireAdmin(request);
+    if (request.method === 'GET' && pathname === '/api/v1/mail') {
+      const workerId = requiredString(url.searchParams.get('worker_id'), 'worker_id', { max: 100 });
+      if (!this.store.getWorker(workerId)) throw protocolError('Worker not found', 404);
+      sendJson(response, 200, this.store.mailbox.list(workerId, {
+        folder: url.searchParams.get('folder') ?? 'inbox',
+        limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,
+        before: url.searchParams.has('before') ? Number(url.searchParams.get('before')) : null,
+        unread: url.searchParams.get('unread') === 'true',
+      }));
+      return;
+    }
+    const adminMailMatch = /^\/api\/v1\/mail\/([^/]+)$/.exec(pathname);
+    if (request.method === 'GET' && adminMailMatch) {
+      const message = this.store.mailbox.get(adminMailMatch[1]);
+      sendJson(response, message ? 200 : 404, message ? { message } : { error: 'Message not found' });
+      return;
+    }
 
     if (request.method === 'GET' && pathname === '/api/v1/coordinator') {
       sendJson(response, 200, { coordinator: this.coordinator.status() });
@@ -857,6 +874,73 @@ export class Hub {
     return command;
   }
 
+  mailForWorker(messageId, workerId) {
+    return this.store.mailbox.forWorker(messageId, workerId);
+  }
+
+  dispatchMail(message) {
+    const worker = this.store.getWorker(message.recipient_worker_id);
+    const socket = worker && this.connectors.get(worker.connector_id);
+    if (!worker || worker.retired_at || !worker.push_capable || !socket
+      || !this.connectorFeatures.get(worker.connector_id)?.has('mailbox_v1')) return;
+    const offered = this.store.mailbox.offer(message.message_id);
+    if (!offered) return;
+    if (!this.send(socket, 'mail.offer', { message: offered })) {
+      this.store.mailbox.notification(message.message_id, 'pending');
+    }
+  }
+
+  notifyMailbox(workerId) {
+    for (const message of this.store.mailbox.pending(workerId)) this.dispatchMail(message);
+  }
+
+  createMail(sender, payload) {
+    if (payload.subject !== undefined && (typeof payload.subject !== 'string' || payload.subject.length > 300)) {
+      throw protocolError('subject must be a string of at most 300 characters');
+    }
+    const recipientId = requiredString(payload.to_worker_id, 'to_worker_id', { max: 100 });
+    const clientId = requiredString(payload.client_message_id, 'client_message_id', { max: 120 });
+    const body = requiredString(payload.body, 'body', { max: 200000 });
+    const replyTo = payload.in_reply_to == null ? null : requiredString(payload.in_reply_to, 'in_reply_to', { max: 100 });
+    const commandId = payload.command_id == null ? null : requiredString(payload.command_id, 'command_id', { max: 100 });
+    const subject = payload.subject ?? '';
+    const previous = this.store.mailbox.byClientId(sender.worker_id, clientId);
+    if (previous) {
+      const same = this.store.mailbox.create({ senderId: sender.worker_id, recipientId, clientMessageId: clientId, subject, body, commandId, inReplyTo: replyTo });
+      return { ...same, receipt: { status: 'accepted', message_id: same.message.message_id, client_message_id: clientId,
+        accepted_at: same.message.accepted_at, inbox_delivered_at: same.message.inbox_delivered_at } };
+    }
+    const recipient = this.store.getWorker(recipientId);
+    if (!recipient || recipient.retired_at) throw protocolError('Recipient Worker is unavailable', 404, 'worker_not_found');
+    if (recipient.worker_id === sender.worker_id) throw protocolError('Cannot message the same Worker', 400, 'mail_self');
+    if (commandId) {
+      const command = this.store.getCommand(commandId);
+      const parent = replyTo ? this.store.mailbox.forWorker(replyTo, sender.worker_id) : null;
+      const historicalReply = parent?.command_id === commandId && [parent.sender_worker_id, parent.recipient_worker_id].includes(recipient.worker_id);
+      if (!historicalReply && (!command || ![command.worker_id, command.sender_worker_id].some(id => [sender.worker_id, recipient.worker_id].includes(id)))) {
+        throw protocolError('Associated command is not available to these participants', 403, 'mail_command_forbidden');
+      }
+    }
+    const created = this.store.mailbox.create({
+      senderId: sender.worker_id, recipientId: recipient.worker_id,
+      clientMessageId: clientId, subject, body,
+      commandId,
+      inReplyTo: replyTo,
+    });
+    if (!created.duplicate) {
+      this.emit('mail.accepted', { type: 'worker', id: sender.worker_id }, {
+        worker_id: recipient.worker_id,
+        payload: { message_id: created.message.message_id, sender_worker_id: sender.worker_id },
+      });
+      this.broadcast('mail.updated', { message_id: created.message.message_id });
+    }
+    return { ...created, receipt: {
+      status: 'accepted', message_id: created.message.message_id,
+      client_message_id: created.message.client_message_id,
+      accepted_at: created.message.accepted_at, inbox_delivered_at: created.message.inbox_delivered_at,
+    } };
+  }
+
   settleWorkerMessageWaiters(command) {
     if (command?.kind !== 'worker_message' || !['succeeded', 'failed'].includes(command.status)) return;
     const waiters = this.workerMessageWaiters.get(command.command_id);
@@ -907,6 +991,38 @@ export class Hub {
 
   async handleConnectorMessage(socket, connectorId, message) {
     const payload = message.payload ?? {};
+    if (message.type === 'mail.send') {
+      const sender = this.workerSession(connectorId, payload);
+      const created = this.createMail(sender, payload);
+      this.send(socket, 'mail.accepted', created, message.id);
+      // Notification is optional. Durable inbox acceptance has already succeeded.
+      try { this.dispatchMail(created.message); } catch (error) { this.logger.error?.(error); }
+      return;
+    }
+    if (['mail.list', 'mail.get', 'mail.read', 'mail.notice'].includes(message.type)) {
+      const worker = this.workerSession(connectorId, payload);
+      if (message.type === 'mail.list') {
+        this.send(socket, 'mail.list', this.store.mailbox.list(worker.worker_id, {
+          folder: payload.folder ?? 'inbox', limit: payload.limit ?? 50, before: payload.before ?? null, unread: payload.unread === true,
+        }), message.id);
+        return;
+      }
+      const mail = this.mailForWorker(requiredString(payload.message_id, 'message_id', { max: 100 }), worker.worker_id);
+      if (message.type === 'mail.get') {
+        this.send(socket, 'mail.message', { message: mail }, message.id);
+      } else if (message.type === 'mail.read') {
+        const read = this.store.mailbox.read(mail.message_id, worker.worker_id);
+        this.broadcast('mail.updated', { message_id: mail.message_id });
+        this.send(socket, 'mail.message', { message: read }, message.id);
+      } else {
+        if (mail.recipient_worker_id !== worker.worker_id) throw protocolError('Only the recipient can acknowledge its notification', 403);
+        const updated = this.store.mailbox.notification(mail.message_id, payload.status, typeof payload.error === 'string' ? payload.error.slice(0, 2000) : null);
+        this.broadcast('mail.updated', { message_id: mail.message_id });
+        this.send(socket, 'mail.notification', { message: updated }, message.id);
+        if (payload.status === 'accepted') this.notifyMailbox(worker.worker_id);
+      }
+      return;
+    }
     if (message.type === 'connector.heartbeat') {
       this.store.touchConnector(connectorId);
       this.send(socket, 'connector.heartbeat', { ts: new Date().toISOString() }, message.id);
@@ -1082,6 +1198,8 @@ export class Hub {
       });
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       if (worker.push_capable) this.replay(connectorId);
+      if (worker.push_capable && Array.isArray(payload.features) && payload.features.includes('mailbox_v1')) this.store.mailbox.retryUnsupported(worker.worker_id);
+      if (worker.push_capable) this.notifyMailbox(worker.worker_id);
       if (worker.push_capable) this.scheduleCoordinator();
       this.send(socket, 'worker.channel', { worker }, message.id);
       return;

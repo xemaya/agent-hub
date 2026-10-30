@@ -4,6 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { readServerSentEvents } from './channel.js';
 import { PROJECT_ROOT } from './build-info.js';
+import { mailPrompt } from './drivers/prompt.js';
 
 const execute = promisify(execFile);
 export async function checkNativeQueue(executable = 'codex') {
@@ -37,6 +38,7 @@ export class CodexQueueChannel {
     Object.assign(this, { connectorUrl: connectorUrl.replace(/\/$/, ''), token, sessionId, dataDir, cwd, executable, queue, desktopPid, onReady, logger, retryMs });
     this.stopped = false;
     this.state = 'connecting';
+    this.seenMail = new Set();
   }
   async call(commandId, action, body = {}) {
     const response = await fetch(`${this.connectorUrl}/local/v1/channel/commands/${encodeURIComponent(commandId)}/${action}`, {
@@ -77,13 +79,38 @@ export class CodexQueueChannel {
       catch (error) { error.transportOnly = true; throw error; }
     }
   }
+
+  async deliverMail(message) {
+    if (this.seenMail.has(message.message_id)) return;
+    this.seenMail.add(message.message_id);
+    let status = 'accepted';
+    let failure = null;
+    try {
+      const text = `Agent Hub 邮件，当前原生会话必须为 ${this.sessionId}，身份不符则停止。\n\n${mailPrompt(message)}`;
+      const { stdout } = await this.queue(this.executable, ['queue', '--thread', this.sessionId, '--message', text],
+        { cwd: this.cwd, timeout: 45000, maxBuffer: 256 * 1024 });
+      if (!stdout?.trim().startsWith('Queued message ') || !stdout.trim().endsWith(` for thread ${this.sessionId}.`)) {
+        throw new Error('Native mail notification acceptance is unknown');
+      }
+    } catch (error) {
+      status = 'unknown'; failure = error.killed ? 'native_queue_timeout' : String(error.code ?? 'native_notification_unknown');
+      this.logger.error?.(`Mail remains in inbox: ${failure}`);
+    }
+    try {
+      const response = await fetch(`${this.connectorUrl}/local/v1/mail/${encodeURIComponent(message.message_id)}/notice`, {
+        method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ runtime: 'codex', runtime_session_id: this.sessionId, status, error: failure }),
+      });
+      if (!response.ok) this.logger.error?.(`Mail notification receipt was not confirmed (${response.status}); inbox is durable, do not replay`);
+    } catch (error) { this.logger.error?.(`Mail notification receipt unknown: ${error.message}; do not replay`); }
+  }
   async start() {
     await mkdir(queueDirectory(this.dataDir, this.sessionId), { recursive: true, mode: 0o700 });
     if (this.desktopPid) {
       this.monitor = setInterval(() => { if (!alive(this.desktopPid)) this.stop(); }, 1000);
       this.monitor.unref();
     }
-    const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId });
+    const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId, features: 'mailbox_v1' });
     try {
       while (!this.stopped) {
         this.abort = new AbortController();
@@ -105,6 +132,7 @@ export class CodexQueueChannel {
               try { await this.deliver(event); }
               catch (error) { deliveryFailed = !error.transportOnly; throw error; }
             }
+            if (event.type === 'mail') await this.deliverMail(event.message);
           }
         } catch (error) {
           if (this.stopped) break;

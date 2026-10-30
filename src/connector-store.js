@@ -44,6 +44,7 @@ export class ConnectorStore {
         : { ...worker, mode: 'external', push_capable: false, driver_state: {} }
     ));
     state.commands ??= [];
+    state.mailNotifications ??= {};
     const store = new ConnectorStore(dataDir, state);
     await store.save();
     return store;
@@ -143,6 +144,17 @@ export class ConnectorStore {
 
   listCommands() {
     return structuredClone(this.state.commands);
+  }
+
+  getMailNotification(messageId) {
+    const notice = this.state.mailNotifications?.[messageId];
+    return notice ? structuredClone(notice) : null;
+  }
+
+  async saveMailNotification(messageId, notice) {
+    this.state.mailNotifications ??= {};
+    this.state.mailNotifications[messageId] = structuredClone(notice);
+    await this.save();
   }
 
   nextAcceptedCommand(workerId) {

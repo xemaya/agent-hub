@@ -49,10 +49,11 @@ export async function waitFor(predicate, { timeout = 6000, interval = 15 } = {})
   throw new Error(`Condition was not met within ${timeout}ms`);
 }
 
-export async function createTestContext(t) {
+export async function createTestContext(t, { hub: hubOptions = {}, connector: connectorOptions = {} } = {}) {
   await mkdir(TEST_ROOT, { recursive: true });
   const root = await mkdtemp(path.join(TEST_ROOT, 'case-'));
   let hub = await Hub.create({
+    ...hubOptions,
     host: '127.0.0.1',
     port: 0,
     dataDir: path.join(root, 'hub'),
@@ -73,6 +74,7 @@ export async function createTestContext(t) {
 
   const startConnector = async () => {
     connector = await Connector.create({
+      ...connectorOptions,
       hubUrl: hub.url,
       name: 'test-mac',
       hostname: 'test-mac',

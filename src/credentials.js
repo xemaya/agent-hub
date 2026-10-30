@@ -24,7 +24,8 @@ export async function loadHubCredentials(dataDir, env = process.env) {
     generated.push('enrollmentToken');
   }
 
-  if (!env.AGENT_HUB_ADMIN_TOKEN && !env.AGENT_HUB_ENROLLMENT_TOKEN) {
+  const changed = adminToken !== stored.adminToken || enrollmentToken !== stored.enrollmentToken;
+  if (changed && !env.AGENT_HUB_ADMIN_TOKEN && !env.AGENT_HUB_ENROLLMENT_TOKEN) {
     const temporary = `${file}.${process.pid}.tmp`;
     await writeFile(temporary, `${JSON.stringify({ adminToken, enrollmentToken }, null, 2)}\n`, {
       mode: 0o600,

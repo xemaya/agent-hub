@@ -219,6 +219,20 @@ agent-hub send --local --wait \
 
 等待由完成事件唤醒，不循环查询。即使命令成功，也必须核对验收后才能把任务更新为 `done`。失败、人工等待、超时或结果不明都不能报告完成。
 
+### 命令取消与无活动超时
+
+管理员可以终止任何仍处于 queued、accepted、running 或 waiting_manual 的 Command：
+
+```bash
+agent-hub command cancel COMMAND_ID \
+  --reason "桌面执行已人工停止" \
+  --hub-url "https://hub.findu.work" --hub-data-dir .runtime/hub
+```
+
+取消将 Command 持久化为 `failed`、`outcome_unknown=true`，保留审计记录，独立任务或编排按规则阻塞，不自动重试。接收方 Connector 丢弃未开始的命令及等待中的回执，晚到 report 不再被接受；已结束命令返回 409。**取消不等于证明模型进程已被杀死**，它终止的是 Hub 追踪和结果接收，桌面进程仍由用户或对应 Runtime 控制。
+
+运行中的 Command 以 `last_activity_at` 做无活动看门狗，ACK、开始执行和输出会刷新时间，机器心跳不冒充 Agent 进展。默认协调者命令 15 分钟、其他命令 60 分钟无活动后以 `inactivity_timeout` 和结果未知收尾；排队或等待人工接入不算正在执行超时。重启后仍按数据库时间判断。可通过 `AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS` 和 `AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS` 调整，设为 0 禁用对应看门狗。
+
 ### 指定中央大脑
 
 先在一个可见交互 Session 中登记并接通目标 Worker，再由管理员在中控点击“指定/更换”，或执行：

@@ -46,7 +46,7 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 10);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 11);
   assert.ok(store.db.prepare('PRAGMA table_info(tasks)').all().some((column) => column.name === 'deleted_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
@@ -183,9 +183,8 @@ test('interactive-only migration preserves Worker identity, work history and Coo
   store.setCoordinatorConfig({ workerId: worker.worker_id, enabled: true, maxSteps: 4 });
   store.db.exec(`PRAGMA ignore_check_constraints = ON;
     UPDATE workers SET mode = 'managed', push_capable = 1 WHERE worker_id = '${worker.worker_id}';
-    DROP INDEX idx_commands_sender;
-    ALTER TABLE commands DROP COLUMN sender_worker_id;
-    PRAGMA user_version = 9;
+    ALTER TABLE commands DROP COLUMN last_activity_at;
+    PRAGMA user_version = 10;
   `);
   store.close();
 
@@ -197,6 +196,7 @@ test('interactive-only migration preserves Worker identity, work history and Coo
   assert.equal(store.getTask(task.task_id).title, 'Legacy work');
   assert.equal(store.getCommand(command.command_id).input, 'Preserve me');
   assert.equal(store.getCommand(command.command_id).sender_worker_id, null);
+  assert.equal(store.getCommand(command.command_id).last_activity_at, command.created_at);
   assert.equal(store.getCoordinatorConfig().worker_id, worker.worker_id);
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 10);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 11);
 });

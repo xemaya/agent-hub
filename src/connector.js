@@ -330,6 +330,10 @@ export class Connector {
       await this.receiveCommand(message.payload.command);
       return;
     }
+    if (message.type === 'command.cancel') {
+      await this.cancelCommand(message.payload.command_id, message.payload.error);
+      return;
+    }
     if (message.type === 'worker.unregistered') {
       await this.applyWorkerRetirement(message.payload.worker);
       return;
@@ -471,6 +475,33 @@ export class Connector {
       delivery.reject(Object.assign(new Error(text || 'Interactive session reported failure'), { code: 'reported_failure' }));
     }
     return { ok: true };
+  }
+
+  async cancelCommand(commandId, error = {}) {
+    const current = this.store.getCommand(commandId);
+    if (!current || ['succeeded', 'failed'].includes(current.status)) return;
+    const failure = {
+      message: typeof error.message === 'string' ? error.message : 'Command cancelled by Hub',
+      code: typeof error.code === 'string' ? error.code : 'command_cancelled',
+    };
+    const updated = await this.store.updateCommand(commandId, {
+      status: 'failed',
+      result: null,
+      error: failure,
+      outcome_unknown: true,
+    });
+    const channel = [...this.channels.values()].find(item => item.deliveries.has(commandId));
+    if (channel) {
+      const delivery = channel.deliveries.get(commandId);
+      channel.deliveries.delete(commandId);
+      delivery.reject(Object.assign(new Error(failure.message), {
+        code: failure.code,
+        outcomeUnknown: true,
+      }));
+      return;
+    }
+    this.send('command.finished', updated);
+    this.scheduleWorker(updated.worker_id);
   }
 
   async syncAndPump() {

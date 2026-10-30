@@ -136,13 +136,21 @@ function workerInput(payload) {
 }
 
 export class Hub {
-  constructor({ host, port, dataDir, credentials, logger = console, build = null }) {
+  constructor({
+    host, port, dataDir, credentials, logger = console, build = null,
+    coordinatorInactivityTimeoutMs = 15 * 60 * 1000,
+    commandInactivityTimeoutMs = 60 * 60 * 1000,
+    watchdogIntervalMs = 30000,
+  }) {
     this.host = host;
     this.build = build ?? { version: null, commit: null, dirty: false };
     this.connectorBuilds = new Map();
     this.requestedPort = port;
     this.dataDir = path.resolve(dataDir);
     this.logger = logger;
+    this.coordinatorInactivityTimeoutMs = coordinatorInactivityTimeoutMs;
+    this.commandInactivityTimeoutMs = commandInactivityTimeoutMs;
+    this.expiringInactiveCommands = false;
     this.store = new HubStore(path.join(dataDir, 'hub.db'));
     this.credentials = credentials;
     this.connectors = new Map();
@@ -173,6 +181,10 @@ export class Hub {
       }
     }, 30000);
     this.heartbeat.unref();
+    this.inactivityWatchdog = setInterval(() => {
+      this.expireInactiveCommands().catch(error => this.logger.error?.(error));
+    }, watchdogIntervalMs);
+    this.inactivityWatchdog.unref();
     this.server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url, 'http://localhost');
       const kind = url.pathname === '/ws/connector'
@@ -214,6 +226,7 @@ export class Hub {
         resolve();
       });
     });
+    this.expireInactiveCommands().catch(error => this.logger.error?.(error));
   }
 
   get port() {
@@ -227,6 +240,7 @@ export class Hub {
 
   async close() {
     clearInterval(this.heartbeat);
+    clearInterval(this.inactivityWatchdog);
     for (const waiters of this.workerMessageWaiters.values()) {
       for (const waiter of waiters) clearTimeout(waiter.timer);
     }
@@ -288,6 +302,70 @@ export class Hub {
 
   presentWorker(worker) {
     return worker ? { ...worker, activity: workerActivity(this.store, worker) } : null;
+  }
+
+  async expireInactiveCommands() {
+    if (this.expiringInactiveCommands) return;
+    this.expiringInactiveCommands = true;
+    try {
+      const timestamp = Date.now();
+      for (const command of this.store.listRunningCommands()) {
+        const timeoutMs = COORDINATOR_COMMAND_KINDS.has(command.kind)
+          ? this.coordinatorInactivityTimeoutMs
+          : this.commandInactivityTimeoutMs;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) continue;
+        const lastActivity = Date.parse(command.last_activity_at ?? command.started_at ?? command.created_at);
+        if (!Number.isFinite(lastActivity) || timestamp - lastActivity < timeoutMs) continue;
+        try {
+          await this.cancelCommand(command.command_id, {
+            actor: { type: 'hub', id: 'inactivity-watchdog' },
+            code: 'inactivity_timeout',
+            message: `No command activity for ${timeoutMs} ms; outcome is unknown`,
+          });
+        } catch (error) {
+          if (error.code !== 'command_not_active') throw error;
+        }
+      }
+    } finally {
+      this.expiringInactiveCommands = false;
+    }
+  }
+
+  async cancelCommand(commandId, { actor, code = 'admin_cancelled', message = 'Command cancelled by administrator' }) {
+    const { command, changed } = this.store.cancelCommand(commandId, { code, message });
+    if (!command) throw protocolError('Command not found', 404, 'command_not_found');
+    if (!changed) throw protocolError('Command is already finished', 409, 'command_not_active');
+    const worker = this.store.getWorker(command.worker_id);
+    this.store.updateWorkerStatus(worker.connector_id, worker.worker_id, { work_state: 'idle', current_task_id: null });
+    this.emit('command.failed', actor, {
+      connector_id: worker.connector_id,
+      worker_id: worker.worker_id,
+      task_id: command.task_id,
+      command_id: command.command_id,
+      payload: { error: command.error, outcome_unknown: command.outcome_unknown },
+    });
+    const socket = this.connectors.get(worker.connector_id);
+    if (socket) this.send(socket, 'command.cancel', { command_id: command.command_id, error: command.error });
+    if (command.kind === 'worker_message') {
+      this.settleWorkerMessageWaiters(command);
+    } else {
+      const handled = await this.coordinator.onCommandFinished(command);
+      if (!handled && command.task_id) {
+        const task = this.store.getTask(command.task_id);
+        if (task && !['done', 'cancelled', 'blocked'].includes(task.status)) {
+          const updated = this.store.updateTask(task.task_id, { status: 'blocked' });
+          this.emit('task.updated', actor, {
+            task_id: updated.task_id,
+            worker_id: updated.assignee_worker_id,
+            payload: { status: updated.status },
+          });
+          this.broadcast('task.updated', { task: updated });
+        }
+      }
+    }
+    this.broadcast('command.updated', { command });
+    this.broadcast('worker.updated', { worker: this.presentWorker(this.store.getWorker(worker.worker_id)) });
+    return command;
   }
 
   unregisterWorker({ workerId = null, connectorId = null, runtime = null, runtimeSessionId = null, actor = { type: 'admin', id: 'admin' } }) {
@@ -611,6 +689,19 @@ export class Hub {
     if (request.method === 'GET' && workerMatch) {
       const worker = this.presentWorker(this.store.getWorker(workerMatch[1]));
       sendJson(response, worker ? 200 : 404, worker ? { worker } : { error: 'Worker not found' });
+      return;
+    }
+    const cancelMatch = /^\/api\/v1\/commands\/([^/]+)\/cancel$/.exec(pathname);
+    if (request.method === 'POST' && cancelMatch) {
+      const body = await readJsonBody(request);
+      const message = body.reason === undefined
+        ? 'Command cancelled by administrator'
+        : requiredString(body.reason, 'reason', { max: 2000 });
+      const command = await this.cancelCommand(cancelMatch[1], {
+        actor: { type: 'admin', id: 'admin' },
+        message,
+      });
+      sendJson(response, 200, { command });
       return;
     }
     const commandMatch = /^\/api\/v1\/commands\/([^/]+)$/.exec(pathname);

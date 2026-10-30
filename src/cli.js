@@ -41,6 +41,7 @@ Usage:
                  [--local] [--wait]
   agent-hub message send --to WORKER_ID --prompt TEXT [--wait]
   agent-hub message wait COMMAND_ID
+  agent-hub command cancel COMMAND_ID [--reason TEXT]
   agent-hub orchestration list [--local]
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub history clear --yes
@@ -53,6 +54,8 @@ Environment:
   AGENT_HUB_CONNECTOR_URL       Local Connector URL (default http://127.0.0.1:8788)
   AGENT_HUB_LOCAL_TOKEN         Local Connector token; otherwise read from data-dir
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
+  AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS  Coordinator timeout (default 900000)
+  AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS      Other command timeout (default 3600000)
 `;
 
 const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui']);
@@ -96,6 +99,12 @@ function parseArgs(argv) {
 function port(value, fallback) {
   const parsed = value === undefined ? fallback : Number(value);
   if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) throw new Error('Invalid port');
+  return parsed;
+}
+
+function milliseconds(value, fallback) {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error('Invalid millisecond timeout');
   return parsed;
 }
 
@@ -181,6 +190,8 @@ async function startHub(flags) {
     host: flags.host ?? '127.0.0.1',
     port: port(flags.port, 8787),
     dataDir: flags['data-dir'] ?? '.runtime/hub',
+    coordinatorInactivityTimeoutMs: milliseconds(process.env.AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS, 15 * 60 * 1000),
+    commandInactivityTimeoutMs: milliseconds(process.env.AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS, 60 * 60 * 1000),
   });
   await hub.listen();
   console.log(`Agent Hub ${shortCommit(hub.build.commit)}${hub.build.dirty ? ' (modified)' : ''} listening on ${hub.url}`);
@@ -631,6 +642,13 @@ export async function run(argv) {
   }
   if (command === 'task') {
     await taskCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'command' && positionals[1] === 'cancel' && positionals[2]) {
+    print(await adminRequest(flags, `/api/v1/commands/${encodeURIComponent(positionals[2])}/cancel`, {
+      method: 'POST',
+      body: flags.reason ? { reason: flags.reason } : {},
+    }));
     return;
   }
   if (command === 'send') {

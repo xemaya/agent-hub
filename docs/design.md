@@ -268,6 +268,15 @@ external Worker: queued → waiting_manual
 - 接收方在可见交互 Session 中处理并提交正常回执，该结果就是发送方的直接回复。每个 Worker 仍串行执行，未接通时保留 `waiting_manual`；此类型不进入 Coordinator，不创建任务或后台 Runtime，也不授予 Admin 权限。
 - `message send --wait` 和 `message wait` 由 Hub 完成事件唤醒。已结束结果可重复等待而不重新执行；bounded timeout 只返回 `wait_timed_out` 和真实状态，不取消工作。断线清理旧等待者，恢复后使用原 command_id 再等待，不重发消息。第一版不做群聊、广播或自动多轮对话。
 
+### 6.5 命令取消与 Agent 失稳保护
+
+- 管理员通过 `POST /api/v1/commands/:id/cancel` 或 `agent-hub command cancel` 终止活动 Command。Hub 将其持久化为 `failed`、`outcome_unknown=true`，保留 Command、Task、Event 历史；不存在的 ID 返回 404，已结束命令返回 409。
+- 取消复用正常失败的收尾规则：独立任务或相关编排阻塞，不自动重试；worker_message 唤醒原发送方，中央模型不参与直连消息。接收方 Connector 收到 `command.cancel` 后取消本地排队或拒绝并移除等待中的 delivery，晚到 report 返回 404。旧 Connector 忽略取消通知时，Hub 的终态仍拒绝晚到成功结果。
+- 取消只终止 Hub 追踪、调度和结果接收，不宣称已杀死任意 Runtime 或桌面模型进程。模型进程的停止由用户或对应 Runtime 负责。
+- `commands.last_activity_at` 从 `user_version=11` 开始持久化，旧记录按 started/accepted/created 回填。create、accept、start 和真实 output 更新时间；Connector/机器心跳不作为 Agent 工作进展。
+- 看门狗只处理 running Command。协调者默认 15 分钟、其他命令默认 60 分钟无活动后以 `inactivity_timeout` 和结果未知收尾，不自动重试；queued、accepted、waiting_manual 不按执行超时处理。超时使用 `cancelCommand` 的统一收尾，服务重启后继续依据数据库时间判断。
+- 可通过 `AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS`、`AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS` 调整，0 表示禁用对应看门狗。Agent 不稳定时允许结果未知，不能把超时或取消伪报为成功。
+
 ## 7. WebSocket 协议
 
 消息统一为 JSON：
@@ -323,6 +332,7 @@ Hub → Connector:
   task.updated
   command.created
   command.dispatch
+  command.cancel
   error
 ```
 

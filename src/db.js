@@ -97,6 +97,7 @@ function commandView(row) {
     created_at: row.created_at,
     accepted_at: row.accepted_at,
     started_at: row.started_at,
+    last_activity_at: row.last_activity_at ?? null,
     finished_at: row.finished_at,
   };
 }
@@ -242,6 +243,7 @@ export class HubStore {
         created_at TEXT NOT NULL,
         accepted_at TEXT,
         started_at TEXT,
+        last_activity_at TEXT,
         finished_at TEXT
       );
       CREATE TABLE IF NOT EXISTS events (
@@ -339,6 +341,9 @@ export class HubStore {
     if (!commandColumns.has('sender_worker_id')) {
       this.db.exec('ALTER TABLE commands ADD COLUMN sender_worker_id TEXT REFERENCES workers(worker_id)');
     }
+    if (!commandColumns.has('last_activity_at')) {
+      this.db.exec('ALTER TABLE commands ADD COLUMN last_activity_at TEXT');
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS task_number_sequence (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -355,8 +360,10 @@ export class HubStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_commands_sender ON commands(sender_worker_id);
+      UPDATE commands SET last_activity_at = COALESCE(started_at, accepted_at, created_at)
+        WHERE last_activity_at IS NULL;
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
-      PRAGMA user_version = 10;
+      PRAGMA user_version = 11;
     `);
   }
 
@@ -707,8 +714,8 @@ export class HubStore {
     const commandId = createId('cmd');
     const status = data.push_capable ? 'queued' : 'waiting_manual';
     this.db.prepare(`
-      INSERT INTO commands (command_id, task_id, worker_id, sender_worker_id, kind, input, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO commands (command_id, task_id, worker_id, sender_worker_id, kind, input, status, created_at, last_activity_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       commandId,
       data.task_id ?? null,
@@ -717,6 +724,7 @@ export class HubStore {
       kind,
       data.input,
       status,
+      timestamp,
       timestamp,
     );
     return this.getCommand(commandId);
@@ -742,6 +750,11 @@ export class HubStore {
       .all(...values, limit).map(commandView);
   }
 
+  listRunningCommands() {
+    return this.db.prepare(`${COMMAND_SELECT} WHERE cmd.status = 'running' ORDER BY cmd.created_at ASC, cmd.rowid ASC`)
+      .all().map(commandView);
+  }
+
   listQueuedCommands(connectorId) {
     return this.db.prepare(`
       ${COMMAND_SELECT}
@@ -751,20 +764,22 @@ export class HubStore {
   }
 
   acceptCommand(commandId, connectorId) {
+    const timestamp = now();
     this.db.prepare(`
-      UPDATE commands SET status = 'accepted', accepted_at = COALESCE(accepted_at, ?)
+      UPDATE commands SET status = 'accepted', accepted_at = COALESCE(accepted_at, ?), last_activity_at = ?
       WHERE command_id = ? AND status = 'queued'
         AND worker_id IN (SELECT worker_id FROM workers WHERE connector_id = ?)
-    `).run(now(), commandId, connectorId);
+    `).run(timestamp, timestamp, commandId, connectorId);
     return this.getCommand(commandId);
   }
 
   startCommand(commandId, connectorId) {
+    const timestamp = now();
     this.db.prepare(`
-      UPDATE commands SET status = 'running', started_at = COALESCE(started_at, ?)
+      UPDATE commands SET status = 'running', started_at = COALESCE(started_at, ?), last_activity_at = ?
       WHERE command_id = ? AND status IN ('queued', 'accepted')
         AND worker_id IN (SELECT worker_id FROM workers WHERE connector_id = ?)
-    `).run(now(), commandId, connectorId);
+    `).run(timestamp, timestamp, commandId, connectorId);
     return this.getCommand(commandId);
   }
 
@@ -777,8 +792,8 @@ export class HubStore {
       output = output.slice(-OUTPUT_LIMIT);
       truncated = true;
     }
-    this.db.prepare('UPDATE commands SET output_text = ?, output_truncated = ? WHERE command_id = ?')
-      .run(output, truncated ? 1 : 0, commandId);
+    this.db.prepare('UPDATE commands SET output_text = ?, output_truncated = ?, last_activity_at = ? WHERE command_id = ?')
+      .run(output, truncated ? 1 : 0, now(), commandId);
     return this.getCommand(commandId);
   }
 
@@ -792,6 +807,18 @@ export class HubStore {
       WHERE command_id = ?
     `).run(status, stringifyJson(result), stringifyJson(error), outcomeUnknown ? 1 : 0, timestamp, commandId);
     return this.getCommand(commandId);
+  }
+
+  cancelCommand(commandId, { code = 'command_cancelled', message = 'Command cancelled' } = {}) {
+    const current = this.getCommand(commandId);
+    if (!current) return { command: null, changed: false };
+    const error = { code, message };
+    const result = this.db.prepare(`
+      UPDATE commands SET status = 'failed', result_json = NULL, error_json = ?,
+        outcome_unknown = 1, finished_at = ?
+      WHERE command_id = ? AND status IN ('queued', 'accepted', 'running', 'waiting_manual')
+    `).run(stringifyJson(error), now(), commandId);
+    return { command: this.getCommand(commandId), changed: result.changes === 1 };
   }
 
   getCoordinatorConfig() {

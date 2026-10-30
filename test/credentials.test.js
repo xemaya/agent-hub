@@ -17,10 +17,14 @@ test('Hub credentials persist with private permissions', async (t) => {
   assert.equal((await stat(first.file)).mode & 0o777, 0o600);
   const stored = JSON.parse(await readFile(first.file, 'utf8'));
   assert.equal(stored.adminToken, first.adminToken);
+  const beforeSecondRead = await stat(first.file);
   const second = await loadHubCredentials(directory, {});
   assert.equal(second.adminToken, first.adminToken);
   assert.equal(second.enrollmentToken, first.enrollmentToken);
   assert.deepEqual(second.generated, []);
+  const afterSecondRead = await stat(first.file);
+  assert.equal(afterSecondRead.ino, beforeSecondRead.ino);
+  assert.equal(afterSecondRead.mtimeMs, beforeSecondRead.mtimeMs);
 });
 
 test('Environment credentials are not written to disk', async (t) => {

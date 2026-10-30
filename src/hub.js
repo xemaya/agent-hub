@@ -157,6 +157,8 @@ export class Hub {
     this.dashboards = new Set();
     this.connectorFeatures = new Map();
     this.workerMessageWaiters = new Map();
+    this.coordinatorScheduled = false;
+    this.closing = false;
     this.coordinator = new Coordinator({
       store: this.store,
       emit: (...args) => this.emit(...args),
@@ -239,6 +241,7 @@ export class Hub {
   }
 
   async close() {
+    this.closing = true;
     clearInterval(this.heartbeat);
     clearInterval(this.inactivityWatchdog);
     for (const waiters of this.workerMessageWaiters.values()) {
@@ -304,6 +307,24 @@ export class Hub {
     return worker ? { ...worker, activity: workerActivity(this.store, worker) } : null;
   }
 
+  refreshWorkerState(workerId) {
+    const worker = this.store.getWorker(workerId);
+    const running = this.store.getRunningCommandForWorker(workerId);
+    return this.store.updateWorkerStatus(worker.connector_id, workerId, {
+      work_state: running ? 'working' : 'idle',
+      current_task_id: running?.task_id ?? null,
+    });
+  }
+
+  scheduleCoordinator() {
+    if (this.closing || this.coordinatorScheduled) return;
+    this.coordinatorScheduled = true;
+    queueMicrotask(() => {
+      this.coordinatorScheduled = false;
+      if (!this.closing) this.coordinator.resume().catch(error => this.logger.error?.(error));
+    });
+  }
+
   async expireInactiveCommands() {
     if (this.expiringInactiveCommands) return;
     this.expiringInactiveCommands = true;
@@ -336,7 +357,7 @@ export class Hub {
     if (!command) throw protocolError('Command not found', 404, 'command_not_found');
     if (!changed) throw protocolError('Command is already finished', 409, 'command_not_active');
     const worker = this.store.getWorker(command.worker_id);
-    this.store.updateWorkerStatus(worker.connector_id, worker.worker_id, { work_state: 'idle', current_task_id: null });
+    this.refreshWorkerState(worker.worker_id);
     this.emit('command.failed', actor, {
       connector_id: worker.connector_id,
       worker_id: worker.worker_id,
@@ -365,6 +386,7 @@ export class Hub {
     }
     this.broadcast('command.updated', { command });
     this.broadcast('worker.updated', { worker: this.presentWorker(this.store.getWorker(worker.worker_id)) });
+    this.scheduleCoordinator();
     return command;
   }
 
@@ -760,7 +782,7 @@ export class Hub {
           this.store.setConnectorOnline(connectorId, true);
           this.recordConnectorBuild(connectorId, message.payload.build);
           this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
-          this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId), hub: this.build });
+          this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId), hub: this.build, features: ['command_reconcile_v1'] });
           this.replay(connectorId);
           this.coordinator.resume().catch((error) => this.logger.error?.(error));
         }
@@ -1040,6 +1062,7 @@ export class Hub {
       });
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       if (worker.push_capable) this.replay(connectorId);
+      if (worker.push_capable) this.scheduleCoordinator();
       this.send(socket, 'worker.channel', { worker }, message.id);
       return;
     }
@@ -1056,10 +1079,13 @@ export class Hub {
         payload: { work_state: worker.work_state },
       });
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
+      if (worker.work_state !== 'working') this.scheduleCoordinator();
       return;
     }
     if (message.type === 'command.ack') {
-      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const current = this.authorizedCommand(payload.command_id, connectorId);
+      if (!current) throw new Error('Command not found for this connector');
+      if (current.status !== 'queued') return;
       const command = this.store.acceptCommand(payload.command_id, connectorId);
       this.emit('command.accepted', { type: 'connector', id: connectorId }, {
         connector_id: connectorId,
@@ -1072,7 +1098,9 @@ export class Hub {
       return;
     }
     if (message.type === 'command.started') {
-      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const current = this.authorizedCommand(payload.command_id, connectorId);
+      if (!current) throw new Error('Command not found for this connector');
+      if (!['queued', 'accepted'].includes(current.status)) return;
       const command = this.store.startCommand(payload.command_id, connectorId);
       const worker = this.store.updateWorkerStatus(connectorId, command.worker_id, {
         work_state: 'working',
@@ -1093,7 +1121,9 @@ export class Hub {
       return;
     }
     if (message.type === 'command.output') {
-      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const current = this.authorizedCommand(payload.command_id, connectorId);
+      if (!current) throw new Error('Command not found for this connector');
+      if (!['accepted', 'running'].includes(current.status)) return;
       const command = this.store.appendCommandOutput(payload.command_id, connectorId, payload.chunk);
       this.broadcast('command.output', {
         command_id: command.command_id,
@@ -1104,7 +1134,12 @@ export class Hub {
       return;
     }
     if (message.type === 'command.finished') {
-      if (!this.authorizedCommand(payload.command_id, connectorId)) throw new Error('Command not found for this connector');
+      const current = this.authorizedCommand(payload.command_id, connectorId);
+      if (!current) throw new Error('Command not found for this connector');
+      if (['succeeded', 'failed'].includes(current.status)) {
+        this.send(socket, 'command.synced', { command: current }, message.id);
+        return;
+      }
       if (!['succeeded', 'failed'].includes(payload.status)) throw new Error('Invalid final command status');
       const command = this.store.finishCommand(payload.command_id, connectorId, {
         status: payload.status,
@@ -1112,7 +1147,7 @@ export class Hub {
         error: payload.error,
         outcomeUnknown: Boolean(payload.outcome_unknown),
       });
-      const worker = this.store.updateWorkerStatus(connectorId, command.worker_id, { work_state: 'idle' });
+      const worker = this.refreshWorkerState(command.worker_id);
       this.emit(`command.${payload.status}`, { type: 'worker', id: command.worker_id }, {
         connector_id: connectorId,
         worker_id: command.worker_id,
@@ -1124,15 +1159,20 @@ export class Hub {
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       if (command.kind === 'worker_message') this.settleWorkerMessageWaiters(command);
       else await this.coordinator.onCommandFinished(command);
+      this.scheduleCoordinator();
       return;
     }
     if (message.type === 'command.sync') {
       const command = this.authorizedCommand(payload.command_id, connectorId);
-      if (!command) return;
+      if (!command) {
+        this.send(socket, 'command.synced', { command: null }, message.id);
+        return;
+      }
       let updated = command;
-      if (payload.status === 'accepted') updated = this.store.acceptCommand(command.command_id, connectorId);
-      if (payload.status === 'running') updated = this.store.startCommand(command.command_id, connectorId);
-      if (['succeeded', 'failed'].includes(payload.status)) {
+      const wasFinal = ['succeeded', 'failed'].includes(command.status);
+      if (!wasFinal && payload.status === 'accepted') updated = this.store.acceptCommand(command.command_id, connectorId);
+      if (!wasFinal && payload.status === 'running') updated = this.store.startCommand(command.command_id, connectorId);
+      if (!wasFinal && ['succeeded', 'failed'].includes(payload.status)) {
         updated = this.store.finishCommand(command.command_id, connectorId, {
           status: payload.status,
           result: payload.result,
@@ -1141,8 +1181,16 @@ export class Hub {
         });
         if (updated.kind === 'worker_message') this.settleWorkerMessageWaiters(updated);
         else await this.coordinator.onCommandFinished(updated);
+        this.refreshWorkerState(command.worker_id);
+        this.scheduleCoordinator();
       }
       this.broadcast('command.updated', { command: updated });
+      this.send(socket, 'command.synced', { command: updated }, message.id);
+      return;
+    }
+    if (message.type === 'command.check') {
+      const command = this.authorizedCommand(payload.command_id, connectorId);
+      this.send(socket, 'command.checked', { command: command ? { command_id: command.command_id, status: command.status, result: command.result, error: command.error, outcome_unknown: command.outcome_unknown } : null }, message.id);
       return;
     }
     throw new Error(`Unsupported connector message: ${message.type}`);

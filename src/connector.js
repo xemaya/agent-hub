@@ -47,6 +47,7 @@ export class Connector {
     this.ws = null;
     this.readyState = deferred();
     this.ready = false;
+    this.reconciling = false;
     this.stopping = false;
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
@@ -56,6 +57,7 @@ export class Connector {
     this.activeWorkers = new Set();
     this.build = options.build ?? { version: null, commit: null, dirty: false };
     this.hubBuild = null;
+    this.hubFeatures = new Set();
     this.connectTimeoutMs = options.connectTimeoutMs ?? 20000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15000;
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 10000;
@@ -320,10 +322,22 @@ export class Connector {
       if (this.everReady) this.logger.error?.('Hub WebSocket reconnected');
       this.everReady = true;
       this.hubBuild = message.payload?.hub ?? null;
+      this.hubFeatures = new Set(message.payload?.features ?? []);
       this.readyState.resolve(message.payload);
       this.checkHubVersion();
-      await this.syncChannels();
-      await this.syncAndPump();
+      this.reconciling = true;
+      try {
+        await this.syncChannels();
+        await this.syncAndPump();
+      } catch (error) {
+        this.detachSocket('command reconciliation failed');
+        throw error;
+      } finally {
+        this.reconciling = false;
+      }
+      for (const worker of this.store.listWorkers()) {
+        if (this.store.nextAcceptedCommand(worker.worker_id)) this.scheduleWorker(worker.worker_id);
+      }
       return;
     }
     if (message.type === 'command.dispatch') {
@@ -332,6 +346,10 @@ export class Connector {
     }
     if (message.type === 'command.cancel') {
       await this.cancelCommand(message.payload.command_id, message.payload.error);
+      return;
+    }
+    if (message.type === 'command.synced' && ['succeeded', 'failed'].includes(message.payload?.command?.status)) {
+      await this.applyTerminalCommand(message.payload.command);
       return;
     }
     if (message.type === 'worker.unregistered') {
@@ -409,9 +427,8 @@ export class Connector {
 
   async closeChannel(channel) {
     this.pendingChannels.delete(channel);
-    if (!channel.workerId || this.channels.get(channel.workerId) !== channel) return;
-    this.channels.delete(channel.workerId);
-    this.store.setWorkerPushCapability(channel.workerId, false);
+    // A replaced stream still owns its outstanding promises. Only changing the
+    // current stream's presence depends on identity; delivery cleanup never does.
     for (const delivery of channel.deliveries.values()) {
       delivery.reject(Object.assign(new Error('Interactive session closed before reporting a result'), {
         code: 'channel_closed',
@@ -419,6 +436,9 @@ export class Connector {
       }));
     }
     channel.deliveries.clear();
+    if (!channel.workerId || this.channels.get(channel.workerId) !== channel) return;
+    this.channels.delete(channel.workerId);
+    this.store.setWorkerPushCapability(channel.workerId, false);
     if (!this.stopping) await this.announceChannel(channel.workerId, false);
   }
 
@@ -478,25 +498,41 @@ export class Connector {
   }
 
   async cancelCommand(commandId, error = {}) {
-    const current = this.store.getCommand(commandId);
-    if (!current || ['succeeded', 'failed'].includes(current.status)) return;
-    const failure = {
-      message: typeof error.message === 'string' ? error.message : 'Command cancelled by Hub',
-      code: typeof error.code === 'string' ? error.code : 'command_cancelled',
-    };
-    const updated = await this.store.updateCommand(commandId, {
+    return this.applyTerminalCommand({
+      command_id: commandId,
       status: 'failed',
       result: null,
-      error: failure,
+      error: {
+        message: typeof error.message === 'string' ? error.message : 'Command cancelled by Hub',
+        code: typeof error.code === 'string' ? error.code : 'command_cancelled',
+      },
       outcome_unknown: true,
+    });
+  }
+
+  async applyTerminalCommand(command) {
+    if (!['succeeded', 'failed'].includes(command.status)) throw localError('A terminal command state is required');
+    const commandId = command.command_id;
+    const current = this.store.getCommand(commandId);
+    if (!current) return;
+    if (['succeeded', 'failed'].includes(current.status)
+      && current.status === command.status
+      && Boolean(current.outcome_unknown) === Boolean(command.outcome_unknown)
+      && JSON.stringify(current.result ?? null) === JSON.stringify(command.result ?? null)
+      && JSON.stringify(current.error ?? null) === JSON.stringify(command.error ?? null)) return;
+    const updated = await this.store.updateCommand(commandId, {
+      status: command.status,
+      result: command.result ?? null,
+      error: command.error ?? null,
+      outcome_unknown: Boolean(command.outcome_unknown),
     });
     const channel = [...this.channels.values()].find(item => item.deliveries.has(commandId));
     if (channel) {
       const delivery = channel.deliveries.get(commandId);
       channel.deliveries.delete(commandId);
-      delivery.reject(Object.assign(new Error(failure.message), {
-        code: failure.code,
-        outcomeUnknown: true,
+      delivery.reject(Object.assign(new Error(command.error?.message ?? 'Command already finished on Hub'), {
+        code: command.error?.code ?? 'command_reconciled',
+        outcomeUnknown: Boolean(command.outcome_unknown),
       }));
       return;
     }
@@ -506,14 +542,26 @@ export class Connector {
 
   async syncAndPump() {
     for (const command of this.store.listCommands()) {
-      this.send('command.sync', {
+      const payload = {
         command_id: command.command_id,
         status: command.status,
         result: command.result,
         error: command.error,
         outcome_unknown: command.outcome_unknown,
-      });
-      if (command.status === 'accepted') this.scheduleWorker(command.worker_id);
+      };
+      if (this.hubFeatures.has('command_reconcile_v1') && !['succeeded', 'failed'].includes(command.status)) {
+        // Reconcile BEFORE scheduling: the Hub may have cancelled this command
+        // while disconnected. Never execute an accepted local record blindly.
+        const { command: authoritative } = await this.request('command.sync', payload);
+        if (!authoritative) {
+          await this.cancelCommand(command.command_id, { code: 'hub_command_missing', message: 'Command is no longer available on Hub; outcome is unknown' });
+        } else if (['succeeded', 'failed'].includes(authoritative.status)) {
+          await this.applyTerminalCommand(authoritative);
+        }
+      } else {
+        this.send('command.sync', payload);
+      }
+      if (this.store.getCommand(command.command_id).status === 'accepted') this.scheduleWorker(command.worker_id);
     }
   }
 
@@ -535,6 +583,7 @@ export class Connector {
   }
 
   scheduleWorker(workerId) {
+    if (!this.ready || this.reconciling) return;
     if (this.activeWorkers.has(workerId)) return;
     this.activeWorkers.add(workerId);
     queueMicrotask(() => {
@@ -562,13 +611,14 @@ export class Connector {
         return;
       }
       await this.store.updateCommand(command.command_id, { status: 'running' });
+      if (this.store.getCommand(command.command_id).status !== 'running') return;
       this.send('command.started', { command_id: command.command_id });
       try {
         const channel = this.channels.get(workerId);
         if (!channel) throw new Error('Interactive Channel is not attached');
         const result = await this.deliverToChannel(channel, command);
         const current = this.store.getCommand(command.command_id);
-        if (current.status === 'failed' && current.outcome_unknown) {
+        if (['succeeded', 'failed'].includes(current.status)) {
           this.send('command.finished', current);
         } else {
           const finished = await this.store.updateCommand(command.command_id, {
@@ -580,7 +630,7 @@ export class Connector {
         }
       } catch (error) {
         const current = this.store.getCommand(command.command_id);
-        const finished = current.status === 'failed' && current.outcome_unknown
+        const finished = ['succeeded', 'failed'].includes(current.status)
           ? current
           : await this.store.updateCommand(command.command_id, {
               status: 'failed',
@@ -682,7 +732,10 @@ export class Connector {
       driver_state: {},
     });
     this.adoptPendingChannels();
-    if (this.channels.has(worker.worker_id)) await this.announceChannel(worker.worker_id, true);
+    if (this.channels.has(worker.worker_id)) {
+      this.store.setWorkerPushCapability(worker.worker_id, true);
+      await this.announceChannel(worker.worker_id, true);
+    }
     return this.store.getWorker(worker.worker_id);
   }
 
@@ -872,6 +925,20 @@ export class Connector {
     if (request.method === 'POST' && channelMatch) {
       const body = await readJsonBody(request);
       sendJson(response, 200, this.handleChannelCall(channelMatch[1], channelMatch[2], body));
+      return;
+    }
+    const checkMatch = /^\/local\/v1\/channel\/commands\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === 'POST' && checkMatch) {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      const channel = [...this.channels.values()].find(item => item.deliveries.has(checkMatch[1]));
+      if (!channel || channel.runtime !== 'codex' || channel.sessionId !== body.runtime_session_id) {
+        throw localError('No current delivery for this native Session', 404);
+      }
+      const { command } = await this.request('command.check', { command_id: checkMatch[1] });
+      if (command && ['succeeded', 'failed'].includes(command.status)) await this.applyTerminalCommand(command);
+      const local = this.store.getCommand(checkMatch[1]);
+      sendJson(response, 200, { allowed: command?.status === 'running' && local?.status === 'running' && channel.deliveries.has(checkMatch[1]), status: command?.status ?? 'missing' });
       return;
     }
     sendJson(response, 404, { error: 'Not found' });

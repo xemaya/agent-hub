@@ -98,7 +98,9 @@ test('public Skill is a complete, deterministic ZIP without exposing admin APIs'
 });
 
 test('downloaded macOS bootstrap completes enrollment and local Skill installation without replacing existing work', { skip: process.platform !== 'darwin', timeout: 90000 }, async (t) => {
-  const directory = await temporaryDirectory(t, 'skill-bootstrap-');
+  // This test must stop its Connector before deleting the PID file and checkout.
+  await mkdir(TEST_ROOT, { recursive: true });
+  const directory = await mkdtemp(path.join(TEST_ROOT, 'skill-bootstrap-'));
   const home = path.join(directory, 'home');
   const repoDir = path.join(directory, 'runtime', 'agent-hub');
   const source = path.join(directory, 'source');
@@ -165,12 +167,21 @@ esac
   const stopConnector = async () => {
     try {
       const pid = Number(await readFile(path.join(home, 'connector-test.pid'), 'utf8'));
-      if (pid) process.kill(pid, 'SIGTERM');
+      if (pid) {
+        process.kill(pid, 'SIGTERM');
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          try { process.kill(pid, 0); } catch { return; }
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        process.kill(pid, 'SIGKILL');
+      }
     } catch {}
   };
   t.after(async () => {
     await stopConnector();
     await hub.close();
+    await rm(directory, { recursive: true, force: true });
   });
   const first = await runBootstrap(script, env, 'test-enroll\n');
   assert.match(first.stdout, /Connector、CLI 与 Skill 已就绪/);

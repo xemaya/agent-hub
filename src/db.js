@@ -755,6 +755,11 @@ export class HubStore {
       .all().map(commandView);
   }
 
+  getRunningCommandForWorker(workerId) {
+    return commandView(this.db.prepare(`${COMMAND_SELECT} WHERE cmd.worker_id = ? AND cmd.status = 'running' ORDER BY cmd.started_at ASC LIMIT 1`)
+      .get(workerId));
+  }
+
   listQueuedCommands(connectorId) {
     return this.db.prepare(`
       ${COMMAND_SELECT}

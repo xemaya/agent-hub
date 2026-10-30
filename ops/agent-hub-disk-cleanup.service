@@ -1,0 +1,11 @@
+[Unit]
+Description=Bounded Agent Hub host disk cleanup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/agent-hub-disk-cleanup --apply
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=5min
+UMask=0077
+NoNewPrivileges=true

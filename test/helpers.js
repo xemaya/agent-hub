@@ -70,20 +70,22 @@ export async function createTestContext(t, { hub: hubOptions = {}, connector: co
   const channels = new Set();
   const cleanups = [];
   let connector;
+  let lastLocalPort = 0;
   let sessionSequence = 0;
 
-  const startConnector = async () => {
+  const startConnector = async (localPort = connectorOptions.localPort ?? 0) => {
     connector = await Connector.create({
       ...connectorOptions,
       hubUrl: hub.url,
       name: 'test-mac',
       hostname: 'test-mac',
       dataDir: path.join(root, 'connector'),
-      localPort: 0,
+      localPort,
       enrollToken: 'test-enroll',
       logger: silentLogger,
     });
     await connector.start();
+    lastLocalPort = connector.localPort;
     await connector.whenReady();
     for (const channel of channels) channel.connectorUrl = connector.localUrl;
     return connector;
@@ -156,10 +158,10 @@ export async function createTestContext(t, { hub: hubOptions = {}, connector: co
     get connector() {
       return connector;
     },
-    async restartConnector() {
+    async restartConnector({ reuseLocalPort = false } = {}) {
       await connector.close();
       await waitFor(() => !hub.store.getConnector(connector.connectorId).online);
-      return startConnector();
+      return startConnector(reuseLocalPort ? lastLocalPort : 0);
     },
     async restartHub() {
       await connector.close();

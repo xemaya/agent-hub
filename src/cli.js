@@ -24,6 +24,7 @@ Usage:
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
   agent-hub desktop report --command-id ID --status succeeded|failed [--data-dir DIR] < result.txt
+  agent-hub desktop check --command-id ID [--data-dir DIR]
   agent-hub worker register --runtime claude|kimi|codex|other --session-id ID
                             [--name NAME] [--cwd DIR]
                             [--capabilities a,b] [--metadata JSON]
@@ -455,13 +456,21 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
 async function desktopCommand(positionals, flags) {
   const dataDir = path.resolve(flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.agent-hub/connector'));
   if (positionals[0] === 'attach') return workerCommand(['register-current'], { ...flags, 'data-dir': dataDir, desktop: true });
-  if (positionals[0] === 'report') {
+  if (['report', 'check'].includes(positionals[0])) {
     const identity = currentSessionIdentity();
     if (identity.runtime !== 'codex') throw new Error('A Codex desktop receipt must originate in its native session');
-    if (!['succeeded', 'failed'].includes(flags.status)) throw new Error('status must be succeeded or failed');
+    if (positionals[0] === 'report' && !['succeeded', 'failed'].includes(flags.status)) throw new Error('status must be succeeded or failed');
     const recordFile = commandRecord(dataDir, identity.sessionId, flags['command-id']);
     const record = JSON.parse(await readFile(recordFile, 'utf8'));
     if (record.session_id !== identity.sessionId || record.command_id !== flags['command-id']) throw new Error('Receipt does not belong to this native session');
+    if (positionals[0] === 'check') {
+      const checked = await localRequest({ ...flags, 'data-dir': dataDir, 'connector-url': record.connector_url },
+        `/local/v1/channel/commands/${encodeURIComponent(record.command_id)}/check`,
+        { method: 'POST', body: { runtime_session_id: identity.sessionId } });
+      print(checked);
+      if (!checked.allowed) process.exitCode = 1;
+      return;
+    }
     let result = '';
     for await (const chunk of process.stdin) { result += chunk; if (Buffer.byteLength(result) > 512 * 1024) throw new Error('Result exceeds 512 KiB'); }
     if (!result.trim()) throw new Error('Report result must be provided through stdin');

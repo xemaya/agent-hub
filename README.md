@@ -304,10 +304,35 @@ node bin/agent-hub.js hub --host 127.0.0.1 --port 8787 --data-dir .runtime/hub
 
 ## 验证
 
+### Hub 主机磁盘保养
+
+Linux 主机执行 `bash scripts/install-hub-disk-cleanup.sh` 安装小时级 systemd timer。
+`scripts/cleanup-hub-disk.sh` 默认仅预览，显式 `--apply` 才清理，带进程锁避免重复运行。
+
+- journal 最多 200 MB、14 天，预留 1 GB 磁盘空间；清理可再生的 DNF 包缓存。
+- Docker 的 `json-file` 日志超过 64 MB 时，先保存最近 4 MB 的 root-only 压缩片段，再按 copytruncate 方式清空原日志；不重启容器。与 logrotate 的 copytruncate 一样，轮转瞬间的并发日志不保证无损。
+- 不删除数据库、凭证、命令记录、回滚备份、容器、镜像或卷。
+- 清理后占用仍达到 85% 时，服务以失败状态结束供 systemd 检查；不会扩大删除范围。
+
+```bash
+systemctl list-timers agent-hub-disk-cleanup.timer
+systemctl show agent-hub-disk-cleanup.service --property=Result,ExecMainStatus
+/usr/local/sbin/agent-hub-disk-cleanup --dry-run
+```
+
+### 恢复与命令终态
+
+Codex 桥接在 Connector 重启后仅恢复传输连接，不重投已有命令。开始处理新投递前按提示运行 `desktop check`，只有 `allowed=true` 才执行工作；取消不宣称杀死已经开始的模型或工具进程。
+
+Hub 与新 Connector 协商 `command_reconcile_v1`。重连先对账未结束命令，再启动本地排队工作；Hub 的取消终态会撤销本地交付。晚到或重复的开始、输出、结束消息不能改变终态、任务状态或审计结果。Worker 释放或 Channel 恢复会推进等待它的活动编排，不恢复已阻塞编排。
+
+### 自动化检查
+
 ```bash
 pnpm install --frozen-lockfile
 pnpm test
 pnpm check
+bash -n scripts/cleanup-hub-disk.sh scripts/install-hub-disk-cleanup.sh
 ```
 
 自动化使用真实 Hub、Connector、WebSocket 与 SSE Channel 验证交互大脑、编排、回执、重连和迁移。Claude、Kimi、Codex 各原生交互通道的历史实测见 [`docs/design.md`](docs/design.md)。

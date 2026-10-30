@@ -54,6 +54,8 @@ Skill 只是操作说明，不能绕过桌面权限或代替 Connector 和桥接
 
 ## Worker 通信录与直连
 
+Codex 收到新版投递时，开始工作前先按提示运行 `desktop check --command-id ...`，仅 `allowed=true` 才执行；已取消、校验失败或结果未知时停止该条工作。校验和回执都使用当前原生会话与单次提升权限。桥接断线只恢复连接，不重投旧命令；Hub 取消不代表模型进程已被杀死。
+
 `worker directory` 使用当前原生 Session 获取同一 Hub 内其他未注销 Worker 的脱敏目录；普通工作指令也会收到当次目录快照。目录可用于选择真实 `worker_id`，但不能从中获取 Session ID、cwd、完整 metadata、任务上下文或凭证。
 
 ```bash

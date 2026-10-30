@@ -63,6 +63,28 @@ No native queue error, timeout, connector disconnect or duplicate record causes
 automatic redelivery. Unknown outcomes remain unknown. Explicit reattachment
 after a disconnect does not replay old delivery records.
 
+### Connector restart and registration refresh (2026-10-29)
+
+The queue bridge now reconnects its SSE transport after a Connector restart,
+clean stream end, or transient connection failure. It keeps the same native
+session and command delivery records. An accepted native queue invocation is
+not repeated if only its acknowledgement connection failed. A queue invocation
+whose acceptance is unknown still stops the bridge rather than retrying work;
+authentication rejection and an explicitly rejected Worker are also terminal.
+Desktop exit cancels an outstanding reconnect delay.
+
+Re-registering or renaming a live Worker now preserves its confirmed Hub channel
+flag. New or restored retired Workers still start without a push flag until
+their real channel attaches. This avoids clearing capability during a metadata
+update without inventing a connection.
+
+Validation: `npm run check` and all 102 tests passed. Restart tests check both
+the local Connector view and actual isolated Hub state, keep the interrupted
+command failed with an unknown outcome, verify no second native queue call, and
+successfully complete a new command after reconnect. Separate tests cover
+renaming, retired-worker restoration, acknowledgement connection failure, and
+authentication rejection.
+
 ## Validation (2026-10-28)
 
 - `npm run check` and all 92 tests passed after removing the unrelated launcher

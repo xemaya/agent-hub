@@ -13,6 +13,25 @@ async function databaseRoot(t) {
   return root;
 }
 
+test('Re-registration preserves a live channel flag but does not restore a retired flag', async t => {
+  const root = await databaseRoot(t);
+  const store = new HubStore(path.join(root, 'hub.db'));
+  t.after(() => store.close());
+  const connector = store.createConnector({ name: 'channel-owner', tokenHash: 'test-hash' });
+  const input = { name: 'original', runtime: 'codex', runtime_session_id: 'native-owner', cwd: root };
+  const worker = store.registerWorker(connector.connector_id, input);
+  assert.equal(worker.push_capable, false);
+  store.setWorkerChannel(connector.connector_id, worker.worker_id, true);
+  const renamed = store.registerWorker(connector.connector_id, { ...input, name: 'renamed' });
+  assert.equal(renamed.worker_id, worker.worker_id);
+  assert.equal(renamed.push_capable, true);
+  store.retireWorker(worker.worker_id);
+  const restored = store.registerWorker(connector.connector_id, input);
+  assert.equal(restored.worker_id, worker.worker_id);
+  assert.equal(restored.retired_at, null);
+  assert.equal(restored.push_capable, false);
+});
+
 test('v2 orchestration schema migrates without losing old records', async (t) => {
   const root = await databaseRoot(t);
   const filename = path.join(root, 'hub.db');

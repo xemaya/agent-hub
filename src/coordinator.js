@@ -2,8 +2,14 @@ import { createId } from './ids.js';
 
 const FINAL_COMMAND_STATUSES = new Set(['succeeded', 'failed']);
 const FINISHED_STEP_STATUSES = new Set(['review', 'done']);
-const DEPENDENCY_EVIDENCE_BUDGET = 64000;
-const REFERENCE_EVIDENCE_BUDGET = 24000;
+// Inline & spill: prompts carry a bounded summary of earlier results; a
+// truncated one comes with a pointer the Worker uses to read the full result.
+const INLINE_RESULT_LIMIT = 1500;
+const DEPENDENCY_EVIDENCE_BUDGET = 6000;
+const REFERENCE_EVIDENCE_BUDGET = 3000;
+const LIVE_TASK_STATUSES = new Set(['ready', 'in_progress', 'review', 'blocked']);
+const HANDBACK = /^\s*HANDBACK:\s*([\s\S]*)$/;
+const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked']);
 const MAX_RECOVERY_ROUNDS = 2;
 
 function taskLabel(task) {
@@ -181,6 +187,24 @@ function resultEvidence(result, max = 12000) {
   return resultText(result).slice(0, max);
 }
 
+export function resultPointer(commandId) {
+  return `agent-hub command result ${commandId}`;
+}
+
+function spilled(result, commandId, limit) {
+  const textValue = resultText(result);
+  const truncated = textValue.length > limit;
+  return {
+    result: textValue.slice(0, limit),
+    result_truncated: truncated,
+    ...(truncated && commandId ? { full_result: resultPointer(commandId) } : {}),
+  };
+}
+
+function inlineLimit(budget, count) {
+  return Math.max(1, Math.min(INLINE_RESULT_LIMIT, Math.floor(budget / Math.max(count, 1))));
+}
+
 export class Coordinator {
   constructor({ store, emit, dispatch, notify = () => {}, logger = console }) {
     this.store = store;
@@ -297,7 +321,7 @@ export class Coordinator {
     const orchestration = this.store.getOrchestrationByTask(taskId)
       ?? this.store.listOrchestrations().find((item) => item.steps.some((step) => step.task_id === taskId));
     const stepCount = orchestration?.steps.length ?? 0;
-    const resultLimit = Math.max(1, Math.floor((resultBudget ?? stepCount * 600) / Math.max(stepCount, 1)));
+    const resultLimit = inlineLimit(resultBudget ?? stepCount * 600, stepCount);
     return {
       task: {
         ...task,
@@ -319,8 +343,7 @@ export class Coordinator {
           title: step.title,
           status: step.status,
           worker_id: step.worker_id,
-          result: resultEvidence(step.result, resultLimit),
-          result_truncated: resultText(step.result).length > resultLimit,
+          ...spilled(step.result, step.command_id, resultLimit),
         })),
       } : null,
     };
@@ -662,21 +685,20 @@ export class Coordinator {
   workPrompt(orchestration, step) {
     const parent = this.store.getTask(orchestration.parent_task_id);
     const dependencies = step.depends_on.map((key) => orchestration.steps.find((item) => item.key === key)).filter(Boolean);
-    const dependencyLimit = Math.max(1, Math.floor(DEPENDENCY_EVIDENCE_BUDGET / Math.max(dependencies.length, 1)));
+    const dependencyLimit = inlineLimit(DEPENDENCY_EVIDENCE_BUDGET, dependencies.length);
     const dependencyResults = dependencies.map((dependency) => ({
       key: dependency.key,
       title: dependency.title,
       status: dependency.status,
       worker_name: this.store.getWorker(dependency.worker_id)?.name ?? dependency.worker_id,
-      result: resultEvidence(dependency.result, dependencyLimit),
-      result_truncated: resultText(dependency.result).length > dependencyLimit,
+      ...spilled(dependency.result, dependency.command_id, dependencyLimit),
       result_incomplete: Boolean(dependency.result?.output_gap),
     }));
     const referenceIds = this.orchestrationTaskIds(orchestration);
-    const referenceLimit = Math.max(1, Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(referenceIds.length, 1)));
+    const referenceLimit = Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(referenceIds.length, 1));
     const references = referenceIds.map((taskId) => this.taskReference(taskId, { resultBudget: referenceLimit })).filter(Boolean);
     const recovering = (step.attempt ?? 1) > 1;
-    const recoveryLimit = Math.max(1, Math.floor(DEPENDENCY_EVIDENCE_BUDGET / Math.max(orchestration.steps.length, 1)));
+    const recoveryLimit = inlineLimit(DEPENDENCY_EVIDENCE_BUDGET, orchestration.steps.length);
     const recoveryContext = recovering ? {
       recovery_round: orchestration.recovery_count,
       overall_review: orchestration.review_reason,
@@ -687,8 +709,7 @@ export class Coordinator {
         return {
           key: item.key,
           title: item.title,
-          result: resultEvidence(result, recoveryLimit),
-          result_truncated: resultText(result).length > recoveryLimit,
+          ...spilled(result, item.result ? item.command_id : previous?.command_id ?? item.command_id, recoveryLimit),
           result_incomplete: Boolean(result?.output_gap),
           review: item.review ?? previous?.review ?? null,
         };
@@ -697,7 +718,8 @@ export class Coordinator {
     return [
       '你正在执行中央大脑分配的一个步骤。只完成当前步骤，不要修改其他任务，不要读取 Admin Token。',
       '返回真实结果：完成内容、修改的文件、实际测试及结果。文案交付请直接给出完整正文，不要只给摘要。不要虚构证据。',
-      '依赖和历史任务的实际结果已经附在下面，不需要自行查询 Hub。result_truncated=true 或 result_incomplete=true 表示内容不完整，不能声称已完整阅读；不足以完成当前步骤时如实说明。',
+      '依赖和历史任务的实际结果摘要附在下面。result_truncated=true 时，需要细节就运行 full_result 里的命令读取完整结果；没读取的部分不能声称已经读过。result_incomplete=true 表示原始结果本身不完整。不足以完成当前步骤时如实说明。',
+      '如果没有人的决定或信息就无法继续，不要猜测：回报时把 outcome 设为 needs_input（被外部条件卡住则设为 blocked），question 写一个具体问题。人回答后，Hub 会让你继续这一步。',
       '父任务背景 JSON:',
       JSON.stringify(parent, null, 2),
       '当前步骤 JSON:',
@@ -759,6 +781,26 @@ export class Coordinator {
     if (changed) this.store.updateOrchestration(current.orchestration_id, { steps: current.steps });
   }
 
+  // A person's answer releases the blocked step: it runs again with the
+  // question and answer in its step JSON. Returns null when the orchestration
+  // moved on, so the caller can deliver the answer as an ordinary follow-up.
+  answerStep(attention, answer) {
+    const orchestration = attention.orchestration_id ? this.store.getOrchestration(attention.orchestration_id) : null;
+    if (!orchestration || orchestration.status !== 'blocked') return null;
+    const step = orchestration.steps.find((item) => item.key === attention.step_key);
+    if (!step || step.status !== 'blocked' || step.command_id !== attention.command_id) return null;
+    step.answers = [...(step.answers ?? []), { question: attention.question, answer, at: new Date().toISOString() }];
+    step.status = 'ready';
+    step.command_id = null;
+    step.error = null;
+    this.store.updateTask(step.task_id, { status: 'ready' });
+    this.store.updateTask(orchestration.parent_task_id, { status: 'in_progress' });
+    const updated = this.store.updateOrchestration(orchestration.orchestration_id, { status: 'in_progress', error: null, steps: orchestration.steps });
+    this.recordActivity(updated, `answer:${attention.attention_id}`, `已收到回答，「${step.title}」继续执行。`);
+    this.pump(updated);
+    return this.store.getOrchestration(orchestration.orchestration_id).steps.find((item) => item.key === step.key);
+  }
+
   onCommandFinished(command) {
     if (command.kind === 'worker_chat') {
       this.acceptWorkerChat(command);
@@ -793,7 +835,29 @@ export class Coordinator {
       const step = orchestration.steps.find((item) => item.command_id === command.command_id);
       if (!step) continue;
       if (orchestration.status !== 'in_progress') return true;
-      if (command.status === 'succeeded' && !command.outcome_unknown) {
+      const outcome = command.result?.outcome;
+      if (command.status === 'succeeded' && !command.outcome_unknown && ATTENTION_OUTCOMES.has(outcome)) {
+        const question = String(command.result?.question ?? '').trim() || resultText(command.result).slice(0, 1000) || '需要人工决定';
+        step.status = 'blocked';
+        step.result = command.result;
+        step.error = { code: outcome === 'needs_input' ? 'step_needs_input' : 'step_blocked', message: question };
+        this.store.updateTask(step.task_id, { status: 'blocked' });
+        const attention = this.store.createAttention({
+          commandId: command.command_id,
+          taskId: step.task_id,
+          workerId: command.worker_id,
+          orchestrationId: orchestration.orchestration_id,
+          stepKey: step.key,
+          outcome,
+          question,
+        });
+        this.emit('attention.created', { type: 'worker', id: command.worker_id }, {
+          worker_id: command.worker_id,
+          task_id: step.task_id,
+          command_id: command.command_id,
+          payload: { attention_id: attention.attention_id, outcome },
+        });
+      } else if (command.status === 'succeeded' && !command.outcome_unknown) {
         step.status = 'review';
         step.result = command.result;
         step.error = null;
@@ -809,7 +873,10 @@ export class Coordinator {
         command_id: command.command_id,
         payload: { orchestration_id: orchestration.orchestration_id, key: step.key, status: step.status },
       });
-      if (step.status === 'blocked') this.fail(updated, 'coordinator_step_failed', step.error.message);
+      if (step.status === 'blocked' && ['step_needs_input', 'step_blocked'].includes(step.error.code)) {
+        const workerName = this.store.getWorker(command.worker_id)?.name ?? '数字员工';
+        this.fail(updated, 'coordinator_step_needs_input', `${workerName} 在「${step.title}」需要你回答：${step.error.message}`);
+      } else if (step.status === 'blocked') this.fail(updated, 'coordinator_step_failed', step.error.message);
       else {
         const workerName = this.store.getWorker(command.worker_id)?.name ?? '数字员工';
         const next = updated.steps.find((candidate) => candidate.status === 'ready' && candidate.depends_on.every((key) => {
@@ -828,9 +895,44 @@ export class Coordinator {
     return false;
   }
 
-  chatPrompt(userMessage) {
+  chatReferences(userMessage) {
+    const workerIds = this.mentionedWorkerIds(userMessage);
+    return {
+      workers: this.workerRegistry().filter((worker) => workerIds.includes(worker.worker_id)),
+      tasks: (userMessage.mentions ?? [])
+        .filter((mention) => mention.type === 'task')
+        .map((mention) => this.taskReference(mention.id))
+        .filter(Boolean),
+    };
+  }
+
+  handbackNote(reason) {
+    return `这条消息曾直接转给被 @ 的员工，员工把它交回中央大脑，原因：${reason}。不要再用 action=chat 转交给同一员工；需要做事就 plan 或 orchestrate，否则直接回答。`;
+  }
+
+  // Several queued messages in one call: each is judged independently and a
+  // refused or missing item does not affect the others.
+  batchChatPrompt(items) {
+    const single = this.chatPrompt(items[0].user, { excludeIds: items.map((item) => item.user.message_id) });
+    const head = single.slice(0, single.lastIndexOf('本次结构化 @ 引用 JSON:'));
+    const messages = items.map(({ user, handbackReason }) => ({
+      message_id: user.message_id,
+      content: user.content,
+      references: this.chatReferences(user),
+      ...(handbackReason ? { handback: this.handbackNote(handbackReason) } : {}),
+    }));
+    return [
+      head.trimEnd(),
+      `中央大脑忙的时候排队了 ${items.length} 条消息，现在一次处理。按时间顺序逐条判断，每条的 reply 与 action 格式和上面的单条格式完全相同，后面的消息可以修正前面的意思。`,
+      '这次只输出一个 JSON 对象：{"replies":[{"message_id":"下面的真实 ID","reply":"...","action":{...}}]}。必须覆盖每条 message_id，不要合并，也不要增加其他文本。',
+      '排队消息 JSON（含各自的 @ 引用）:',
+      JSON.stringify(messages, null, 2),
+    ].join('\n\n');
+  }
+
+  chatPrompt(userMessage, { excludeIds = [userMessage.message_id], handbackReason = null } = {}) {
     const history = this.store.listChatMessages({ limit: 20, epoch: this.store.conversationEpoch() })
-      .filter((message) => message.message_id !== userMessage.message_id && message.status === 'done')
+      .filter((message) => !excludeIds.includes(message.message_id) && message.status === 'done')
       .slice(-12)
       .map((message) => ({
         role: message.role,
@@ -862,14 +964,7 @@ export class Coordinator {
         error: step.error ? String(step.error.message ?? '').slice(0, 500) : null,
       })),
     }));
-    const workerIds = this.mentionedWorkerIds(userMessage);
-    const references = {
-      workers: this.workerRegistry().filter((worker) => workerIds.includes(worker.worker_id)),
-      tasks: (userMessage.mentions ?? [])
-        .filter((mention) => mention.type === 'task')
-        .map((mention) => this.taskReference(mention.id))
-        .filter(Boolean),
-    };
+    const references = this.chatReferences(userMessage);
     return [
       '你是 Agent Hub 的中央大脑，正在和管理员对话。你可以回答问题、解释真实进展、规划任务和启动任务。不要调用工具，不要读取凭证。',
       '只能根据提供的对话、任务快照和 Worker 自描述陈述事实。不能虚构执行、测试或完成情况。没有明确要求做事时不要创建任务。',
@@ -888,6 +983,7 @@ export class Coordinator {
       JSON.stringify(this.workerRegistry().slice(0, 50), null, 2),
       '本次结构化 @ 引用 JSON:',
       JSON.stringify(references, null, 2),
+      ...(handbackReason ? [this.handbackNote(handbackReason)] : []),
       '用户新消息:',
       userMessage.content,
     ].join('\n\n');
@@ -921,7 +1017,7 @@ export class Coordinator {
     return user?.role === 'user' ? user : null;
   }
 
-  startWorkerChat(message, workerId) {
+  startWorkerChat(message, workerId, { taskId = null } = {}) {
     const worker = this.store.getWorker(workerId);
     const user = this.chatUserMessage(message);
     if (!user) {
@@ -938,10 +1034,16 @@ export class Coordinator {
     const identity = this.workerRegistry().find((item) => item.worker_id === workerId);
     const taskIds = (user.mentions ?? []).filter((mention) => mention.type === 'task').map((mention) => mention.id);
     const resultBudget = Math.floor(REFERENCE_EVIDENCE_BUDGET / Math.max(taskIds.length, 1));
-    const references = taskIds.map((taskId) => this.taskReference(taskId, { resultBudget })).filter(Boolean);
+    const references = taskIds.map((id) => this.taskReference(id, { resultBudget })).filter(Boolean);
+    const followup = taskId ? this.store.getTask(taskId) : null;
     const input = [
-      '你是被管理员在 Agent Hub 操作台直接点名的数字员工。请亲自用中文回答，不要冒充中央大脑。',
-      '这是直接问答，不是自动创建或修改任务的授权。可以在现有权限内核实事实，但不要创建任务、修改任务状态或虚构执行与验收。直接回答问题，不要只回复收到。',
+      followup
+        ? `你是任务 ${taskLabel(followup)} 的负责人。管理员在 Agent Hub 操作台 @ 了这个任务，消息直接交给你，没有经过中央大脑。请亲自用中文回答。`
+        : '你是被管理员在 Agent Hub 操作台直接点名的数字员工。请亲自用中文回答，不要冒充中央大脑。',
+      followup
+        ? '这是对你负责任务的追问或补充：在该任务范围内处理并直接回答；需要继续推进该任务就在本会话中照常进行，回复里说明做了什么。不要虚构执行与验收。'
+        : '这是直接问答，不是自动创建或修改任务的授权。可以在现有权限内核实事实，但不要创建任务、修改任务状态或虚构执行与验收。直接回答问题，不要只回复收到。',
+      `如果这条消息其实是在派一项需要立项跟踪的新工作${followup ? '（超出上述任务范围）' : '（不是提问、讨论或对你当前工作的补充）'}，不要开始做，只回复一行：HANDBACK: <一句原因>。Hub 会把它交给中央大脑安排。`,
       `你的身份与职责 JSON：${JSON.stringify(identity)}`,
       ...(references.length ? [`引用的任务上下文 JSON（若标记不完整，不得声称完整阅读）：${JSON.stringify(references)}`] : []),
       '管理员的原消息：',
@@ -994,7 +1096,133 @@ export class Coordinator {
       this.completeChat(message, { status: 'failed', content: `${workerName} 没有返回可显示的回复。` });
       return;
     }
+    const handback = HANDBACK.exec(content);
+    if (handback && !message.handback_reason) {
+      const reason = handback[1].trim().slice(0, 1000) || '员工判断这是需要立项的新工作';
+      const user = this.chatUserMessage(message);
+      const returned = this.store.updateChatMessage(message.message_id, {
+        handbackReason: reason,
+        commandId: null,
+        content: `${workerName} 把这条交回中央大脑安排：${reason}`,
+      });
+      this.notify(returned);
+      this.emit('coordinator.chat.handback', { type: 'worker', id: command.worker_id }, {
+        command_id: command.command_id,
+        payload: { message_id: user?.message_id ?? null, reason },
+      });
+      try {
+        if (!user) throw coordinatorError('Original message not found', 'chat_not_found', 404);
+        this.requestCoordinatorChat(returned, user);
+      } catch (error) {
+        this.completeChat(returned, { status: 'failed', content: `交回中央大脑失败：${error.message}` });
+      }
+      return;
+    }
     this.completeChat(message, { content });
+  }
+
+  // Deterministic fast path: a message that names exactly one Worker, or one
+  // live Task with a reachable assignee, goes straight to that Worker. The
+  // Worker hands it back when it is really new work.
+  fastRoute(user, coordinatorWorkerId) {
+    const workerIds = this.mentionedWorkerIds(user);
+    const taskIds = (user.mentions ?? []).filter((mention) => mention.type === 'task').map((mention) => mention.id);
+    if (workerIds.length === 1 && taskIds.length === 0) return { workerId: workerIds[0], taskId: null };
+    if (workerIds.length || taskIds.length !== 1) return null;
+    const task = this.store.getTask(taskIds[0]);
+    if (!task || task.deleted_at || !LIVE_TASK_STATUSES.has(task.status) || !task.assignee_worker_id) return null;
+    if (task.assignee_worker_id === coordinatorWorkerId || this.store.getOrchestrationByTask(task.task_id)) return null;
+    if (!canReceivePush(this.store.getWorker(task.assignee_worker_id))) return null;
+    return { workerId: task.assignee_worker_id, taskId: task.task_id };
+  }
+
+  // One coordinator_chat at a time: while the coordinator Session has Hub work,
+  // later messages wait and are merged into one call when it is free.
+  requestCoordinatorChat(reply, user) {
+    const { worker } = this.configuredWorker();
+    if (this.store.hasActiveCommand(worker.worker_id)) {
+      const queued = this.store.updateChatMessage(reply.message_id, {
+        queued: true,
+        commandId: null,
+        content: '中央大脑正在处理上一条消息，这条已排队，空下来后合并处理。',
+      });
+      this.notify(queued);
+      this.emit('coordinator.chat.queued', { type: 'worker', id: worker.worker_id }, { payload: { message_id: user.message_id } });
+      return queued;
+    }
+    let pending = reply;
+    try {
+      const command = this.store.createCommand({
+        task_id: null,
+        worker_id: worker.worker_id,
+        kind: 'coordinator_chat',
+        input: this.chatPrompt(user, { handbackReason: reply.handback_reason }),
+        push_capable: true,
+      });
+      pending = this.store.updateChatMessage(reply.message_id, { commandId: command.command_id, queued: false });
+      this.notify(pending);
+      this.emit('coordinator.chat.requested', { type: 'worker', id: worker.worker_id }, {
+        command_id: command.command_id,
+        payload: { message_id: user.message_id },
+      });
+      this.dispatch(command);
+      return pending;
+    } catch (error) {
+      if (!pending.command_id) {
+        this.completeChat(pending, {
+          status: 'failed',
+          content: `消息未能进入执行队列：${error.message}`,
+        });
+      }
+      throw error;
+    }
+  }
+
+  flushChatQueue() {
+    const queued = this.store.listQueuedChatMessages();
+    if (!queued.length) return;
+    let worker;
+    try {
+      ({ worker } = this.configuredWorker());
+    } catch (error) {
+      for (const message of queued) this.completeChat(message, { status: 'failed', content: `排队的消息没能交给中央大脑：${error.message}` });
+      return;
+    }
+    if (this.store.hasActiveCommand(worker.worker_id)) return;
+    const items = [];
+    for (const reply of queued) {
+      const user = this.chatUserMessage(reply);
+      if (user) items.push({ reply, user, handbackReason: reply.handback_reason });
+      else this.completeChat(reply, { status: 'failed', content: '没有找到排队的原消息，请重新发送。' });
+    }
+    if (!items.length) return;
+    if (items.length === 1) {
+      try {
+        this.requestCoordinatorChat({ ...items[0].reply, queued: false }, items[0].user);
+      } catch (error) {
+        this.logger.error?.(error);
+      }
+      return;
+    }
+    const command = this.store.transaction(() => {
+      const created = this.store.createCommand({
+        task_id: null,
+        worker_id: worker.worker_id,
+        kind: 'coordinator_chat',
+        input: this.batchChatPrompt(items),
+        push_capable: true,
+      });
+      for (const { reply } of items) {
+        this.store.updateChatMessage(reply.message_id, { queued: false, batchCommandId: created.command_id, content: '中央大脑正在合并处理排队的消息。' });
+      }
+      return created;
+    });
+    for (const { reply } of items) this.notify(this.store.getChatMessage(reply.message_id));
+    this.emit('coordinator.chat.batched', { type: 'worker', id: worker.worker_id }, {
+      command_id: command.command_id,
+      payload: { message_ids: items.map((item) => item.user.message_id) },
+    });
+    this.dispatch(command);
   }
 
   sendChat({ message, requestId, mentions }) {
@@ -1008,33 +1236,19 @@ export class Coordinator {
     const sourceKey = `chat-reply:${user.message_id}`;
     const existing = this.store.getChatMessageBySourceKey(sourceKey);
     if (existing) return { user, message: this.presentChatMessage(existing) };
-    let reply = this.store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey, mentions: user.mentions });
-    try {
-      const command = this.store.createCommand({
-        task_id: null,
-        worker_id: worker.worker_id,
-        kind: 'coordinator_chat',
-        input: this.chatPrompt(user),
-        push_capable: true,
-      });
-      reply = this.store.updateChatMessage(reply.message_id, { commandId: command.command_id });
-      this.notify(user);
-      this.notify(reply);
-      this.emit('coordinator.chat.requested', { type: 'worker', id: worker.worker_id }, {
-        command_id: command.command_id,
+    const reply = this.store.createChatMessage({ role: 'coordinator', status: 'pending', sourceKey, mentions: user.mentions });
+    this.notify(user);
+    const route = this.fastRoute(user, worker.worker_id);
+    if (route) {
+      this.emit('coordinator.chat.fast_path', { type: 'admin', id: 'admin' }, {
+        worker_id: route.workerId,
+        task_id: route.taskId,
         payload: { message_id: user.message_id },
       });
-      this.dispatch(command);
-      return { user, message: this.presentChatMessage(reply) };
-    } catch (error) {
-      if (!reply.command_id) {
-        this.completeChat(reply, {
-          status: 'failed',
-          content: `消息未能进入执行队列：${error.message}`,
-        });
-      }
-      throw error;
+      this.startWorkerChat(reply, route.workerId, { taskId: route.taskId });
+      return { user, message: this.presentChatMessage(this.store.getChatMessage(reply.message_id)) };
     }
+    return { user, message: this.presentChatMessage(this.requestCoordinatorChat(reply, user)) };
   }
 
   completeChat(message, { content, status = 'done', taskId }) {
@@ -1077,9 +1291,40 @@ export class Coordinator {
     return `已开始处理「${title}」。我会根据真实进展继续汇报，完成前会核对验收。`;
   }
 
+  acceptBatchChat(command, messages) {
+    if (command.status !== 'succeeded' || command.outcome_unknown) {
+      for (const message of messages) {
+        this.completeChat(message, { status: 'failed', content: `这次对话没有完成：${command.error?.message ?? '执行结果无法确认'}。未据此创建或启动任务。` });
+      }
+      return;
+    }
+    let replies = null;
+    try {
+      const document = jsonDocument(command.result?.text);
+      if (Array.isArray(document?.replies)) replies = document.replies;
+    } catch { /* handled below */ }
+    for (const message of messages) {
+      const user = this.chatUserMessage(message);
+      const item = replies?.find((candidate) => candidate && candidate.message_id === user?.message_id);
+      let response;
+      try {
+        response = validateChatResponse(item);
+      } catch {
+        this.completeChat(message, { status: 'failed', content: '这条排队消息没有得到可理解的回复，未创建或启动任务。请重新发送。' });
+        continue;
+      }
+      this.applyChatResponse(message, response);
+    }
+  }
+
   acceptChat(command) {
     const message = this.store.getChatMessageByCommand(command.command_id);
-    if (!message || message.status !== 'pending') return;
+    if (!message) {
+      const batch = this.store.listChatMessagesByBatch(command.command_id).filter((item) => item.status === 'pending');
+      if (batch.length) this.acceptBatchChat(command, batch);
+      return;
+    }
+    if (message.status !== 'pending') return;
     if (command.status !== 'succeeded' || command.outcome_unknown) {
       this.completeChat(message, {
         status: 'failed',
@@ -1097,11 +1342,15 @@ export class Coordinator {
       });
       return;
     }
+    this.applyChatResponse(message, response);
+  }
+
+  applyChatResponse(message, response) {
     try {
       const { action } = response;
       if (action.type === 'chat') {
         const workerIds = this.mentionedWorkerIds(message);
-        if (workerIds.length === 1) this.startWorkerChat(message, workerIds[0]);
+        if (workerIds.length === 1 && !message.handback_reason) this.startWorkerChat(message, workerIds[0]);
         else this.completeChat(message, { content: response.reply });
         return;
       }
@@ -1201,7 +1450,9 @@ export class Coordinator {
 
   resumeChat() {
     for (const message of this.store.listPendingChatMessages()) {
-      const command = message.command_id ? this.store.getCommand(message.command_id) : null;
+      if (message.queued) continue;
+      const commandId = message.command_id ?? message.batch_command_id;
+      const command = commandId ? this.store.getCommand(commandId) : null;
       if (!command) {
         this.completeChat(message, {
           status: 'failed',
@@ -1216,6 +1467,7 @@ export class Coordinator {
         });
       }
     }
+    this.flushChatQueue();
   }
 
   async resume() {

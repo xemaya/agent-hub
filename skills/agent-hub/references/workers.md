@@ -29,7 +29,7 @@ agent-hub session start --runtime claude --push --cwd /path/to/project
 agent-hub session start --runtime claude --push --resume <session-id> --cwd /path/to/project
 ```
 
-在窗口中执行 `register-current`。Channel 接通后，命令以 `<channel source="agent-hub" command_id="...">` 到达；先调用 `agent_hub_ack`，完成工作后调用 `agent_hub_report` 返回完整结果，每个 command_id 一次。终端文字不会自动回传。首次启动选择“本地开发”，权限确认仍在终端处理。关闭窗口会退回 `waiting_manual`。
+在窗口中执行 `register-current`。Channel 接通后，命令以 `<channel source="agent-hub" command_id="...">` 到达；先调用 `agent_hub_ack`；耗时较长的工作在每个有意义的步骤后可调用 `agent_hub_progress` 写一行进展（变化、下一步或阻塞，几分钟最多一次），看门狗据此区分真实推进和空转；完成后调用 `agent_hub_report` 返回完整结果，每个 command_id 一次；缺人的决定或信息时用 `outcome: needs_input` + 一个 `question`，被卡住用 `blocked`，无事可做用 `dropped`。终端文字不会自动回传。首次启动选择“本地开发”，权限确认仍在终端处理。关闭窗口会退回 `waiting_manual`；加入了岗位（`register-current --role KEY`）的窗口除外：它负责的岗位任务会在接手等待时间（默认 3 分钟）后带着交接包转给同岗位的其他在线窗口，原窗口在这之前回来则继续由它做。
 
 ## Kimi ACP 或原生 TUI
 
@@ -46,7 +46,7 @@ ACP 是轻量交互窗口，不是原生全屏 TUI。正常回答即可，桥接
 
 在当前聊天中使用 `worker register-current --push`（或 `desktop attach --push`）。桥接调用现有 `codex queue --thread <CODEX_SESSION_ID> --message ...`，不启动另一个 App，不重启桌面，不在另一进程恢复当前模型线程。
 
-收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执核对原生会话并保护重复调用。桌面进程退出后通道关闭。
+收到命令后按消息中的参数数组调用 `desktop report --command-id ... --status succeeded|failed`，结果从 stdin 传入；需要人回答时追加 `--outcome needs_input --question "<一个问题>"`。回执必须在收到指令的真实原生会话中提交；只在桌面回答不会回传 Hub。入队成功只是接受投递，必须核对最终回执；超时、断线、回执不明都不得重投。桥接持久化每个 command_id，回执核对原生会话并保护重复调用。桌面进程退出后通道关闭。
 
 Skill 只是操作说明，不能绕过桌面权限或代替 Connector 和桥接保持连接。登记、`worker list` 和回执是分别授权的本机命令，直接为每条命令使用 Codex 工具自带的单次提升权限，不必先等待 `spawn EPERM` 或 `fetch failed`。不要 sudo、修改全局沙箱、切换终端或改用后台 Worker。回执需要访问本机 Connector，登记成功不代表后续命令可以不加权限地执行。
 

@@ -4,7 +4,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { HubStore } from './db.js';
-import { Coordinator } from './coordinator.js';
+import { Coordinator, resultPointer } from './coordinator.js';
+import { Watchdog, WATCHDOG_KIND } from './watchdog.js';
+import { Roles } from './roles.js';
 import { bearerToken, hashToken, tokensEqual } from './auth.js';
 import { loadHubCredentials } from './credentials.js';
 import { createId, createToken } from './ids.js';
@@ -19,10 +21,14 @@ const STATIC_FILES = new Map([
   ['/markdown.js', ['markdown.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
+const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked']);
+const WORK_COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request']);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
 const COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request', 'coordinator_plan', 'coordinator_review', 'coordinator_chat', 'worker_chat', 'worker_message']);
 const COORDINATOR_COMMAND_KINDS = new Set(['coordinator_plan', 'coordinator_review', 'coordinator_chat']);
+// Internal JSON-producing commands whose output is not shown as Worker work.
+const INTERNAL_COMMAND_KINDS = new Set([...COORDINATOR_COMMAND_KINDS, WATCHDOG_KIND]);
 
 function workerActivity(store, worker) {
   const commands = store.listCommands({ workerId: worker.worker_id });
@@ -50,6 +56,7 @@ function workerActivity(store, worker) {
   else if (current?.kind === 'coordinator_plan') phase = 'planning';
   else if (current?.kind === 'coordinator_review') phase = 'reviewing';
   else if (['coordinator_chat', 'worker_chat'].includes(current?.kind)) phase = 'chatting';
+  else if (current?.kind === WATCHDOG_KIND) phase = 'watching';
   else if (current || worker.work_state === 'working') phase = 'working';
   else if (['waiting', 'blocked'].includes(worker.work_state)) phase = worker.work_state;
   const details = {
@@ -58,15 +65,16 @@ function workerActivity(store, worker) {
     planning: '正在制定任务计划',
     reviewing: '正在核对执行证据',
     chatting: '正在理解你的消息',
+    watching: '正在巡检其他员工的进展',
     working: '正在执行任务',
     waiting: '等待进一步处理',
     blocked: 'Worker 报告了阻塞',
     waiting_manual: '需要在原会话中人工处理',
     offline: '机器连接已断开，展示最后已知状态',
   };
-  const internal = current ? COORDINATOR_COMMAND_KINDS.has(current.kind) : false;
+  const internal = current ? INTERNAL_COMMAND_KINDS.has(current.kind) : false;
   const output = current && !internal ? current.output_text.slice(-2000) : '';
-  const recentText = recent && !COORDINATOR_COMMAND_KINDS.has(recent.kind)
+  const recentText = recent && !INTERNAL_COMMAND_KINDS.has(recent.kind)
     ? typeof recent.result?.text === 'string' ? recent.result.text : recent.output_text
     : '';
   return {
@@ -75,7 +83,7 @@ function workerActivity(store, worker) {
     command_id: current?.command_id ?? null,
     command_status: current?.status ?? null,
     task_id: orchestration?.parent_task_id ?? taskId,
-    task_title: step?.title ?? task?.title ?? (current?.kind === 'coordinator_chat' ? '中央对话' : current?.kind === 'worker_chat' ? '直接对话' : null),
+    task_title: step?.title ?? task?.title ?? (current?.kind === 'coordinator_chat' ? '中央对话' : current?.kind === 'worker_chat' ? '直接对话' : current?.kind === WATCHDOG_KIND ? '看门狗巡检' : null),
     parent_task_title: orchestration ? store.getTask(orchestration.parent_task_id)?.title ?? null : null,
     output_text: output,
     output_truncated: Boolean(current?.output_truncated || (current && current.output_text.length > output.length)),
@@ -168,6 +176,26 @@ export class Hub {
       notify: (message) => this.broadcast('chat.updated', { message: this.coordinator.presentChatMessage(message) }),
       logger: this.logger,
     });
+    this.watchdog = new Watchdog({
+      store: this.store,
+      emit: (...args) => this.emit(...args),
+      dispatch: (command) => this.dispatch(command),
+      sendMail: (senderWorkerId, payload) => {
+        const created = this.createMail(this.store.getWorker(senderWorkerId), payload);
+        try { this.dispatchMail(created.message); } catch (error) { this.logger.error?.(error); }
+        return created;
+      },
+      alert: ({ target, verdict }) => this.watchdogAlert(target, verdict),
+      logger: this.logger,
+    });
+    this.roles = new Roles({
+      store: this.store,
+      emit: (...args) => this.emit(...args),
+      dispatch: (command) => this.dispatch(command),
+      broadcast: (type, payload) => this.broadcast(type, payload),
+      cancel: (commandId, options) => this.cancelCommand(commandId, options),
+      logger: this.logger,
+    });
     this.server = createServer((request, response) => {
       this.handleRequest(request, response).catch((error) => {
         this.logger.error?.(error);
@@ -187,6 +215,8 @@ export class Hub {
     this.heartbeat.unref();
     this.inactivityWatchdog = setInterval(() => {
       this.expireInactiveCommands().catch(error => this.logger.error?.(error));
+      this.tickWatchdog();
+      if (!this.closing) this.roles.tick().catch(error => this.logger.error?.(error));
     }, watchdogIntervalMs);
     this.inactivityWatchdog.unref();
     this.server.on('upgrade', (request, socket, head) => {
@@ -341,8 +371,285 @@ export class Hub {
     this.coordinatorScheduled = true;
     queueMicrotask(() => {
       this.coordinatorScheduled = false;
-      if (!this.closing) this.coordinator.resume().catch(error => this.logger.error?.(error));
+      if (this.closing) return;
+      try {
+        this.roles.pump();
+      } catch (error) {
+        this.logger.error?.(error);
+      }
+      this.coordinator.resume().catch(error => this.logger.error?.(error));
     });
+  }
+
+  async onCommandFinished(command) {
+    if (await this.watchdog.onCommandFinished(command)) return true;
+    let handled = await this.coordinator.onCommandFinished(command);
+    if (!handled) handled = this.roles.onCommandFinished(command);
+    if (!handled) this.captureAttention(command);
+    try {
+      this.coordinator.flushChatQueue();
+    } catch (error) {
+      this.logger.error?.(error);
+    }
+    return handled;
+  }
+
+  // A structured report that needs a person becomes an Attention: one question,
+  // shown first on the Dashboard, answered back into the same Worker.
+  captureAttention(command) {
+    const outcome = command.result?.outcome;
+    if (command.status !== 'succeeded' || command.outcome_unknown || !WORK_COMMAND_KINDS.has(command.kind)) return null;
+    if (!ATTENTION_OUTCOMES.has(outcome)) return null;
+    const question = String(command.result?.question ?? '').trim()
+      || String(command.result?.text ?? '').trim().slice(0, 1000) || '需要人工决定';
+    const attention = this.store.createAttention({
+      commandId: command.command_id,
+      taskId: command.task_id,
+      workerId: command.worker_id,
+      outcome,
+      question,
+    });
+    if (command.task_id) {
+      const task = this.store.updateTask(command.task_id, { status: 'blocked' });
+      this.broadcast('task.updated', { task });
+    }
+    this.emit('attention.created', { type: 'worker', id: command.worker_id }, {
+      worker_id: command.worker_id,
+      task_id: command.task_id,
+      command_id: command.command_id,
+      payload: { attention_id: attention.attention_id, outcome },
+    });
+    this.broadcast('attention.updated', { attention });
+    return attention;
+  }
+
+  answerAttention(attentionId, answer, actor = { type: 'admin', id: 'admin' }) {
+    const attention = this.store.getAttention(attentionId);
+    if (!attention) throw protocolError('Attention not found', 404, 'attention_not_found');
+    if (attention.status !== 'open') throw protocolError('Attention is already resolved', 409, 'attention_resolved');
+    const text = requiredString(answer, 'answer', { max: 20000 });
+    const step = this.coordinator.answerStep(attention, text);
+    let commandId = step?.command_id ?? null;
+    let handoff = null;
+    // Resolve first so a handoff package built for a new seat does not list
+    // the question as still open.
+    const resolve = () => this.store.resolveAttention(attentionId, { status: 'answered', answer: text, answerCommandId: commandId }).attention;
+    let resolved = null;
+    if (!step) {
+      const task = attention.task_id ? this.store.getTask(attention.task_id) : null;
+      const input = [
+        `命令 ${attention.command_id} 里提出的问题有了回答，请在原任务范围内继续，完成后照常回报。`,
+        `问题：${attention.question}`,
+        `回答：${text}`,
+        `需要回看那次的完整回报：${resultPointer(attention.command_id)}`,
+      ].join('\n\n');
+      if (task?.role_key && !task.deleted_at) {
+        resolved = resolve();
+        const delivered = this.roles.deliver(task, input, { reason: 'answer', actor });
+        handoff = delivered.handoff;
+        commandId = delivered.command?.command_id ?? null;
+        if (commandId) resolved = this.store.setAttentionAnswerCommand(attentionId, commandId);
+      } else {
+        const worker = this.store.getWorker(attention.worker_id);
+        if (!worker || worker.retired_at) throw protocolError('The Worker that asked is no longer available', 409, 'worker_retired');
+        const command = this.store.createCommand({
+          task_id: task && !task.deleted_at ? task.task_id : null,
+          worker_id: worker.worker_id,
+          kind: 'prompt',
+          input,
+          push_capable: worker.push_capable,
+        });
+        commandId = command.command_id;
+        this.dispatch(command);
+      }
+    }
+    resolved ??= resolve();
+    this.emit('attention.answered', actor, {
+      worker_id: attention.worker_id,
+      task_id: attention.task_id,
+      command_id: commandId,
+      payload: { attention_id: attentionId, ...(handoff ? { handoff_id: handoff.handoff_id } : {}) },
+    });
+    this.broadcast('attention.updated', { attention: resolved });
+    this.scheduleCoordinator();
+    return resolved;
+  }
+
+  dismissAttention(attentionId) {
+    const { attention, changed } = this.store.resolveAttention(attentionId, { status: 'dismissed' });
+    if (!attention) throw protocolError('Attention not found', 404, 'attention_not_found');
+    if (!changed) throw protocolError('Attention is already resolved', 409, 'attention_resolved');
+    this.emit('attention.dismissed', { type: 'admin', id: 'admin' }, { worker_id: attention.worker_id, task_id: attention.task_id, payload: { attention_id: attentionId } });
+    this.broadcast('attention.updated', { attention });
+    return attention;
+  }
+
+  // An event from an external conversation (a Feishu topic, a PR thread). The
+  // thread_key is the subscription: while a live Task follows the thread, its
+  // later messages go straight to the Task's assignee (or answer its open
+  // question) without the Coordinator. trigger_key makes delivery idempotent.
+  receiveTrigger(connectorId, payload) {
+    const triggerKey = requiredString(payload.trigger_key, 'trigger_key', { max: 300 });
+    const threadKey = requiredString(payload.thread_key, 'thread_key', { max: 300 });
+    const source = requiredString(payload.source ?? 'external', 'source', { max: 60 });
+    const text = requiredString(payload.text, 'text', { max: 20000 });
+    const actor = { type: 'connector', id: connectorId };
+    const previous = this.store.getTrigger(triggerKey);
+    if (previous) {
+      return { routed: previous.routed, duplicate: true, task: previous.task_id ? this.store.getTask(previous.task_id) : null, command_id: previous.command_id };
+    }
+    const task = this.store.liveTaskByThread(threadKey);
+    let routed = 'ignored';
+    let command = null;
+    let attention = null;
+    let created = null;
+    let handoff = null;
+    if (task) {
+      const open = this.store.openAttentionForTask(task.task_id);
+      const followup = [
+        `【跟进】你负责的任务 ${task.task_number ? `#${String(task.task_number).padStart(4, '0')} ` : ''}「${task.title}」所在的话题（${threadKey}）有新消息，直接转给你，没有经过中央大脑。`,
+        '它可能是补充、追问、感谢或与任务无关；在任务范围内处理，不需要回应的就简短回报「无需处理」。超出任务范围的新工作不要做，回报时说明。',
+        `来自：${payload.actor ?? '未知'}`,
+        text,
+      ].join('\n\n');
+      if (open) {
+        attention = this.answerAttention(open.attention_id, `${payload.actor ? `${payload.actor}：` : ''}${text}`, actor);
+        handoff = attention.answer_command_id ? null : this.store.openHandoffForTask(task.task_id);
+        routed = 'answered';
+      } else if (task.role_key) {
+        ({ command, handoff } = this.roles.deliver(task, followup, { reason: 'followup', actor }));
+        routed = 'followup';
+      } else if (task.assignee_worker_id && !this.store.getWorker(task.assignee_worker_id)?.retired_at) {
+        const worker = this.store.getWorker(task.assignee_worker_id);
+        command = this.store.createCommand({
+          task_id: task.task_id,
+          worker_id: worker.worker_id,
+          kind: 'prompt',
+          input: followup,
+          push_capable: worker.push_capable,
+        });
+        routed = 'followup';
+      }
+    } else if (payload.followup_only !== true && payload.role !== undefined) {
+      // Addressed to a Role: whichever seat is live takes it, or the first
+      // seat that comes online.
+      const role = this.roles.ensure(payload.role);
+      created = this.store.createTask({
+        title: requiredString(payload.title ?? text.slice(0, 80), 'title', { max: 300 }),
+        goal: optionalString(payload.goal, text),
+        context: optionalString(payload.context),
+        acceptance: stringArray(payload.acceptance),
+        created_by: `trigger:${source}`,
+        thread_key: threadKey,
+        role_key: role.role_key,
+      });
+      routed = 'created';
+      this.emit('task.created', actor, { task_id: created.task_id, payload: { title: created.title, thread_key: threadKey, role_key: role.role_key } });
+      this.broadcast('task.updated', { task: created });
+      handoff = this.roles.enqueue(created, { reason: 'initial', input: text, actor });
+    } else if (payload.followup_only !== true) {
+      const workerId = requiredString(payload.worker_id, 'worker_id', { max: 100 });
+      const worker = this.store.getWorkerForConnector(workerId, connectorId);
+      if (!worker || worker.retired_at) throw protocolError('Worker does not belong to this connector', 403, 'worker_forbidden');
+      created = this.store.createTask({
+        title: requiredString(payload.title ?? text.slice(0, 80), 'title', { max: 300 }),
+        goal: optionalString(payload.goal, text),
+        context: optionalString(payload.context),
+        acceptance: stringArray(payload.acceptance),
+        assignee_worker_id: worker.worker_id,
+        created_by: `trigger:${source}`,
+        thread_key: threadKey,
+      });
+      command = this.store.createCommand({
+        task_id: created.task_id,
+        worker_id: worker.worker_id,
+        kind: 'prompt',
+        input: text,
+        push_capable: worker.push_capable,
+      });
+      routed = 'created';
+      this.emit('task.created', actor, { task_id: created.task_id, worker_id: worker.worker_id, payload: { title: created.title, thread_key: threadKey } });
+      this.broadcast('task.updated', { task: created });
+    }
+    const target = created ?? task;
+    if (handoff) handoff = this.store.getHandoff(handoff.handoff_id);
+    // Role delivery dispatches and announces its own command.
+    const seated = handoff?.command_id ?? (target?.role_key && !attention ? command?.command_id : null) ?? null;
+    if (target?.role_key) command = null;
+    this.store.recordTrigger({
+      triggerKey, threadKey, source, routed,
+      taskId: target?.task_id ?? null,
+      commandId: command?.command_id ?? seated ?? attention?.answer_command_id ?? null,
+      attentionId: attention?.attention_id ?? null,
+    });
+    this.emit('trigger.received', actor, {
+      task_id: target?.task_id ?? null,
+      command_id: command?.command_id ?? seated ?? null,
+      payload: { trigger_key: triggerKey, thread_key: threadKey, source, routed },
+    });
+    if (command) {
+      this.emit('command.created', actor, {
+        worker_id: command.worker_id, task_id: command.task_id, command_id: command.command_id,
+        payload: { kind: command.kind, status: command.status },
+      });
+      this.dispatch(command);
+      this.broadcast('command.updated', { command });
+    }
+    const waiting = handoff?.status === 'open';
+    return {
+      routed,
+      duplicate: false,
+      task: target ? this.store.getTask(target.task_id) : null,
+      command_id: command?.command_id ?? seated ?? attention?.answer_command_id ?? null,
+      ...(waiting ? { waiting_for_seat: true, handoff_id: handoff.handoff_id, role: handoff.role_key } : {}),
+    };
+  }
+
+  // Reading a full result is allowed only for the Worker that produced it, or a
+  // Worker whose own instructions contained the pointer.
+  commandResultFor(requester, commandId) {
+    const command = this.store.getCommand(requiredString(commandId, 'command_id', { max: 100 }));
+    if (!command || (command.worker_id !== requester.worker_id && !this.store.commandReferencedBy(requester.worker_id, command.command_id))) {
+      throw protocolError('Command result is not available to this Worker', 404, 'command_result_forbidden');
+    }
+    return {
+      command_id: command.command_id,
+      worker_name: command.worker_name,
+      task_id: command.task_id,
+      status: command.status,
+      outcome: command.result?.outcome ?? null,
+      text: typeof command.result?.text === 'string' ? command.result.text : command.result == null ? '' : JSON.stringify(command.result),
+      output_gap: Boolean(command.result?.output_gap),
+      error: command.error,
+      finished_at: command.finished_at,
+    };
+  }
+
+  tickWatchdog() {
+    if (this.closing) return;
+    try {
+      this.watchdog.tick();
+    } catch (error) {
+      this.logger.error?.(error);
+    }
+  }
+
+  // An escalation waits for a person: it is shown in the central conversation
+  // and on the Dashboard, and changes no task or command state.
+  watchdogAlert(target, verdict) {
+    const worker = this.store.getWorker(target.worker_id);
+    const task = target.task_id ? this.store.getTask(target.task_id) : null;
+    const sourceKey = `watchdog:${target.command_id}:${target.last_activity_at ?? ''}`;
+    if (!this.store.getChatMessageBySourceKey(sourceKey)) {
+      const message = this.store.createChatMessage({
+        role: 'activity',
+        content: `看门狗：${worker?.name ?? '数字员工'}${task ? `（${task.title}）` : ''} 需要你看一下。\n${verdict.message}\n依据：${verdict.evidence}`.slice(0, 12000),
+        taskId: target.task_id ?? null,
+        sourceKey,
+      });
+      this.broadcast('chat.updated', { message: this.coordinator.presentChatMessage(message) });
+    }
+    this.broadcast('watchdog.alert', { command_id: target.command_id, worker_id: target.worker_id, state: verdict.state, message: verdict.message });
   }
 
   async expireInactiveCommands() {
@@ -351,7 +658,7 @@ export class Hub {
     try {
       const timestamp = Date.now();
       for (const command of this.store.listRunningCommands()) {
-        const timeoutMs = COORDINATOR_COMMAND_KINDS.has(command.kind)
+        const timeoutMs = INTERNAL_COMMAND_KINDS.has(command.kind)
           ? this.coordinatorInactivityTimeoutMs
           : this.commandInactivityTimeoutMs;
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) continue;
@@ -390,7 +697,7 @@ export class Hub {
     if (command.kind === 'worker_message') {
       this.settleWorkerMessageWaiters(command);
     } else {
-      const handled = await this.coordinator.onCommandFinished(command);
+      const handled = await this.onCommandFinished(command);
       if (!handled && command.task_id) {
         const task = this.store.getTask(command.task_id);
         if (task && !['done', 'cancelled', 'blocked'].includes(task.status)) {
@@ -536,6 +843,31 @@ export class Hub {
       sendJson(response, 200, { coordinator });
       return;
     }
+    if (request.method === 'GET' && pathname === '/api/v1/watchdog') {
+      sendJson(response, 200, { watchdog: this.watchdog.status() });
+      return;
+    }
+    if (request.method === 'PUT' && pathname === '/api/v1/watchdog') {
+      const body = await readJsonBody(request);
+      if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+        sendJson(response, 400, { error: 'enabled must be a boolean' });
+        return;
+      }
+      const watchdog = this.watchdog.configure({
+        workerId: body.worker_id,
+        enabled: body.enabled ?? true,
+        intervalMs: body.interval_ms,
+        minRunningMs: body.min_running_ms,
+        nudgeCooldownMs: body.nudge_cooldown_ms,
+      });
+      sendJson(response, 200, { watchdog });
+      return;
+    }
+    if (request.method === 'POST' && pathname === '/api/v1/watchdog/check') {
+      const check = this.watchdog.tick({ force: true });
+      sendJson(response, 200, { check });
+      return;
+    }
     if (request.method === 'GET' && pathname === '/api/v1/coordinator/chat') {
       sendJson(response, 200, { messages: this.coordinator.chat(), epoch: this.store.conversationEpoch() });
       return;
@@ -592,6 +924,63 @@ export class Hub {
       sendJson(response, 200, { tasks: this.store.listTasks({ includeDeleted }) });
       return;
     }
+    if (request.method === 'GET' && pathname === '/api/v1/roles') {
+      sendJson(response, 200, { roles: this.store.listRoles().map((role) => this.roles.present(role)) });
+      return;
+    }
+    const roleMatch = /^\/api\/v1\/roles\/([^/]+)$/.exec(pathname);
+    if (request.method === 'PUT' && roleMatch) {
+      const body = await readJsonBody(request);
+      const roleKey = this.roles.validKey(decodeURIComponent(roleMatch[1]));
+      const takeover = body.takeover_after_ms === undefined ? undefined : Number(body.takeover_after_ms);
+      if (takeover !== undefined && (!Number.isInteger(takeover) || takeover < 0 || takeover > 7 * 24 * 3600 * 1000)) {
+        sendJson(response, 400, { error: 'takeover_after_ms must be an integer between 0 and 7 days' });
+        return;
+      }
+      const role = this.store.upsertRole({
+        roleKey,
+        name: body.name === undefined ? undefined : requiredString(body.name, 'name', { max: 60 }),
+        description: body.description === undefined ? undefined : optionalString(body.description).slice(0, 2000),
+        takeoverAfterMs: takeover,
+      });
+      this.emit('role.updated', { type: 'admin', id: 'admin' }, { payload: { role_key: role.role_key } });
+      this.scheduleCoordinator();
+      sendJson(response, 200, { role: this.roles.present(role) });
+      return;
+    }
+    const workerRoleMatch = /^\/api\/v1\/workers\/([^/]+)\/role$/.exec(pathname);
+    if (request.method === 'PUT' && workerRoleMatch) {
+      const body = await readJsonBody(request);
+      const current = this.store.getWorker(decodeURIComponent(workerRoleMatch[1]));
+      if (!current || current.retired_at) {
+        sendJson(response, 404, { error: 'Worker not found' });
+        return;
+      }
+      const worker = this.roles.assign(current.worker_id, body.role ?? null, { type: 'admin', id: 'admin' });
+      this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
+      this.scheduleCoordinator();
+      sendJson(response, 200, { worker: this.presentWorker(worker) });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/handoffs') {
+      const status = url.searchParams.get('status') ?? 'open';
+      sendJson(response, 200, { handoffs: this.store.listHandoffs({ status: status === 'all' ? null : status, roleKey: url.searchParams.get('role') }) });
+      return;
+    }
+    if (request.method === 'GET' && pathname === '/api/v1/attentions') {
+      const status = url.searchParams.get('status') ?? 'open';
+      sendJson(response, 200, { attentions: this.store.listAttentions({ status: status === 'all' ? null : status }) });
+      return;
+    }
+    const attentionMatch = /^\/api\/v1\/attentions\/([^/]+)\/(answer|dismiss)$/.exec(pathname);
+    if (request.method === 'POST' && attentionMatch) {
+      const body = await readJsonBody(request);
+      const attention = attentionMatch[2] === 'answer'
+        ? this.answerAttention(attentionMatch[1], body.answer)
+        : this.dismissAttention(attentionMatch[1]);
+      sendJson(response, 200, { attention });
+      return;
+    }
     if (request.method === 'GET' && pathname === '/api/v1/events') {
       sendJson(response, 200, { events: this.store.listEvents() });
       return;
@@ -635,6 +1024,7 @@ export class Hub {
         sendJson(response, 400, { error: 'Assignee worker does not exist' });
         return;
       }
+      const role = body.role ? this.roles.ensure(body.role) : null;
       const task = this.store.createTask({
         title: requiredString(body.title, 'title', { max: 300 }),
         goal: optionalString(body.goal),
@@ -642,6 +1032,7 @@ export class Hub {
         acceptance: stringArray(body.acceptance),
         assignee_worker_id: assignee,
         created_by: 'admin',
+        role_key: role?.role_key ?? null,
       });
       this.emit('task.created', { type: 'admin', id: 'admin' }, {
         task_id: task.task_id,
@@ -657,6 +1048,15 @@ export class Hub {
       const task = taskId ? this.store.getTask(taskId) : null;
       if (taskId && !task) {
         sendJson(response, 400, { error: 'Task does not exist' });
+        return;
+      }
+      if (task?.role_key && !body.worker_id && (body.kind ?? 'prompt') === 'prompt') {
+        if (task.deleted_at || ['done', 'cancelled'].includes(task.status)) {
+          sendJson(response, 409, { error: 'Task is closed' });
+          return;
+        }
+        const { command, handoff } = this.roles.deliver(task, requiredString(body.input, 'input', { max: 200000 }), { reason: 'followup', actor: { type: 'admin', id: 'admin' } });
+        sendJson(response, 202, { command, handoff });
         return;
       }
       const workerId = body.worker_id ?? task?.assignee_worker_id;
@@ -1034,6 +1434,15 @@ export class Hub {
       }, message.id);
       return;
     }
+    if (message.type === 'command.result') {
+      const requester = this.workerSession(connectorId, payload);
+      this.send(socket, 'command.result', { result: this.commandResultFor(requester, payload.command_id) }, message.id);
+      return;
+    }
+    if (message.type === 'trigger.receive') {
+      this.send(socket, 'trigger.received', this.receiveTrigger(connectorId, payload), message.id);
+      return;
+    }
     if (message.type === 'worker.directory') {
       const requester = this.workerSession(connectorId, payload);
       this.send(socket, 'worker.directory', {
@@ -1109,6 +1518,7 @@ export class Hub {
       if (assignee && !this.store.getWorkerForConnector(assignee, connectorId)) {
         throw protocolError('Assignee worker does not belong to this connector', 403, 'worker_forbidden');
       }
+      const role = payload.role ? this.roles.ensure(payload.role) : null;
       const task = this.store.createTask({
         title: requiredString(payload.title, 'title', { max: 300 }),
         goal: optionalString(payload.goal),
@@ -1116,6 +1526,7 @@ export class Hub {
         acceptance: stringArray(payload.acceptance),
         assignee_worker_id: assignee,
         created_by: `connector:${connectorId}`,
+        role_key: role?.role_key ?? null,
       });
       this.emit('task.created', { type: 'connector', id: connectorId }, {
         task_id: task.task_id,
@@ -1146,6 +1557,12 @@ export class Hub {
       const taskId = payload.task_id ?? null;
       const task = taskId ? this.store.getTask(taskId) : null;
       if (taskId && !task) throw protocolError('Task does not exist', 400, 'task_not_found');
+      if (task?.role_key && !payload.worker_id && (payload.kind ?? 'prompt') === 'prompt') {
+        if (task.deleted_at || ['done', 'cancelled'].includes(task.status)) throw protocolError('Task is closed', 409, 'task_closed');
+        const { command, handoff } = this.roles.deliver(task, requiredString(payload.input, 'input', { max: 200000 }), { reason: 'followup', actor: { type: 'connector', id: connectorId } });
+        this.send(socket, 'command.created', { command, handoff }, message.id);
+        return;
+      }
       const workerId = payload.worker_id ?? task?.assignee_worker_id;
       const worker = workerId ? this.store.getWorkerForConnector(workerId, connectorId) : null;
       if (!worker) throw protocolError('Worker is unavailable to this connector', 403, 'worker_forbidden');
@@ -1170,7 +1587,11 @@ export class Hub {
       return;
     }
     if (message.type === 'worker.register') {
-      const worker = this.store.registerWorker(connectorId, workerInput(payload));
+      if (payload.role !== undefined && payload.role !== null && payload.role !== '') this.roles.validKey(payload.role);
+      let worker = this.store.registerWorker(connectorId, workerInput(payload));
+      // Joining a Role is part of registering; re-registering without one keeps it.
+      if (payload.role !== undefined) worker = this.roles.assign(worker.worker_id, payload.role, { type: 'worker', id: worker.worker_id });
+      if (worker.role_key) this.scheduleCoordinator();
       this.emit('worker.registered', { type: 'worker', id: worker.worker_id }, {
         connector_id: connectorId,
         worker_id: worker.worker_id,
@@ -1296,7 +1717,7 @@ export class Hub {
       this.broadcast('command.updated', { command });
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       if (command.kind === 'worker_message') this.settleWorkerMessageWaiters(command);
-      else await this.coordinator.onCommandFinished(command);
+      else await this.onCommandFinished(command);
       this.scheduleCoordinator();
       return;
     }
@@ -1318,7 +1739,7 @@ export class Hub {
           outcomeUnknown: Boolean(payload.outcome_unknown),
         });
         if (updated.kind === 'worker_message') this.settleWorkerMessageWaiters(updated);
-        else await this.coordinator.onCommandFinished(updated);
+        else await this.onCommandFinished(updated);
         this.refreshWorkerState(command.worker_id);
         this.scheduleCoordinator();
       }
@@ -1345,7 +1766,7 @@ export class Hub {
     const socket = worker && this.connectors.get(worker.connector_id);
     if (!socket) return false;
     const task = command.task_id ? this.store.getTask(command.task_id) : null;
-    const directory = COORDINATOR_COMMAND_KINDS.has(command.kind)
+    const directory = INTERNAL_COMMAND_KINDS.has(command.kind)
       ? null
       : this.store.listWorkerDirectory({ excludeWorkerId: command.worker_id });
     return this.send(socket, 'command.dispatch', {

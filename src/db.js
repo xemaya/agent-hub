@@ -41,6 +41,8 @@ function workerView(row) {
     updated_at: row.updated_at,
     last_seen_at: row.last_seen_at,
     retired_at: row.retired_at ?? null,
+    role_key: row.role_key ?? null,
+    detached_at: row.detached_at ?? null,
   };
 }
 
@@ -53,6 +55,7 @@ function workerDirectoryView(worker) {
     runtime: worker.runtime,
     capabilities: worker.capabilities,
     description: typeof worker.metadata?.description === 'string' ? worker.metadata.description.slice(0, 2000) : '',
+    role: worker.role_key,
     push_capable: worker.push_capable,
     presence: worker.presence,
     work_state: worker.work_state,
@@ -71,6 +74,8 @@ function taskView(row) {
     assignee_worker_id: row.assignee_worker_id,
     assignee_name: row.assignee_name ?? null,
     status: row.status,
+    thread_key: row.thread_key ?? null,
+    role_key: row.role_key ?? null,
     deleted_at: row.deleted_at ?? null,
     created_by: row.created_by,
     created_at: row.created_at,
@@ -149,6 +154,66 @@ function orchestrationView(row) {
   };
 }
 
+function attentionView(row) {
+  if (!row) return null;
+  return {
+    attention_id: row.attention_id,
+    command_id: row.command_id,
+    task_id: row.task_id,
+    worker_id: row.worker_id,
+    worker_name: row.worker_name ?? null,
+    task_title: row.task_title ?? null,
+    task_number: row.task_number == null ? null : Number(row.task_number),
+    orchestration_id: row.orchestration_id ?? null,
+    step_key: row.step_key ?? null,
+    outcome: row.outcome,
+    question: row.question,
+    status: row.status,
+    answer: row.answer ?? null,
+    answer_command_id: row.answer_command_id ?? null,
+    created_at: row.created_at,
+    resolved_at: row.resolved_at ?? null,
+  };
+}
+
+function roleView(row) {
+  if (!row) return null;
+  return {
+    role_key: row.role_key,
+    name: row.name,
+    description: row.description,
+    takeover_after_ms: Number(row.takeover_after_ms),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function handoffView(row) {
+  if (!row) return null;
+  return {
+    handoff_id: row.handoff_id,
+    task_id: row.task_id,
+    task_title: row.task_title ?? null,
+    task_number: row.task_number == null ? null : Number(row.task_number),
+    role_key: row.role_key,
+    reason: row.reason,
+    input: row.input,
+    from_worker_id: row.from_worker_id ?? null,
+    from_command_id: row.from_command_id ?? null,
+    status: row.status,
+    worker_id: row.worker_id ?? null,
+    command_id: row.command_id ?? null,
+    not_before: row.not_before,
+    created_at: row.created_at,
+    resolved_at: row.resolved_at ?? null,
+  };
+}
+
+const HANDOFF_SELECT = `
+  SELECT h.*, t.title AS task_title, t.task_number AS task_number
+  FROM handoffs AS h LEFT JOIN tasks AS t ON t.task_id = h.task_id
+`;
+
 function chatMessageView(row) {
   if (!row) return null;
   return {
@@ -162,9 +227,19 @@ function chatMessageView(row) {
     source_key: row.source_key,
     mentions: parseJson(row.mentions_json ?? '[]', []),
     conversation_epoch: Number(row.conversation_epoch ?? 0),
+    handback_reason: row.handback_reason ?? null,
+    queued: Boolean(row.queued),
+    batch_command_id: row.batch_command_id ?? null,
     created_at: row.created_at,
   };
 }
+
+const ATTENTION_SELECT = `
+  SELECT a.*, w.name AS worker_name, t.title AS task_title, t.task_number AS task_number
+  FROM attentions AS a
+  LEFT JOIN workers AS w ON w.worker_id = a.worker_id
+  LEFT JOIN tasks AS t ON t.task_id = a.task_id
+`;
 
 const WORKER_SELECT = `
   SELECT w.*, c.name AS connector_name, c.online AS connector_online
@@ -293,6 +368,63 @@ export class HubStore {
         conversation_epoch INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS watchdog_config (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        worker_id TEXT REFERENCES workers(worker_id),
+        enabled INTEGER NOT NULL,
+        interval_ms INTEGER NOT NULL,
+        min_running_ms INTEGER NOT NULL,
+        nudge_cooldown_ms INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS attentions (
+        attention_id TEXT PRIMARY KEY,
+        command_id TEXT NOT NULL UNIQUE REFERENCES commands(command_id),
+        task_id TEXT REFERENCES tasks(task_id),
+        worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+        orchestration_id TEXT,
+        step_key TEXT,
+        outcome TEXT NOT NULL,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open', 'answered', 'dismissed')),
+        answer TEXT,
+        answer_command_id TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS triggers (
+        trigger_key TEXT PRIMARY KEY,
+        thread_key TEXT NOT NULL,
+        source TEXT NOT NULL,
+        routed TEXT NOT NULL,
+        task_id TEXT,
+        command_id TEXT,
+        attention_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS roles (
+        role_key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        takeover_after_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS handoffs (
+        handoff_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        role_key TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        input TEXT NOT NULL DEFAULT '',
+        from_worker_id TEXT,
+        from_command_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('open', 'dispatched', 'cancelled')),
+        worker_id TEXT,
+        command_id TEXT,
+        not_before TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
       CREATE TABLE IF NOT EXISTS coordinator_chat_state (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         epoch INTEGER NOT NULL DEFAULT 0
@@ -302,6 +434,7 @@ export class HubStore {
       CREATE INDEX IF NOT EXISTS idx_commands_worker ON commands(worker_id, status);
       CREATE INDEX IF NOT EXISTS idx_commands_task ON commands(task_id);
       CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_command ON events(command_id, event_type);
       CREATE INDEX IF NOT EXISTS idx_coordinator_orchestrations_status ON coordinator_orchestrations(status);
       CREATE INDEX IF NOT EXISTS idx_coordinator_chat_created ON coordinator_chat_messages(created_at);
     `);
@@ -327,10 +460,15 @@ export class HubStore {
     if (!chatColumns.has('conversation_epoch')) {
       this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN conversation_epoch INTEGER NOT NULL DEFAULT 0');
     }
+    if (!chatColumns.has('handback_reason')) this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN handback_reason TEXT');
+    if (!chatColumns.has('queued')) this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN queued INTEGER NOT NULL DEFAULT 0');
+    if (!chatColumns.has('batch_command_id')) this.db.exec('ALTER TABLE coordinator_chat_messages ADD COLUMN batch_command_id TEXT');
     const workerColumns = new Set(this.db.prepare('PRAGMA table_info(workers)').all().map((column) => column.name));
     if (!workerColumns.has('retired_at')) {
       this.db.exec('ALTER TABLE workers ADD COLUMN retired_at TEXT');
     }
+    if (!workerColumns.has('role_key')) this.db.exec('ALTER TABLE workers ADD COLUMN role_key TEXT');
+    if (!workerColumns.has('detached_at')) this.db.exec('ALTER TABLE workers ADD COLUMN detached_at TEXT');
     const taskColumns = new Set(this.db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name));
     if (!taskColumns.has('task_number')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN task_number INTEGER');
@@ -338,6 +476,8 @@ export class HubStore {
     if (!taskColumns.has('deleted_at')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN deleted_at TEXT');
     }
+    if (!taskColumns.has('thread_key')) this.db.exec('ALTER TABLE tasks ADD COLUMN thread_key TEXT');
+    if (!taskColumns.has('role_key')) this.db.exec('ALTER TABLE tasks ADD COLUMN role_key TEXT');
     const commandColumns = new Set(this.db.prepare('PRAGMA table_info(commands)').all().map((column) => column.name));
     if (!commandColumns.has('sender_worker_id')) {
       this.db.exec('ALTER TABLE commands ADD COLUMN sender_worker_id TEXT REFERENCES workers(worker_id)');
@@ -361,12 +501,17 @@ export class HubStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_orchestrations_source
         ON coordinator_orchestrations(source_message_id) WHERE source_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_commands_sender ON commands(sender_worker_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_thread ON tasks(thread_key) WHERE thread_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_chat_batch ON coordinator_chat_messages(batch_command_id) WHERE batch_command_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_attentions_status ON attentions(status);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_open_task ON handoffs(task_id) WHERE status = 'open';
+      CREATE INDEX IF NOT EXISTS idx_workers_role ON workers(role_key) WHERE role_key IS NOT NULL;
       UPDATE commands SET last_activity_at = COALESCE(started_at, accepted_at, created_at)
         WHERE last_activity_at IS NULL;
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
     `);
     this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 12');
+    this.db.exec('PRAGMA user_version = 15');
   }
 
   close() {
@@ -544,8 +689,11 @@ export class HubStore {
     const worker = this.getWorkerForConnector(workerId, connectorId);
     if (!worker) return null;
     const timestamp = now();
-    this.db.prepare('UPDATE workers SET push_capable = ?, updated_at = ?, last_seen_at = ? WHERE worker_id = ?')
-      .run(attached ? 1 : 0, timestamp, timestamp, workerId);
+    this.db.prepare(`
+      UPDATE workers SET push_capable = ?, updated_at = ?, last_seen_at = ?,
+        detached_at = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(detached_at, ?) END
+      WHERE worker_id = ?
+    `).run(attached ? 1 : 0, timestamp, timestamp, attached ? 1 : 0, timestamp, workerId);
     return this.getWorker(workerId);
   }
 
@@ -558,8 +706,8 @@ export class HubStore {
     this.db.prepare(`
       INSERT INTO tasks (
         task_id, task_number, title, goal, context, acceptance_json, assignee_worker_id,
-        status, created_by, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+        status, created_by, created_at, updated_at, thread_key, role_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)
     `).run(
       taskId,
       taskNumber,
@@ -571,6 +719,8 @@ export class HubStore {
       data.created_by ?? 'admin',
       timestamp,
       timestamp,
+      data.thread_key ?? null,
+      data.role_key ?? null,
     );
     if (data.assignee_worker_id) {
       this.db.prepare('UPDATE workers SET current_task_id = ?, updated_at = ? WHERE worker_id = ?')
@@ -610,11 +760,12 @@ export class HubStore {
       acceptance: data.acceptance ?? current.acceptance,
       status: data.status ?? current.status,
       assignee: data.assignee_worker_id === undefined ? current.assignee_worker_id : data.assignee_worker_id,
+      role: data.role_key === undefined ? current.role_key : data.role_key,
     };
     this.transaction(() => {
       this.db.prepare(`
         UPDATE tasks SET title = ?, goal = ?, context = ?, acceptance_json = ?,
-          status = ?, assignee_worker_id = ?, updated_at = ? WHERE task_id = ?
+          status = ?, assignee_worker_id = ?, role_key = ?, updated_at = ? WHERE task_id = ?
       `).run(
         next.title,
         next.goal,
@@ -622,6 +773,7 @@ export class HubStore {
         stringifyJson(next.acceptance),
         next.status,
         next.assignee,
+        next.role,
         timestamp,
         taskId,
       );
@@ -828,6 +980,124 @@ export class HubStore {
     return { command: this.getCommand(commandId), changed: result.changes === 1 };
   }
 
+  getRole(roleKey) {
+    return roleView(this.db.prepare('SELECT * FROM roles WHERE role_key = ?').get(roleKey));
+  }
+
+  listRoles() {
+    return this.db.prepare('SELECT * FROM roles ORDER BY role_key').all().map(roleView);
+  }
+
+  upsertRole({ roleKey, name, description, takeoverAfterMs }) {
+    const timestamp = now();
+    const current = this.getRole(roleKey);
+    this.db.prepare(`
+      INSERT INTO roles (role_key, name, description, takeover_after_ms, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(role_key) DO UPDATE SET name = excluded.name, description = excluded.description,
+        takeover_after_ms = excluded.takeover_after_ms, updated_at = excluded.updated_at
+    `).run(
+      roleKey,
+      name ?? current?.name ?? roleKey,
+      description ?? current?.description ?? '',
+      takeoverAfterMs ?? current?.takeover_after_ms ?? 3 * 60 * 1000,
+      timestamp,
+      timestamp,
+    );
+    return this.getRole(roleKey);
+  }
+
+  setWorkerRole(workerId, roleKey) {
+    this.db.prepare('UPDATE workers SET role_key = ?, updated_at = ? WHERE worker_id = ?').run(roleKey ?? null, now(), workerId);
+    return this.getWorker(workerId);
+  }
+
+  listRoleWorkers(roleKey) {
+    return this.db.prepare(`${WORKER_SELECT} WHERE w.role_key = ? AND w.retired_at IS NULL ORDER BY w.last_seen_at DESC, w.rowid DESC`)
+      .all(roleKey).map(workerView);
+  }
+
+  activeCommandCount(workerId) {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM commands WHERE worker_id = ? AND status IN ('queued', 'accepted', 'running')
+    `).get(workerId).count;
+  }
+
+  // Work queued on a seat but not started: safe to move to another seat.
+  listUnstartedTaskCommands(taskId, workerId) {
+    return this.db.prepare(`
+      ${COMMAND_SELECT} WHERE cmd.task_id = ? AND cmd.worker_id = ? AND cmd.started_at IS NULL
+        AND cmd.status IN ('queued', 'accepted', 'waiting_manual')
+      ORDER BY cmd.created_at ASC, cmd.rowid ASC
+    `).all(taskId, workerId).map(commandView);
+  }
+
+  listLiveRoleTasks() {
+    return this.db.prepare(`
+      ${TASK_SELECT} WHERE t.role_key IS NOT NULL AND t.deleted_at IS NULL
+        AND t.status NOT IN ('done', 'cancelled') AND t.assignee_worker_id IS NOT NULL
+    `).all().map(taskView);
+  }
+
+  // The task's own execution history, oldest first: what a new seat reads.
+  listTaskWorkCommands(taskId, limit = 20) {
+    return this.db.prepare(`
+      SELECT * FROM (${COMMAND_SELECT} WHERE cmd.task_id = ? ORDER BY cmd.created_at DESC, cmd.rowid DESC LIMIT ?)
+      ORDER BY created_at ASC
+    `).all(taskId, limit).map(commandView);
+  }
+
+  createHandoff({ taskId, roleKey, reason, input = '', fromWorkerId = null, fromCommandId = null, notBefore }) {
+    const handoffId = createId('handoff');
+    const timestamp = now();
+    this.db.prepare(`
+      INSERT INTO handoffs (handoff_id, task_id, role_key, reason, input, from_worker_id, from_command_id, status, not_before, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+    `).run(handoffId, taskId, roleKey, reason, input, fromWorkerId, fromCommandId, notBefore ?? timestamp, timestamp);
+    return this.getHandoff(handoffId);
+  }
+
+  getHandoff(handoffId) {
+    return handoffView(this.db.prepare(`${HANDOFF_SELECT} WHERE h.handoff_id = ?`).get(handoffId));
+  }
+
+  openHandoffForTask(taskId) {
+    return handoffView(this.db.prepare(`${HANDOFF_SELECT} WHERE h.task_id = ? AND h.status = 'open'`).get(taskId));
+  }
+
+  listHandoffs({ status = null, roleKey = null, taskId = null, limit = 200 } = {}) {
+    const conditions = [];
+    const values = [];
+    if (status) { conditions.push('h.status = ?'); values.push(status); }
+    if (roleKey) { conditions.push('h.role_key = ?'); values.push(roleKey); }
+    if (taskId) { conditions.push('h.task_id = ?'); values.push(taskId); }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    return this.db.prepare(`${HANDOFF_SELECT} ${where} ORDER BY h.created_at ASC, h.rowid ASC LIMIT ?`).all(...values, limit).map(handoffView);
+  }
+
+  countHandoffs(taskId, reason) {
+    return this.db.prepare('SELECT COUNT(*) AS count FROM handoffs WHERE task_id = ? AND reason = ?').get(taskId, reason).count;
+  }
+
+  // Later work for a task that still waits for a seat joins the same handoff.
+  mergeHandoff(handoffId, { input, fromCommandId, notBefore }) {
+    const current = this.getHandoff(handoffId);
+    const merged = [current.input, input].filter(Boolean).join('\n\n---\n\n');
+    this.db.prepare(`
+      UPDATE handoffs SET input = ?, from_command_id = COALESCE(?, from_command_id),
+        not_before = MIN(not_before, ?) WHERE handoff_id = ? AND status = 'open'
+    `).run(merged, fromCommandId ?? null, notBefore ?? current.not_before, handoffId);
+    return this.getHandoff(handoffId);
+  }
+
+  resolveHandoff(handoffId, { status, workerId = null, commandId = null }) {
+    const result = this.db.prepare(`
+      UPDATE handoffs SET status = ?, worker_id = ?, command_id = ?, resolved_at = ?
+      WHERE handoff_id = ? AND status = 'open'
+    `).run(status, workerId, commandId, now(), handoffId);
+    return { handoff: this.getHandoff(handoffId), changed: result.changes === 1 };
+  }
+
   getCoordinatorConfig() {
     return coordinatorConfigView(this.db.prepare('SELECT * FROM coordinator_config WHERE singleton = 1').get());
   }
@@ -841,6 +1111,128 @@ export class HubStore {
         max_steps = excluded.max_steps, updated_at = excluded.updated_at
     `).run(workerId ?? null, enabled ? 1 : 0, maxSteps, now());
     return this.getCoordinatorConfig();
+  }
+
+  getWatchdogConfig() {
+    const row = this.db.prepare('SELECT * FROM watchdog_config WHERE singleton = 1').get();
+    return row
+      ? {
+        worker_id: row.worker_id,
+        enabled: Boolean(row.enabled),
+        interval_ms: row.interval_ms,
+        min_running_ms: row.min_running_ms,
+        nudge_cooldown_ms: row.nudge_cooldown_ms,
+        updated_at: row.updated_at,
+      }
+      : { worker_id: null, enabled: false, interval_ms: null, min_running_ms: null, nudge_cooldown_ms: null, updated_at: null };
+  }
+
+  setWatchdogConfig({ workerId, enabled, intervalMs, minRunningMs, nudgeCooldownMs }) {
+    this.db.prepare(`
+      INSERT INTO watchdog_config (singleton, worker_id, enabled, interval_ms, min_running_ms, nudge_cooldown_ms, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET
+        worker_id = excluded.worker_id, enabled = excluded.enabled, interval_ms = excluded.interval_ms,
+        min_running_ms = excluded.min_running_ms, nudge_cooldown_ms = excluded.nudge_cooldown_ms,
+        updated_at = excluded.updated_at
+    `).run(workerId ?? null, enabled ? 1 : 0, intervalMs, minRunningMs, nudgeCooldownMs, now());
+    return this.getWatchdogConfig();
+  }
+
+  hasActiveCommand(workerId) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM commands WHERE worker_id = ? AND status IN ('queued', 'accepted', 'running') LIMIT 1
+    `).get(workerId));
+  }
+
+  // A pointer to a command's result is a capability handed out in a prompt: a
+  // Worker may read a result that appears in one of its own command inputs.
+  commandReferencedBy(workerId, commandId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM commands WHERE worker_id = ? AND instr(input, ?) > 0 LIMIT 1').get(workerId, commandId));
+  }
+
+  listQueuedChatMessages() {
+    return this.db.prepare(`
+      SELECT * FROM coordinator_chat_messages
+      WHERE role = 'coordinator' AND status = 'pending' AND queued = 1
+      ORDER BY created_at ASC, rowid ASC
+    `).all().map(chatMessageView);
+  }
+
+  listChatMessagesByBatch(commandId) {
+    return this.db.prepare('SELECT * FROM coordinator_chat_messages WHERE batch_command_id = ? ORDER BY created_at ASC, rowid ASC')
+      .all(commandId).map(chatMessageView);
+  }
+
+  liveTaskByThread(threadKey) {
+    const row = this.db.prepare(`
+      SELECT task_id FROM tasks
+      WHERE thread_key = ? AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(threadKey);
+    return row ? this.getTask(row.task_id) : null;
+  }
+
+  getTrigger(triggerKey) {
+    return this.db.prepare('SELECT * FROM triggers WHERE trigger_key = ?').get(triggerKey) ?? null;
+  }
+
+  recordTrigger({ triggerKey, threadKey, source, routed, taskId = null, commandId = null, attentionId = null }) {
+    this.db.prepare(`
+      INSERT INTO triggers (trigger_key, thread_key, source, routed, task_id, command_id, attention_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(triggerKey, threadKey, source, routed, taskId, commandId, attentionId, now());
+    return this.getTrigger(triggerKey);
+  }
+
+  createAttention({ commandId, taskId = null, workerId, orchestrationId = null, stepKey = null, outcome, question }) {
+    const existing = this.db.prepare('SELECT attention_id FROM attentions WHERE command_id = ?').get(commandId);
+    if (existing) return this.getAttention(existing.attention_id);
+    const attentionId = createId('attn');
+    this.db.prepare(`
+      INSERT INTO attentions (attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+    `).run(attentionId, commandId, taskId, workerId, orchestrationId, stepKey, outcome, question, now());
+    return this.getAttention(attentionId);
+  }
+
+  getAttention(attentionId) {
+    return attentionView(this.db.prepare(`${ATTENTION_SELECT} WHERE a.attention_id = ?`).get(attentionId));
+  }
+
+  listAttentions({ status = 'open' } = {}) {
+    const where = status ? 'WHERE a.status = ?' : '';
+    return this.db.prepare(`${ATTENTION_SELECT} ${where} ORDER BY a.created_at ASC, a.rowid ASC LIMIT 200`)
+      .all(...(status ? [status] : [])).map(attentionView);
+  }
+
+  openAttentionForTask(taskId) {
+    const row = this.db.prepare(`SELECT attention_id FROM attentions WHERE task_id = ? AND status = 'open' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(taskId);
+    return row ? this.getAttention(row.attention_id) : null;
+  }
+
+  resolveAttention(attentionId, { status, answer = null, answerCommandId = null }) {
+    const result = this.db.prepare(`
+      UPDATE attentions SET status = ?, answer = ?, answer_command_id = ?, resolved_at = ?
+      WHERE attention_id = ? AND status = 'open'
+    `).run(status, answer, answerCommandId, now(), attentionId);
+    return { attention: this.getAttention(attentionId), changed: result.changes === 1 };
+  }
+
+  setAttentionAnswerCommand(attentionId, commandId) {
+    this.db.prepare('UPDATE attentions SET answer_command_id = ? WHERE attention_id = ?').run(commandId, attentionId);
+    return this.getAttention(attentionId);
+  }
+
+  latestCommandOfKind(kind) {
+    return commandView(this.db.prepare(`${COMMAND_SELECT} WHERE cmd.kind = ? ORDER BY cmd.created_at DESC, cmd.rowid DESC LIMIT 1`).get(kind));
+  }
+
+  latestCommandEvent(commandId, eventType) {
+    return eventView(this.db.prepare(`
+      SELECT * FROM events WHERE command_id = ? AND event_type = ?
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(commandId, eventType));
   }
 
   createOrchestratedTask({ title, goal, context, acceptance, createdBy, coordinatorWorkerId, sourceMessageId = null, autoStart = true }) {
@@ -994,11 +1386,14 @@ export class HubStore {
     const status = data.status ?? current.status;
     const commandId = data.commandId === undefined ? current.command_id : data.commandId;
     const taskId = data.taskId === undefined ? current.task_id : data.taskId;
+    const handbackReason = data.handbackReason === undefined ? current.handback_reason : data.handbackReason;
+    const queued = data.queued === undefined ? current.queued : data.queued;
+    const batchCommandId = data.batchCommandId === undefined ? current.batch_command_id : data.batchCommandId;
     this.db.prepare(`
       UPDATE coordinator_chat_messages
-      SET content = ?, status = ?, command_id = ?, task_id = ?
+      SET content = ?, status = ?, command_id = ?, task_id = ?, handback_reason = ?, queued = ?, batch_command_id = ?
       WHERE message_id = ?
-    `).run(content, status, commandId, taskId, messageId);
+    `).run(content, status, commandId, taskId, handbackReason, queued ? 1 : 0, batchCommandId, messageId);
     return this.getChatMessage(messageId);
   }
 
@@ -1024,7 +1419,7 @@ export class HubStore {
 
   clearHistory() {
     this.assertHistoryClearable();
-    const tables = ['coordinator_chat_messages', 'coordinator_orchestrations', 'events', 'commands', 'tasks'];
+    const tables = ['handoffs', 'attentions', 'triggers', 'coordinator_chat_messages', 'coordinator_orchestrations', 'events', 'commands', 'tasks'];
     const cleared = Object.fromEntries(tables.map((table) => [
       table,
       this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,

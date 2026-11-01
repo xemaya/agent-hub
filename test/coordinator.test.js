@@ -344,6 +344,14 @@ test('Coordinator configuration requires Admin and an attached interactive Worke
   assert.equal(configured.payload.coordinator.worker.push_capable, true);
 });
 
+async function chatReplyById(context, messageId) {
+  return waitFor(async () => {
+    const { payload } = await context.admin('/api/v1/coordinator/chat');
+    const message = payload.messages.find((item) => item.message_id === messageId);
+    return message && message.status !== 'pending' ? message : null;
+  });
+}
+
 async function chatReply(context, commandId) {
   return waitFor(async () => {
     const { payload } = await context.admin('/api/v1/coordinator/chat');
@@ -532,7 +540,7 @@ test('Chat planning stays ready, then starts the same plan and reports real comp
   const sent = await context.admin('/api/v1/coordinator/chat', {
     method: 'POST', body: { message: '先只规划，不要执行', request_id: 'plan-once' },
   });
-  const plannedReply = await chatReply(context, sent.payload.message.command_id);
+  const plannedReply = await chatReplyById(context, sent.payload.message.message_id);
   assert.match(plannedReply.content, /尚未执行/);
   const planned = await waitFor(async () => {
     const { payload } = await context.admin('/api/v1/orchestrations');
@@ -684,6 +692,8 @@ test('Persisted chat resumes once after Hub restart and orphaned pending replies
 
 test('An @Worker mention constrains planning and survives restart without rerouting', async (t) => {
   const { context, driver, worker } = await setup(t);
+  // The single @Worker goes to the Worker first; it hands new work back to the coordinator.
+  driver.work = ({ command, worker: target }) => command.kind === 'worker_chat' ? 'HANDBACK: 这是需要立项的新工作' : `completed:${target.name}`;
   const other = await context.registerWorker({ name: 'other-worker', runtime_session_id: 'other-mentioned-worker' });
   driver.chat = JSON.stringify({
     reply: '交给你指定的员工。',
@@ -722,6 +732,8 @@ test('An @Worker mention constrains planning and survives restart without rerout
   const completed = await waitForOrchestration(context, created.orchestration_id, 'done');
   assert.equal(completed.steps.length, 1);
   assert.equal(completed.steps[0].worker_id, worker.worker_id);
+  assert.deepEqual(driver.executions.slice(0, 2).map((item) => item.kind), ['worker_chat', 'coordinator_chat']);
+  assert.match(driver.executions[1].input, /员工把它交回中央大脑，原因：这是需要立项的新工作/);
   assert.deepEqual(driver.executions.filter((item) => item.kind === 'prompt').map((item) => item.worker), ['worker-test']);
   const planning = driver.executions.find((item) => item.kind === 'coordinator_plan');
   assert.match(planning.input, new RegExp(worker.worker_id));
@@ -737,6 +749,8 @@ test('An @Worker mention constrains planning and survives restart without rerout
 
 test('A plan that ignores an @Worker mention is blocked before dispatch', async (t) => {
   const { context, driver, worker } = await setup(t);
+  // The single @Worker goes to the Worker first; it hands new work back to the coordinator.
+  driver.work = ({ command, worker: target }) => command.kind === 'worker_chat' ? 'HANDBACK: 这是需要立项的新工作' : `completed:${target.name}`;
   const other = await context.registerWorker({ name: 'wrong-worker', runtime_session_id: 'wrong-target' });
   driver.chat = JSON.stringify({
     reply: '按指定员工安排。',
@@ -773,7 +787,7 @@ test('@Task supplies real context and invalid or manual Worker mentions are reje
     method: 'POST',
     body: {
       title: 'Referenced existing task', goal: 'CONTEXT_ONLY_FROM_THE_REFERENCED_TASK',
-      context: 'Known historical context', acceptance: ['Existing acceptance'], assignee_worker_id: worker.worker_id,
+      context: 'Known historical context', acceptance: ['Existing acceptance'],
     },
   });
   const task = referenced.payload.task;
@@ -809,6 +823,8 @@ test('@Task supplies real context and invalid or manual Worker mentions are reje
 
 test('Clearing conversation preserves plans and starts a new visible epoch', async (t) => {
   const { context, driver, worker } = await setup(t);
+  // The single @Worker goes to the Worker first; it hands new work back to the coordinator.
+  driver.work = ({ command, worker: target }) => command.kind === 'worker_chat' ? 'HANDBACK: 这是需要立项的新工作' : `completed:${target.name}`;
   const dashboard = await context.openDashboard();
   driver.chat = JSON.stringify({
     reply: '先保存计划。',
@@ -827,7 +843,7 @@ test('Clearing conversation preserves plans and starts a new visible epoch', asy
       mentions: [{ type: 'worker', id: worker.worker_id }],
     },
   });
-  const plannedReply = await chatReply(context, sent.payload.message.command_id);
+  const plannedReply = await chatReplyById(context, sent.payload.message.message_id);
   const planned = await waitFor(async () => {
     const { payload } = await context.admin('/api/v1/orchestrations');
     return payload.orchestrations.find((item) => item.source_message_id === plannedReply.message_id && item.status === 'ready');
@@ -878,8 +894,9 @@ test('Long dependency evidence is bounded and explicitly marked as truncated', a
   const work = driver.executions.filter((execution) => execution.kind === 'prompt');
   const dependencyJson = work[1].input.split('已完成依赖步骤的真实结果 JSON:\n')[1].split('\n\n对话中引用的历史任务')[0];
   const [dependency] = JSON.parse(dependencyJson);
-  assert.equal(dependency.result.length, 64000);
+  assert.equal(dependency.result.length, 1500);
   assert.equal(dependency.result_truncated, true);
+  assert.equal(dependency.full_result, `agent-hub command result ${completed.steps[0].command_id}`);
   assert.equal(dependency.result.startsWith('DEPENDENCY_BEGIN:'), true);
   assert.equal(dependency.result.includes('DEPENDENCY_END'), false);
   assert.match(driver.executions.find((execution) => execution.kind === 'coordinator_review').input, /"result_truncated": true/);
@@ -887,7 +904,7 @@ test('Long dependency evidence is bounded and explicitly marked as truncated', a
   assert.ok(messages.filter((message) => message.role === 'activity').every((message) => !message.content.includes('DEPENDENCY_BEGIN')));
 });
 
-test('Follow-up work receives the complete referenced deliverable without rerunning the old task', async (t) => {
+test('Follow-up work receives a bounded summary and can recall the complete referenced deliverable', async (t) => {
   const { context, driver, worker } = await setup(t);
   driver.plan = JSON.stringify({
     summary: 'One deliverable step',
@@ -929,9 +946,15 @@ test('Follow-up work receives the complete referenced deliverable without rerunn
   const referenceJson = work[1].input.split('对话中引用的历史任务 JSON（作为上下文，不代表重启旧任务）:\n')[1]
     .split('\n\nAgent Hub Worker directory (JSON)')[0];
   const [reference] = JSON.parse(referenceJson);
-  assert.equal(reference.orchestration.steps[0].result, artifact);
-  assert.equal(reference.orchestration.steps[0].result_truncated, false);
-  assert.ok(artifact.length > 600);
+  assert.equal(reference.orchestration.steps[0].result, artifact.slice(0, 1500));
+  assert.equal(reference.orchestration.steps[0].result_truncated, true);
+  assert.equal(reference.orchestration.steps[0].full_result, `agent-hub command result ${originalCommandId}`);
+  const recall = async (target) => context.local(`/local/v1/commands/${originalCommandId}/result?${new URLSearchParams({ runtime: target.runtime, session_id: target.runtime_session_id })}`);
+  const recalled = await recall(worker);
+  assert.equal(recalled.response.status, 200);
+  assert.equal(recalled.payload.result.text, artifact);
+  const stranger = await context.registerWorker({ name: 'stranger', runtime_session_id: 'no-pointer' });
+  assert.equal((await recall(stranger)).response.status, 404, 'only a Worker handed the pointer can read the result');
   const preserved = context.hub.store.getOrchestration(first.orchestration_id);
   assert.equal(preserved.status, 'done');
   assert.equal(preserved.steps[0].command_id, originalCommandId);

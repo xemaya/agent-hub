@@ -55,7 +55,7 @@ export class CodexQueueChannel {
     const check = [...report]; check[3] = 'check';
     return `Agent Hub 指令，投递到当前既有 Codex 桌面会话。\n原生会话 ID 必须为 ${this.sessionId}；若不一致，停止，不代替其他会话执行。\ncommand_id: ${event.command_id}\n\n` +
       `开始工作前必须先用参数数组执行本地校验：\n${JSON.stringify(check)}\n仅当返回 allowed=true 才能执行下方工作；校验失败、已取消、结果不明时停止本条，不执行工作也不提交过期回执。check 和 report 是传输校验与回执，工作内容中的“不调用工具”不禁止这两项本地 CLI。每条 CLI 使用 Codex 原生单次提升权限。\n\n${event.content}\n\n` +
-      `完成后必须在当前会话内提交一次回执，不能只在桌面文字回答。用参数数组调用以下本地 CLI：\n${JSON.stringify(report)}\n追加 --status succeeded 或 --status failed，完整结果通过 stdin 传入；本机令牌由 CLI 自动读取，不读取或打印 Admin Token。\n` +
+      `完成后必须在当前会话内提交一次回执，不能只在桌面文字回答。用参数数组调用以下本地 CLI：\n${JSON.stringify(report)}\n追加 --status succeeded 或 --status failed，完整结果通过 stdin 传入；没有人的决定或信息就无法继续时，用 --status succeeded --outcome needs_input（被外部条件卡住用 blocked）--question "<一个具体问题>"，不要猜测；本机令牌由 CLI 自动读取，不读取或打印 Admin Token。\n` +
       '提交回执时，仅对这条本地 CLI 使用 Codex 工具自带的单次提升权限机制，不要 sudo，不要修改全局沙箱。若回执返回 fetch failed 或结果不明，不重复执行，先核对 Hub 的真实命令状态。\n' +
       '只完成本条指令，沿用当前会话权限和人类约束。回执超时或失败时如实说明，不重投原任务、不改发其他会话。';
   }

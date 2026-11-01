@@ -457,3 +457,12 @@ button:disabled { cursor: wait; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+.attention-panel { margin-bottom: 18px; }
+.attention-list { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; }
+.attention-card { padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--signal); background: var(--paper-light); }
+.attention-meta { margin: 0 0 6px; color: var(--muted); font-size: 11px; }
+.attention-card.is-handoff .attention-question { margin: 0; color: var(--muted); font-size: 13px; }
+.attention-question { margin: 0 0 10px; color: var(--ink); font-size: 14px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.attention-card textarea { display: block; width: 100%; padding: 8px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font-size: 13px; line-height: 1.6; resize: vertical; }
+.attention-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }

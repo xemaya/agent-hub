@@ -24,12 +24,13 @@ Usage:
   agent-hub session start --runtime kimi --push --native-tui [--resume SESSION_ID] [--cwd DIR]
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
   agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
-  agent-hub desktop report --command-id ID --status succeeded|failed [--data-dir DIR] < result.txt
+  agent-hub desktop report --command-id ID --status succeeded|failed
+                         [--outcome done|needs_input|blocked|dropped] [--question TEXT] [--data-dir DIR] < result.txt
   agent-hub desktop check --command-id ID [--data-dir DIR]
   agent-hub worker register --runtime claude|kimi|codex|other --session-id ID
                             [--name NAME] [--cwd DIR]
                             [--capabilities a,b] [--metadata JSON]
-  agent-hub worker register-current [--name NAME] [--cwd DIR]
+  agent-hub worker register-current [--name NAME] [--cwd DIR] [--role KEY|none]
                                     [--capabilities a,b] [--metadata JSON]
   agent-hub worker unregister WORKER_ID
   agent-hub worker unregister-current
@@ -37,7 +38,7 @@ Usage:
   agent-hub worker directory
   agent-hub worker status WORKER_ID idle|working|waiting|blocked
   agent-hub task create --title TITLE [--goal TEXT] [--context TEXT]
-                        [--acceptance LINE1\\nLINE2] [--worker-id ID] [--local] [--orchestrate]
+                        [--acceptance LINE1\\nLINE2] [--worker-id ID] [--role KEY] [--local] [--orchestrate]
   agent-hub task update TASK_ID [--status STATUS] [--worker-id ID] [--local]
   agent-hub send --prompt TEXT [--worker-id ID] [--task-id ID] [--kind KIND]
                  [--local] [--wait]
@@ -48,6 +49,13 @@ Usage:
   agent-hub message reply MESSAGE_ID --body TEXT
   agent-hub message wait COMMAND_ID
   agent-hub command cancel COMMAND_ID [--reason TEXT]
+  agent-hub command result COMMAND_ID          (full result behind a pointer in your instructions)
+  agent-hub trigger --trigger-key KEY --thread-key KEY --text TEXT [--source NAME]
+                    [--worker-id ID | --role KEY] [--title TITLE] [--actor NAME] [--followup-only]
+  agent-hub role list | set KEY [--name NAME] [--description TEXT] [--takeover-after-ms MS]
+  agent-hub role assign WORKER_ID --role KEY | unassign WORKER_ID
+  agent-hub handoff list [--status open|dispatched|cancelled|all]
+  agent-hub attention list|answer|dismiss [ATTENTION_ID] [--answer TEXT]
   agent-hub orchestration list [--local]
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub history clear --yes
@@ -64,7 +72,7 @@ Environment:
   AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS      Other command timeout (default 3600000)
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread', 'followup-only']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -376,6 +384,7 @@ async function workerCommand(positionals, flags) {
         capabilities: flags.capabilities ? flags.capabilities.split(',').map((item) => item.trim()).filter(Boolean) : [],
         cwd: flags.cwd ?? process.cwd(),
         metadata,
+        ...(flags.role !== undefined ? { role: flags.role === 'none' ? null : flags.role } : {}),
       },
     });
     if (desktop) {
@@ -528,7 +537,11 @@ async function desktopCommand(positionals, flags) {
       await lock.writeFile(JSON.stringify({ state: 'reporting' }));
       const response = await localRequest({ ...flags, 'data-dir': dataDir, 'connector-url': record.connector_url },
         `/local/v1/channel/commands/${encodeURIComponent(record.command_id)}/report`,
-        { method: 'POST', body: { status: flags.status, result } });
+        { method: 'POST', body: {
+          status: flags.status, result,
+          ...(flags.outcome ? { outcome: flags.outcome } : {}),
+          ...(flags.question ? { question: flags.question } : {}),
+        } });
       await lock.truncate(0); await lock.write(JSON.stringify({ state: 'reported' }), 0, 'utf8');
       print(response);
     } finally { await lock.close(); }
@@ -587,6 +600,7 @@ async function taskCommand(positionals, flags) {
         context: flags.context ?? '',
         acceptance: flags.acceptance ? flags.acceptance.split('\\n') : [],
         assignee_worker_id: flags['worker-id'],
+        ...(flags.role ? { role: flags.role } : {}),
         orchestrate: flags.orchestrate === true,
       },
     }));
@@ -700,6 +714,75 @@ export async function run(argv) {
   }
   if (command === 'task') {
     await taskCommand(positionals.slice(1), flags);
+    return;
+  }
+  if (command === 'command' && positionals[1] === 'result' && positionals[2]) {
+    const identity = currentSessionIdentity({ operation: 'command result' });
+    const query = new URLSearchParams({ runtime: identity.runtime, session_id: identity.sessionId });
+    print(await localRequest(flags, `/local/v1/commands/${encodeURIComponent(positionals[2])}/result?${query}`));
+    return;
+  }
+  if (command === 'trigger') {
+    for (const name of ['trigger-key', 'thread-key', 'text']) if (!flags[name]) throw new Error(`--${name} is required`);
+    print(await localRequest(flags, '/local/v1/triggers', {
+      method: 'POST',
+      body: {
+        trigger_key: flags['trigger-key'],
+        thread_key: flags['thread-key'],
+        source: flags.source ?? 'external',
+        text: flags.text,
+        ...(flags['worker-id'] ? { worker_id: flags['worker-id'] } : {}),
+        ...(flags.role ? { role: flags.role } : {}),
+        ...(flags.title ? { title: flags.title } : {}),
+        ...(flags.goal ? { goal: flags.goal } : {}),
+        ...(flags.actor ? { actor: flags.actor } : {}),
+        ...(flags.acceptance ? { acceptance: String(flags.acceptance).split('\n').map((line) => line.trim()).filter(Boolean) } : {}),
+        followup_only: flags['followup-only'] === true,
+      },
+    }));
+    return;
+  }
+  if (command === 'role') {
+    const action = positionals[1] ?? 'list';
+    if (action === 'list') {
+      print(await adminRequest(flags, '/api/v1/roles'));
+      return;
+    }
+    if (action === 'set' && positionals[2]) {
+      print(await adminRequest(flags, `/api/v1/roles/${encodeURIComponent(positionals[2])}`, {
+        method: 'PUT',
+        body: {
+          ...(flags.name ? { name: flags.name } : {}),
+          ...(flags.description !== undefined ? { description: flags.description } : {}),
+          ...(flags['takeover-after-ms'] !== undefined ? { takeover_after_ms: Number(flags['takeover-after-ms']) } : {}),
+        },
+      }));
+      return;
+    }
+    if (['assign', 'unassign'].includes(action) && positionals[2]) {
+      if (action === 'assign' && !flags.role) throw new Error('--role is required');
+      print(await adminRequest(flags, `/api/v1/workers/${encodeURIComponent(positionals[2])}/role`, {
+        method: 'PUT', body: { role: action === 'assign' ? flags.role : null },
+      }));
+      return;
+    }
+    throw new Error('Usage: agent-hub role list | set KEY [--name N] [--takeover-after-ms MS] | assign WORKER_ID --role KEY | unassign WORKER_ID');
+  }
+  if (command === 'handoff') {
+    print(await adminRequest(flags, `/api/v1/handoffs?status=${encodeURIComponent(flags.status ?? 'open')}`));
+    return;
+  }
+  if (command === 'attention') {
+    const action = positionals[1] ?? 'list';
+    if (action === 'list') {
+      print(await adminRequest(flags, `/api/v1/attentions?status=${encodeURIComponent(flags.status ?? 'open')}`));
+      return;
+    }
+    if (!['answer', 'dismiss'].includes(action) || !positionals[2]) throw new Error('Usage: agent-hub attention list|answer|dismiss ATTENTION_ID [--answer TEXT]');
+    if (action === 'answer' && !flags.answer) throw new Error('--answer is required');
+    print(await adminRequest(flags, `/api/v1/attentions/${encodeURIComponent(positionals[2])}/${action}`, {
+      method: 'POST', body: action === 'answer' ? { answer: flags.answer } : {},
+    }));
     return;
   }
   if (command === 'command' && positionals[1] === 'cancel' && positionals[2]) {

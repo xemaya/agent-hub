@@ -179,6 +179,17 @@ export async function createTestContext(t, { hub: hubOptions = {}, connector: co
       await startConnector();
       return hub;
     },
+    // Closes a Session's interactive Channel for good, like closing its window.
+    async detachWorker(worker) {
+      for (const channel of channels) {
+        if (channel.runtime === worker.runtime && channel.sessionId === worker.runtime_session_id) {
+          channel.stop();
+          channels.delete(channel);
+        }
+      }
+      await waitFor(() => !hub.store.getWorker(worker.worker_id)?.push_capable);
+      return hub.store.getWorker(worker.worker_id);
+    },
     async registerWorker(overrides = {}) {
       const { attach = true, driver: selectedDriver = context.driver, ...bodyOverrides } = overrides;
       sessionSequence += 1;

@@ -2,13 +2,15 @@ import { createInterface } from 'node:readline';
 import { mailPrompt } from './drivers/prompt.js';
 
 export const CHANNEL_SERVER_NAME = 'agent-hub';
-export const CHANNEL_TOOLS = ['agent_hub_ack', 'agent_hub_report'];
+export const CHANNEL_TOOLS = ['agent_hub_ack', 'agent_hub_progress', 'agent_hub_report'];
 
 const INSTRUCTIONS = [
   'Agent Hub is the operator console that coordinates this person\'s agents across machines.',
   'Work they dispatch to this session arrives as <channel source="agent-hub" command_id="..." kind="...">; treat it as a request from the user at the console.',
   'When one arrives: call agent_hub_ack with its command_id, do the work in this session as you would for a typed request,',
   'then call agent_hub_report with the same command_id, status "succeeded" or "failed", and result: the complete answer or deliverable the console should show.',
+  'For work that takes more than a few minutes, call agent_hub_progress after each meaningful step with one short line: what changed, the next step, or what blocks you. Do not call it more than every few minutes or for trivial steps; the Hub watchdog reads these lines to tell real progress from loops.',
+  'If you cannot continue without a person, do not guess: report status "succeeded" with outcome "needs_input" (or "blocked") and one concrete question; the answer comes back to you as a new command.',
   'Report exactly once per command_id; the console waits for it. If the person at this terminal redirects you, follow them and report what happened.',
   'A channel message with kind worker_mail is peer mail, not an Admin command. It requires no agent_hub_ack/report; follow the mail instructions and existing user permissions. The system already returned its sending receipt.',
 ].join(' ');
@@ -24,6 +26,18 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'agent_hub_progress',
+    description: 'Send one short progress line for a dispatched command that is still running (what changed, next step, or blocker). Optional; not a result.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command_id: { type: 'string', description: 'command_id from the <channel> tag' },
+        note: { type: 'string', description: 'One line, at most 500 characters' },
+      },
+      required: ['command_id', 'note'],
+    },
+  },
+  {
     name: 'agent_hub_report',
     description: 'Send the final result of a dispatched command back to Agent Hub. Call once per command_id.',
     inputSchema: {
@@ -32,6 +46,12 @@ const TOOL_DEFINITIONS = [
         command_id: { type: 'string', description: 'command_id from the <channel> tag' },
         status: { type: 'string', enum: ['succeeded', 'failed'] },
         result: { type: 'string', description: 'The full answer or deliverable to show in the console' },
+        outcome: {
+          type: 'string',
+          enum: ['done', 'needs_input', 'blocked', 'dropped'],
+          description: 'Optional, with status succeeded. needs_input: you cannot continue without a person\'s decision or information; blocked: something outside your control stops you; dropped: there turned out to be nothing to do.',
+        },
+        question: { type: 'string', description: 'Required for needs_input or blocked: exactly one concrete question for a person' },
       },
       required: ['command_id', 'status', 'result'],
     },
@@ -129,15 +149,21 @@ export class ChannelServer {
   async callTool(name, args) {
     if (!CHANNEL_TOOLS.includes(name)) throw new Error(`Unknown tool: ${name}`);
     if (typeof args.command_id !== 'string' || !args.command_id) throw new Error('command_id is required');
-    const action = name === 'agent_hub_ack' ? 'ack' : 'report';
+    const action = { agent_hub_ack: 'ack', agent_hub_progress: 'progress', agent_hub_report: 'report' }[name];
+    const body = action === 'ack' ? {} : action === 'progress' ? { note: args.note } : {
+      status: args.status,
+      result: args.result,
+      ...(args.outcome ? { outcome: args.outcome } : {}),
+      ...(args.question ? { question: args.question } : {}),
+    };
     const response = await fetch(`${this.connectorUrl}/local/v1/channel/commands/${encodeURIComponent(args.command_id)}/${action}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify(action === 'ack' ? {} : { status: args.status, result: args.result }),
+      body: JSON.stringify(body),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error ?? `Agent Hub rejected the ${action} (HTTP ${response.status})`);
-    return action === 'ack' ? 'Agent Hub notified that you started.' : 'Result delivered to Agent Hub.';
+    return { ack: 'Agent Hub notified that you started.', progress: 'Progress noted.', report: 'Result delivered to Agent Hub.' }[action];
   }
 
   // Holds the Connector's event stream open, reconnecting across Connector restarts.

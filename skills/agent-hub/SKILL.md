@@ -62,6 +62,8 @@ agent-hub worker register-current \
   --metadata '{"description":"<用户定义的职责与真实限制>"}'
 ```
 
+用户说这个窗口是某个岗位（比如「QA 岗位」）时，加 `--role qa`。同一岗位可以有多个窗口；任务属于岗位，某个窗口关掉后，任务会带着交接包交给同岗位的其他窗口，或者等原窗口回来。不要自己编岗位名。
+
 当前窗口统一登记为 external，不虚报主动推送。Claude/Kimi 使用启动器注入的可信身份，Codex 使用自身注入的 `CODEX_SESSION_ID`。缺少可信身份时停止并说明，**不能随机生成、选择最近会话、手工伪造身份或用另一个 Session 冒充当前窗口**。
 
 ### Codex 桌面：当前窗口直接接入
@@ -133,6 +135,14 @@ agent-hub send --local --wait \
 ```
 
 等待由完成事件唤醒，不循环查询。进程成功不等于验收通过；核对真实结果后才可执行 `agent-hub task update --local TASK_ID --status done --data-dir ...`。失败、人工等待、超时或结果不明都不能报告为完成，也不要重复派发。详见 [references/tasks.md](references/tasks.md)。
+
+## 执行中与回报
+
+- 收到的指令里给了 `agent-hub command result <command_id>`：那是被截断的上游结果，需要细节时再读全文，没读的部分不要声称读过。
+- 没有人的决定或信息就无法继续时不要猜：回报 `outcome: needs_input`（Claude 的 `agent_hub_report`；Codex 用 `desktop report --outcome needs_input --question "<一个问题>"`），被外部条件卡住用 `blocked`。Hub 把问题放进「等你处理」，回答会作为新指令回到本会话。查下来其实无事可做时用 `dropped`。
+- 被直接 @ 的问答里，如果对方其实是在派一项需要立项的新工作，只回复一行 `HANDBACK: <原因>`，Hub 会交给中央大脑安排。
+- 收到以【交接】开头的指令，说明你是接手的人，没有前任的记忆：以交接包为准，先按恢复提示核对现场（git status / log、已发出的消息或草稿、外部系统），确认哪些对外动作已经做过，再做「本次要处理」的部分，绝不重复已经发生的对外动作。【恢复】是你自己上一次执行被中断，同样先核对现场。
+- 外部话题接入（飞书话题、PR 讨论）：`agent-hub trigger --trigger-key <消息唯一键> --thread-key <话题唯一键> --text ... --role <岗位> --title ...`（或 `--worker-id <负责人>`）为新话题建任务。岗位上暂时没有在线窗口时，返回 `waiting_for_seat: true`，任务会排队，第一个登记到这个岗位的窗口会接手；同一话题后面的消息加 `--followup-only`，任务没结束前会直接交给负责人，或作为它提过的问题的回答。
 
 明确要求中央大脑统筹时，使用 `agent-hub task create --local --orchestrate`，不传 `--worker-id`。这会立即规划并执行，不是仅记录；中央大脑负责选人和终审，不要手工关闭父任务。
 

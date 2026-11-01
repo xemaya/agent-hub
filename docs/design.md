@@ -49,6 +49,7 @@ Agent Hub 不是新的 Agent Runtime，也不替代 Git、终端或各 Agent 客
 | Host | 一台 Mac 或服务器 | 物理/虚拟机器 |
 | Connector | 每台机器上的唯一本地连接器 | 一个机器节点一个实例 |
 | Worker | 一个独立的数字员工 | 一个 Agent Session |
+| Role（岗位） | 一类长期工作的负责方，比如 QA | 由管理员或登记命名；Session 是它的座位，可以换 |
 | Runtime | Claude、Kimi、Codex 等客户端类型 | Worker 的实现方式，不是身份 |
 | Task | 有目标、上下文和完成标准的工作 | 跨 Worker 的协作主线 |
 | Command | 发给 Worker 的一次具体触发 | 有唯一 ID 的执行请求 |
@@ -281,6 +282,55 @@ Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状�
 - 看门狗只处理 running Command。协调者默认 15 分钟、其他命令默认 60 分钟无活动后以 `inactivity_timeout` 和结果未知收尾，不自动重试；queued、accepted、waiting_manual 不按执行超时处理。超时使用 `cancelCommand` 的统一收尾，服务重启后继续依据数据库时间判断。
 - 可通过 `AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS`、`AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS` 调整，0 表示禁用对应看门狗。Agent 不稳定时允许结果未知，不能把超时或取消伪报为成功。
 
+### 6.6 进展上报与语义看门狗（schema 13）
+
+6.5 的无活动超时只看时间。交互 Channel 在 ack 和 report 之间不回传任何输出，长任务因此要么被 60 分钟一刀切，要么空转也看不出来。参考 DeepSeek Super-agent 的 Watchdog 设计（见 [`research/deepseek-superagent.md`](research/deepseek-superagent.md)），补两件事：
+
+- **进展上报**：Claude Channel 新增 `agent_hub_progress(command_id, note)`，Connector 本地接口 `POST /local/v1/channel/commands/:id/progress`。一行（≤500 字符）写入命令输出，前缀为 `[progress] `，并刷新 `last_activity_at`，所以健康的长任务不会被无活动超时误杀。这个调用可选，不是结果，也不替代 report。
+- **语义看门狗**：管理员用 `PUT /api/v1/watchdog` 指定一个在线、Channel 已接通、且不是中央协调者的 Worker。Hub 定时器每 `interval_ms`（默认 10 分钟，按上一条巡检命令的创建时间计算，重启不会连发）检查一次：如果有运行超过 `min_running_ms`（默认 10 分钟）的命令，就生成一条 `watchdog_check` 命令。快照包含任务目标与验收、指令头部、运行和空闲分钟数、最近 10 条进展行、输出尾部，以及上次巡检的结论与 `activity_since`。看门狗不评判它自己的 Session，每次最多评判 8 条命令。
+- 看门狗只输出 `{"verdicts":[{command_id,state,action,evidence,message}]}`：`state` 取 progressing / looping / drifted / stuck / unclear，`action` 取 none / nudge / escalate。Hub 按 Schema 校验，要求覆盖快照中每条命令。progressing 和 unclear 一律强制为 none。
+- Hub 只执行低风险动作：`nudge` 由看门狗 Worker 给目标 Worker 发一封邮箱提醒，关联原 command_id，同一命令在 `nudge_cooldown_ms`（默认 30 分钟）内最多一封；`escalate` 写 `watchdog.alert` 事件，并在中央对话追加一条 activity 消息等人处理。**不取消、不重试、不改任务状态**；取消仍只由 6.5 的无活动超时和管理员执行。目标命令在巡检期间已经结束的，只记录 verdict（`stale=true`）。
+- 每条结论都写成 `watchdog.verdict` 事件（含 `applied`，即实际执行的动作），用于审计和后续调参。输出无效或巡检失败时写 `watchdog.check.failed`，不采取任何动作。`watchdog_check` 属于内部命令：输出不在员工工作动态中展示，使用协调者的 15 分钟无活动超时。手动触发一次巡检：`POST /api/v1/watchdog/check`（忽略间隔和最短运行时长）。
+
+### 6.7 快路径、批处理、证据摘要、结构化回报与外部话题（schema 14）
+
+参考 DeepSeek Super-agent 的 Router/Worker 设计（[`research/deepseek-superagent.md`](research/deepseek-superagent.md) §6）：
+
+- **确定性快路径**：中央对话里只 @ 了一位员工、没有 @ 任务的消息，以及只 @ 了一个任务、该任务状态是 ready / in_progress / review / blocked、负责人在线可推送、且不是编排父任务的消息，由 Hub 直接作为 `worker_chat` 发给对应员工，不调用中央大脑（事件 `coordinator.chat.fast_path`）。员工判断这其实是需要立项的新工作时，只回复 `HANDBACK: <原因>`：Hub 把同一条回复改交中央大脑（`coordinator.chat.handback`，记录 `handback_reason`），提示词里写明交回原因，并禁止再转回同一员工；每条消息只交回一次。其余消息照旧走中央大脑。
+- **协调者批处理**：中央大脑的 Session 有活动中的 Hub 命令（queued / accepted / running）时，新消息先排队（`queued=1`，`coordinator.chat.queued`）。任一命令结束后，Hub 合并处理排队消息：只有一条时走原来的单条格式；多条时生成**一条** `coordinator_chat`（`coordinator.chat.batched`），要求输出 `{"replies":[{message_id,reply,action}]}`，各条独立校验、独立执行，缺失或无效的那条单独失败，不影响其他条。批次回复用 `batch_command_id` 关联；重启后由 `resumeChat` 继续处理。
+- **证据摘要加读取指针（Inline & Spill）**：步骤 prompt、修正上下文和 @任务 引用中，每条上游结果最多内联 1,500 字。依赖结果总预算 6,000 字，引用任务 3,000 字。被截断的条目带 `full_result: "agent-hub command result <command_id>"`。`command.result`（本地 `GET /local/v1/commands/:id/result`）只允许命令执行者本人，或自己某条命令输入里含有该 command_id 的员工读取，即「指针就是在 prompt 里拿到的凭据」。中央大脑终审仍内联每条结果最多 12,000 字，因为它不能调用工具，不完整的证据不得判通过。
+- **结构化回报与「等你处理」**：成功回报可带 `outcome`（done / needs_input / blocked / dropped）和一个 `question`；needs_input / blocked 必须带 question。Claude 用 `agent_hub_report`，Codex 用 `desktop report --outcome --question`，Connector 会校验。Hub 为 needs_input / blocked 生成 Attention（`attentions` 表，每条命令一个）：独立任务改为 blocked；编排步骤改为 blocked，编排以 `coordinator_step_needs_input` 停住，不当作失败去重试。Dashboard 员工栏顶部的「等你处理」只列开放的 Attention，没有就不显示。回答（`POST /api/v1/attentions/:id/answer` 或 `agent-hub attention answer`）时：编排步骤把问答追加到 `step.answers`，同一步重新执行，编排恢复 in_progress；其他情况给原员工发一条新指令，带上问题、回答和上次回报的读取指针。`dismiss` 只关闭，不发指令。不会从自由文本里推断「在等人」。
+- **外部话题（trigger）**：`agent-hub trigger` / `POST /local/v1/triggers` / WS `trigger.receive`。`trigger_key` 用于幂等（`triggers` 表，重复送达返回 `duplicate=true`）；`thread_key` 就是订阅。话题上有未结束（非 done / cancelled）的任务时：任务有开放 Attention，这条消息就作为回答（routed `answered`）；否则直接给负责人发一条跟进指令（`followup`），不经过中央大脑。没有任务时，不带 `followup_only` 的消息新建任务，负责人必须是本 Connector 上的员工，并标记 `thread_key`（`created`）；带 `followup_only` 的消息返回 `ignored`。任务结束后订阅自然失效。消息只是上下文：权限仍由负责人自己的 Session 和任务范围决定。
+### 6.8 岗位与交接：Session 是座位，不是身份（schema 15）
+
+参考 DeepSeek Super-agent 的 Ticket / Assignment 分离（[`research/deepseek-superagent.md`](research/deepseek-superagent.md)）。之前一个 Session 就是一个岗位，这个 Session 断了，岗位上的活也就没人做了。我们控制不了 Session 是否在线，所以不能只靠一个 Session：
+
+- **岗位**（`roles` 表：`role_key`、名称、`takeover_after_ms`，默认 3 分钟）。Session 登记时带 `--role qa` 加入岗位（`worker register-current --role qa`；再次登记不带 `--role` 时保持原岗位，`--role none` 退出），也可以由管理员调整（`PUT /api/v1/workers/:id/role`）。加入不存在的岗位时会自动创建。一个岗位可以有多个座位，可以分布在不同的机器上。
+- **任务属于岗位**（`tasks.role_key`）。`assignee_worker_id` 只表示当前坐在这个任务上的那个 Session。按岗位寻址的入口有：trigger 的 `role`（替代 `worker_id`）、`task create --role`，以及不带 `worker_id`、只带 `task_id` 的 prompt 命令（Admin 和 `send --local` 都支持）。
+- **交接记录**（`handoffs` 表，每个任务最多一条 open）：表示这个任务有工作在等座位。如果工作到达时还有一条交接没送出，新工作会合并进这条交接（`handoff.merged`）。选座规则：
+  - 只考虑 Channel 已接通、所在机器在线、未撤下的 Session。
+  - 原来那个 Session 只要回来，就优先交给它，换来的是【恢复】提示，不带交接包。
+  - 过了 `not_before` 之后才交给其他 Session：选活动命令最少的，一样多时选最近活跃的。
+  - 送出时任务改派给接手的 Session（事件 `task.handoff`），交接记录改为 dispatched。
+  - 任务结束或被删除时，open 的交接记录被取消。
+- **什么时候发生交接**：
+  - **任务有人负责、但那个 Session 不可达**：新工作（话题跟进、Attention 回答、管理员指令）不再停在 `waiting_manual`，而是进入交接。`not_before` = 它不可达的起点（Channel 断开记 `workers.detached_at`，机器离线按 `last_seen_at`）+ `takeover_after_ms`。
+  - **执行中途 Session 丢了**：命令以 `outcome_unknown` 失败，比如 `channel_closed`，或者看门狗判定的 `inactivity_timeout`。Hub 把同一份工作再交接一次（reason `session_lost`），`not_before` = 现在 + `takeover_after_ms`，给原 Session 留出重启恢复的时间。管理员取消（`admin_cancelled`）不算 Session 丢失。同一个任务最多交接 3 次（`MAX_SESSION_LOST_HANDOFFS`），之后写 `handoff.exhausted` 事件，任务停在原地，防止一个会把 Session 搞崩的任务把所有座位挨个搞崩。
+  - **已排队但没开始的工作**：负责的 Session 不可达超过 `takeover_after_ms`，而且岗位上有其他在线座位时，Hub 定时检查（与命令超时检查共用间隔）会把还没开始的命令（queued / accepted / waiting_manual，并且 `started_at` 为空）以 `seat_reassigned` 收回，交给其他座位（reason `seat_down`）。正在执行的命令从不搬走：它可能还在跑，只能等 Session 自己回报，或者等无活动超时。
+- **交接包**：给新座位的指令由任务自身的记录生成，不依赖前任的记忆。内容包括：
+  - 任务、岗位、前任是谁、为什么交接；
+  - 目标和验收标准、关联话题；
+  - 前任的工作目录和机器，接手的 Session 在另一台机器上时会注明「本地改动看不到」；
+  - 最近 8 条 `[progress]` 进展；
+  - 上一次回报，最多内联 1,500 字，并附读取指针；
+  - 还没回答的问题；
+  - 被中断那次执行的读取指针；
+  - 恢复提示：先核对现场（git status / log、已经发出的消息或草稿、外部系统），不重复已经发生的对外动作，拿不准就用 needs_input 回报；
+  - 最后是 `本次要处理：` 加上工作本身。
+  再次交接时只传递 `本次要处理：` 之后的部分，交接包不会层层嵌套。读取指针按 6.7 的规则成为接手者的凭据。
+- **不做的事**：不维护无状态的 agent loop（Runtime 不归我们管），不自动重跑非岗位任务，不在 Session 之间迁移对话记忆。没有加入岗位的 Worker 和任务，行为与之前完全一样。
+- Dashboard：员工卡片显示所属岗位；「等你处理」顶部列出等座位的交接，并说明是在等原 Session 恢复，还是岗位上没有在线的 Session。
+
 ## 7. WebSocket 协议
 
 消息统一为 JSON：
@@ -374,7 +424,7 @@ Dashboard 的新增、修改操作仍使用带 `Authorization: Bearer` 的 REST 
 ### 8.2 崩溃处理
 
 - 已 accepted 但尚未 running 的命令，Connector 重启后可继续排队。
-- 崩溃前已经 running 的命令标记为 `failed`，并注明 `outcome_unknown=true`，不自动重跑可能已有副作用的工作。
+- 崩溃前已经 running 的命令标记为 `failed`，并注明 `outcome_unknown=true`，不自动重跑可能已有副作用的工作。属于岗位的任务例外（6.8）：同一份工作会带着交接包和「先核对现场、不重复对外动作」的恢复提示，交给原 Session（如果它回来）或同岗位的其他 Session，最多 3 次。
 - Hub 或 Connector 离线不删除 Task/Worker。
 - 所有时间使用 UTC ISO-8601；数据库关联使用稳定 ID。
 
@@ -536,6 +586,16 @@ PUT    /api/v1/coordinator
 GET    /api/v1/coordinator/chat
 POST   /api/v1/coordinator/chat
 DELETE /api/v1/coordinator/chat
+GET    /api/v1/roles
+PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms? }
+PUT    /api/v1/workers/:id/role           { role: KEY | null }
+GET    /api/v1/handoffs[?status=open|dispatched|cancelled|all&role=KEY]
+GET    /api/v1/attentions[?status=open|answered|dismissed|all]
+POST   /api/v1/attentions/:id/answer
+POST   /api/v1/attentions/:id/dismiss
+GET    /api/v1/watchdog
+PUT    /api/v1/watchdog
+POST   /api/v1/watchdog/check
 GET    /api/v1/orchestrations
 GET    /api/v1/orchestrations/:id
 POST   /api/v1/history/clear

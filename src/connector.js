@@ -8,6 +8,19 @@ import { readJsonBody, sendJson } from './json.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
 import { commandPrompt } from './drivers/prompt.js';
 
+const PROGRESS_NOTE_LIMIT = 500;
+const REPORT_OUTCOMES = new Set(['done', 'needs_input', 'blocked', 'dropped']);
+
+// Optional structured fields of a successful report. A question is required
+// when the Worker cannot continue without a person.
+export function reportOutcome(body) {
+  if (body.outcome === undefined || body.outcome === null || body.outcome === '') return {};
+  if (!REPORT_OUTCOMES.has(body.outcome)) throw localError('outcome must be done, needs_input, blocked or dropped');
+  const question = typeof body.question === 'string' ? body.question.trim().slice(0, 2000) : '';
+  if (['needs_input', 'blocked'].includes(body.outcome) && !question) throw localError('question is required when outcome is needs_input or blocked');
+  return { outcome: body.outcome, ...(question ? { question } : {}) };
+}
+
 function deferred() {
   const state = { settled: false };
   state.promise = new Promise((resolve, reject) => {
@@ -498,7 +511,14 @@ export class Connector {
       this.emitOutput(commandId, '[accepted by the interactive session]\n');
       return { ok: true };
     }
+    if (action === 'progress') {
+      const note = typeof body.note === 'string' ? body.note.replace(/\s+/g, ' ').trim() : '';
+      if (!note) throw localError('note is required');
+      this.emitOutput(commandId, `[progress] ${note.slice(0, PROGRESS_NOTE_LIMIT)}\n`);
+      return { ok: true };
+    }
     if (!['succeeded', 'failed'].includes(body.status)) throw localError('status must be succeeded or failed');
+    const structured = body.status === 'succeeded' ? reportOutcome(body) : {};
     const text = typeof body.result === 'string' ? body.result : '';
     const delivery = channel.deliveries.get(commandId);
     channel.deliveries.delete(commandId);
@@ -508,6 +528,7 @@ export class Connector {
         text,
         session_id: channel.sessionId,
         delivery: 'channel',
+        ...structured,
         ...(body.output_gap === true ? { output_gap: true } : {}),
       });
     } else {
@@ -745,6 +766,7 @@ export class Connector {
       capabilities: input.capabilities ?? [],
       cwd: path.resolve(input.cwd ?? process.cwd()),
       metadata: input.metadata ?? {},
+      ...(input.role !== undefined ? { role: input.role } : {}),
     });
     const worker = await this.store.upsertWorker({
       ...response.worker,
@@ -875,6 +897,22 @@ export class Connector {
       sendJson(response, 200, { task });
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/local/v1/triggers') {
+      await this.whenReady();
+      const body = await readJsonBody(request);
+      sendJson(response, 200, await this.request('trigger.receive', body));
+      return;
+    }
+    const resultMatch = /^\/local\/v1\/commands\/([^/]+)\/result$/.exec(url.pathname);
+    if (request.method === 'GET' && resultMatch) {
+      await this.whenReady();
+      sendJson(response, 200, await this.request('command.result', {
+        command_id: decodeURIComponent(resultMatch[1]),
+        runtime: url.searchParams.get('runtime'),
+        runtime_session_id: url.searchParams.get('session_id'),
+      }));
+      return;
+    }
     if (request.method === 'GET' && url.pathname === '/local/v1/directory') {
       await this.whenReady();
       const directory = await this.request('worker.directory', {
@@ -975,7 +1013,7 @@ export class Connector {
       });
       return;
     }
-    const channelMatch = /^\/local\/v1\/channel\/commands\/([^/]+)\/(ack|report)$/.exec(url.pathname);
+    const channelMatch = /^\/local\/v1\/channel\/commands\/([^/]+)\/(ack|progress|report)$/.exec(url.pathname);
     if (request.method === 'POST' && channelMatch) {
       const body = await readJsonBody(request);
       sendJson(response, 200, this.handleChannelCall(channelMatch[1], channelMatch[2], body));

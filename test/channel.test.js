@@ -52,7 +52,7 @@ async function workerView(context, workerId) {
   return payload.workers.find((worker) => worker.worker_id === workerId);
 }
 
-test('Channel speaks MCP with the channel capability and its two tools', async (t) => {
+test('Channel speaks MCP with the channel capability and its tools', async (t) => {
   const context = await createTestContext(t);
   const channel = openChannel(context, 'mcp-shape');
   t.after(() => channel.close());
@@ -62,7 +62,7 @@ test('Channel speaks MCP with the channel capability and its two tools', async (
   assert.deepEqual(init.result.capabilities.tools, {});
   assert.match(init.result.instructions, /agent_hub_report/);
   const tools = await channel.call('tools/list', {});
-  assert.deepEqual(tools.result.tools.map((tool) => tool.name), ['agent_hub_ack', 'agent_hub_report']);
+  assert.deepEqual(tools.result.tools.map((tool) => tool.name), ['agent_hub_ack', 'agent_hub_progress', 'agent_hub_report']);
   const unknown = await channel.call('resources/list', {});
   assert.equal(unknown.error.code, -32601);
 });
@@ -91,6 +91,19 @@ test('An attached interactive Session receives Hub commands and reports results 
   const ack = await channel.call('tools/call', { name: 'agent_hub_ack', arguments: { command_id: commandId } });
   assert.equal(ack.result.isError, undefined);
   await waitFor(async () => (await context.admin(`/api/v1/commands/${commandId}`)).payload.command.status === 'running');
+  const before = (await context.admin(`/api/v1/commands/${commandId}`)).payload.command;
+  const emptyProgress = await channel.call('tools/call', { name: 'agent_hub_progress', arguments: { command_id: commandId, note: '  ' } });
+  assert.equal(emptyProgress.result.isError, true);
+  const progress = await channel.call('tools/call', {
+    name: 'agent_hub_progress',
+    arguments: { command_id: commandId, note: 'read README\nnext: summarize src/' },
+  });
+  assert.equal(progress.result.isError, undefined);
+  const progressed = await waitFor(async () => {
+    const { payload } = await context.admin(`/api/v1/commands/${commandId}`);
+    return payload.command.output_text.includes('[progress] read README next: summarize src/') && payload.command;
+  });
+  assert.ok(progressed.last_activity_at >= before.last_activity_at);
   const report = await channel.call('tools/call', {
     name: 'agent_hub_report',
     arguments: { command_id: commandId, status: 'succeeded', result: 'It is a coordination hub.' },
@@ -262,10 +275,35 @@ test('Claude push launcher wires the channel config, tool allowance and native i
   const args = calls[0].args;
   assert.deepEqual(args.slice(-3), ['--resume', 'resume-me', 'hello']);
   assert.equal(args[args.indexOf('--dangerously-load-development-channels') + 1], 'server:agent-hub');
-  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__agent-hub__agent_hub_ack,mcp__agent-hub__agent_hub_report');
+  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__agent-hub__agent_hub_ack,mcp__agent-hub__agent_hub_progress,mcp__agent-hub__agent_hub_report');
   const config = JSON.parse(await readFile(args[args.indexOf('--mcp-config') + 1], 'utf8'));
   assert.equal(config.mcpServers['agent-hub'].command, '/opt/node');
   assert.deepEqual(config.mcpServers['agent-hub'].env, { AGENT_HUB_RUNTIME: 'claude', AGENT_HUB_SESSION_ID: 'resume-me' });
   assert.equal(calls[0].options.env.AGENT_HUB_SESSION_ID, 'resume-me');
   await assert.rejects(startSession({ runtime: 'codex', push: true, spawn: fakeChild }), /only supported for claude or kimi/);
+});
+
+test('A Claude report can ask one structured question, which becomes an Attention', async (t) => {
+  const context = await createTestContext(t);
+  const worker = await context.registerWorker({ name: 'asking-claude', runtime: 'claude', attach: false, runtime_session_id: 'live-ask' });
+  const channel = openChannel(context, 'live-ask');
+  t.after(() => channel.close());
+  await channel.server.start();
+  await waitFor(async () => (await workerView(context, worker.worker_id))?.push_capable === true);
+  const created = await context.admin('/api/v1/commands', { method: 'POST', body: { worker_id: worker.worker_id, input: 'decide scope' } });
+  const commandId = created.payload.command.command_id;
+  await waitFor(() => channel.notifications().length);
+  await channel.call('tools/call', { name: 'agent_hub_ack', arguments: { command_id: commandId } });
+  const noQuestion = await channel.call('tools/call', {
+    name: 'agent_hub_report', arguments: { command_id: commandId, status: 'succeeded', result: 'stuck', outcome: 'needs_input' },
+  });
+  assert.equal(noQuestion.result.isError, true);
+  const asked = await channel.call('tools/call', {
+    name: 'agent_hub_report',
+    arguments: { command_id: commandId, status: 'succeeded', result: 'Two options found.', outcome: 'needs_input', question: 'Option A or B?' },
+  });
+  assert.equal(asked.result.isError, undefined);
+  const attention = await waitFor(() => context.hub.store.listAttentions()[0]);
+  assert.equal(attention.question, 'Option A or B?');
+  assert.equal(context.hub.store.getCommand(commandId).result.outcome, 'needs_input');
 });

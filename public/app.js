@@ -26,6 +26,9 @@ const state = {
   mailCursor: null,
   mailSelected: null,
   mailGeneration: 0,
+  attentions: [],
+  handoffs: [],
+  roles: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -753,7 +756,7 @@ function renderWorkers() {
           <button class="worker-mention" type="button" data-mention-worker="${escapeHtml(worker.worker_id)}" title="${escapeHtml(mentionHint)}" aria-label="${escapeHtml(mentionHint)}" ${canMention ? '' : 'disabled'}>@</button>
         </summary>
         <div class="worker-details">
-          <p class="worker-runtime">${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${state.coordinator?.enabled && worker.worker_id === state.coordinator.worker_id ? '中央大脑' : worker.push_capable ? '交互会话 · 已接通' : '人工协作 · 会话未接通'}</p>
+          <p class="worker-runtime">${worker.role_key ? `岗位 ${escapeHtml(roleName(worker.role_key))} · ` : ''}${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${state.coordinator?.enabled && worker.worker_id === state.coordinator.worker_id ? '中央大脑' : worker.push_capable ? '交互会话 · 已接通' : '人工协作 · 会话未接通'}</p>
           <div class="capabilities">${worker.capabilities.map((capability) => `<span>${escapeHtml(capability)}</span>`).join('')}</div>
           ${active ? `<div class="worker-current">
             <strong>${escapeHtml(activity.task_title ?? activity.detail)}</strong>
@@ -894,7 +897,47 @@ function renderTaskDialog() {
   dialog.dataset.taskStatus = status;
 }
 
+// Only what waits for a person; a healthy state takes no space.
+function roleName(roleKey) {
+  return state.roles.find((role) => role.role_key === roleKey)?.name ?? roleKey;
+}
+
+// Work that waits for a seat of its Role. It needs a Session, not an answer.
+function handoffCard(handoff) {
+  const role = state.roles.find((item) => item.role_key === handoff.role_key);
+  const live = role?.seats?.some((seat) => seat.available);
+  const waitingForPrevious = live && Date.parse(handoff.not_before) > Date.now();
+  const reason = { session_lost: '会话中途断开', seat_down: '原会话离线', initial: '新工作' }[handoff.reason] ?? '新消息';
+  const status = waitingForPrevious
+    ? `等原会话恢复，${escapeHtml(time(handoff.not_before))} 后交给岗位上的其他会话`
+    : `岗位「${escapeHtml(roleName(handoff.role_key))}」上没有在线的会话，开一个并登记到这个岗位就会接手`;
+  return `
+    <div class="attention-card is-handoff">
+      <p class="attention-meta">等岗位接手 · ${escapeHtml(reason)}${handoff.task_title ? ` · ${escapeHtml(handoff.task_title)}` : ''} · ${escapeHtml(time(handoff.created_at))}</p>
+      <p class="attention-question">${status}</p>
+    </div>`;
+}
+
+function renderAttentions() {
+  const panel = $('#attention-panel');
+  const count = state.attentions.length + state.handoffs.length;
+  panel.hidden = count === 0;
+  $('#attention-count').textContent = count ? `${count} 项` : '';
+  $('#attention-list').innerHTML = state.handoffs.map(handoffCard).join('') + state.attentions.map((attention) => `
+    <form class="attention-card" data-attention-id="${escapeHtml(attention.attention_id)}">
+      <p class="attention-meta">${escapeHtml(attention.worker_name ?? '数字员工')}${attention.task_title ? ` · ${escapeHtml(attention.task_title)}` : ''} · ${escapeHtml(attention.outcome === 'blocked' ? '被卡住' : '需要你回答')} · ${escapeHtml(time(attention.created_at))}</p>
+      <p class="attention-question">${escapeHtml(attention.question)}</p>
+      <label class="sr-only" for="answer-${escapeHtml(attention.attention_id)}">回答</label>
+      <textarea id="answer-${escapeHtml(attention.attention_id)}" name="answer" rows="2" maxlength="20000" required placeholder="写下回答，会发回给提问的员工继续"></textarea>
+      <div class="attention-actions">
+        <button class="button button-quiet" type="button" data-attention-dismiss>不用处理</button>
+        <button class="button button-accent" type="submit">回答</button>
+      </div>
+    </form>`).join('');
+}
+
 function render() {
+  renderAttentions();
   renderCoordinator();
   renderChat();
   renderTasks();
@@ -906,13 +949,19 @@ function render() {
 }
 
 async function refresh() {
-  const [workers, tasks, orchestrations, coordinator, chat] = await Promise.all([
+  const [workers, tasks, orchestrations, coordinator, chat, attentions, handoffs, roles] = await Promise.all([
     api('/api/v1/workers'),
     api('/api/v1/tasks'),
     api('/api/v1/orchestrations'),
     api('/api/v1/coordinator'),
     api('/api/v1/coordinator/chat'),
+    api('/api/v1/attentions').catch(() => ({ attentions: [] })),
+    api('/api/v1/handoffs').catch(() => ({ handoffs: [] })),
+    api('/api/v1/roles').catch(() => ({ roles: [] })),
   ]);
+  state.attentions = attentions.attentions ?? [];
+  state.handoffs = handoffs.handoffs ?? [];
+  state.roles = roles.roles ?? [];
   state.workers = workers.workers;
   state.tasks = tasks.tasks;
   state.orchestrations = orchestrations.orchestrations;
@@ -1024,7 +1073,7 @@ function connectSocket() {
       toast('历史已清理，员工和中央协调者保持不变。');
       return;
     }
-    if (message.type === 'command.updated' || message.type === 'event') scheduleRefresh();
+    if (['command.updated', 'event', 'attention.updated', 'watchdog.alert', 'handoff.updated'].includes(message.type)) scheduleRefresh();
   });
   socket.addEventListener('close', () => {
     if (state.socket !== socket) return;
@@ -1080,6 +1129,34 @@ $('#auth-form').addEventListener('submit', (event) => {
   connect($('#admin-token').value.trim()).finally(() => { button.disabled = false; });
 });
 $('#logout').addEventListener('click', logout);
+$('#attention-list').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.target.closest('[data-attention-id]');
+  const answer = form.elements.answer.value.trim();
+  if (!answer) return;
+  form.querySelectorAll('button, textarea').forEach((element) => { element.disabled = true; });
+  try {
+    await api(`/api/v1/attentions/${encodeURIComponent(form.dataset.attentionId)}/answer`, { method: 'POST', body: { answer } });
+    toast('回答已发回给员工');
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+    form.querySelectorAll('button, textarea').forEach((element) => { element.disabled = false; });
+  }
+});
+$('#attention-list').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-attention-dismiss]');
+  if (!button) return;
+  const form = button.closest('[data-attention-id]');
+  button.disabled = true;
+  try {
+    await api(`/api/v1/attentions/${encodeURIComponent(form.dataset.attentionId)}/dismiss`, { method: 'POST', body: {} });
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+  }
+});
 $('#refresh').addEventListener('click', () => refresh().then(() => toast('已更新为最新状态')).catch((error) => toast(error.message, true)));
 $('.workspace-nav').addEventListener('click', (event) => {
   const button = event.target.closest('[data-view]');

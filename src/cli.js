@@ -1,9 +1,9 @@
-import { open, readFile } from 'node:fs/promises';
+import { access, open, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Hub } from './hub.js';
 import { createId } from './ids.js';
 import { Connector } from './connector.js';
-import { SESSION_RUNTIMES, startSession } from './session-launcher.js';
+import { SESSION_RUNTIMES, resolveResumeCwd, startSession } from './session-launcher.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
 import { selfUpdate } from './updater.js';
 import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
@@ -52,7 +52,7 @@ Usage:
   agent-hub command result COMMAND_ID          (full result behind a pointer in your instructions)
   agent-hub trigger --trigger-key KEY --thread-key KEY --text TEXT [--source NAME]
                     [--worker-id ID | --role KEY] [--title TITLE] [--actor NAME] [--followup-only]
-  agent-hub role list | set KEY [--name NAME] [--description TEXT] [--takeover-after-ms MS]
+  agent-hub role list | set KEY [--name NAME] [--description TEXT] [--takeover-after-ms MS] [--workdir DIR|none]
   agent-hub role assign WORKER_ID --role KEY | unassign WORKER_ID
   agent-hub handoff list [--status open|dispatched|cancelled|all]
   agent-hub attention list|answer|dismiss [ATTENTION_ID] [--answer TEXT]
@@ -154,8 +154,22 @@ async function adminRequest(flags, pathname, { method = 'GET', body } = {}) {
   return payload;
 }
 
+// A checkout's own Connector first, then this Mac's installed one, so a Session
+// never has to spell the path (some permission allowlists refuse $HOME in a command).
+async function localDataDir(flags) {
+  const chosen = flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR;
+  if (chosen) return path.resolve(chosen);
+  const checkout = path.resolve('.runtime/connector');
+  try {
+    await access(path.join(checkout, 'connector.json'));
+    return checkout;
+  } catch {
+    return path.join(process.env.HOME ?? '.', '.agent-hub/connector');
+  }
+}
+
 async function localOptions(flags) {
-  const dataDir = path.resolve(flags['data-dir'] ?? '.runtime/connector');
+  const dataDir = await localDataDir(flags);
   let stored = {};
   try {
     stored = JSON.parse(await readFile(path.join(dataDir, 'connector.json'), 'utf8'));
@@ -381,7 +395,7 @@ async function workerCommand(positionals, flags) {
         runtime,
         mode: 'external',
         runtime_session_id: sessionId,
-        capabilities: flags.capabilities ? flags.capabilities.split(',').map((item) => item.trim()).filter(Boolean) : [],
+        ...(flags.capabilities ? { capabilities: flags.capabilities.split(',').map((item) => item.trim()).filter(Boolean) } : {}),
         cwd: flags.cwd ?? process.cwd(),
         metadata,
         ...(flags.role !== undefined ? { role: flags.role === 'none' ? null : flags.role } : {}),
@@ -494,9 +508,19 @@ async function sessionCommand(positionals, flags, runtimeArgs) {
   const channel = flags.push === true && flags.runtime === 'kimi'
     ? await localOptions({ 'data-dir': dataDir, 'connector-url': connectorUrl })
     : null;
+  const cwd = flags.cwd ?? (typeof flags.resume === 'string'
+    ? await resolveResumeCwd({
+      runtime: flags.runtime,
+      resumeId: flags.resume,
+      currentCwd: process.cwd(),
+      lookupWorkers: async () => (await localRequest({ 'data-dir': dataDir, 'connector-url': connectorUrl }, '/local/v1/workers')).workers,
+      isDirectory: (target) => stat(target).then((info) => info.isDirectory(), () => false),
+      log: (line) => console.error(line),
+    })
+    : process.cwd());
   const result = await startSession({
     runtime: flags.runtime,
-    cwd: flags.cwd ?? process.cwd(),
+    cwd,
     runtimeArgs,
     push: flags.push === true,
     nativeTui: flags['native-tui'] === true,
@@ -755,6 +779,7 @@ export async function run(argv) {
           ...(flags.name ? { name: flags.name } : {}),
           ...(flags.description !== undefined ? { description: flags.description } : {}),
           ...(flags['takeover-after-ms'] !== undefined ? { takeover_after_ms: Number(flags['takeover-after-ms']) } : {}),
+          ...(flags.workdir !== undefined ? { workdir: flags.workdir === 'none' ? null : flags.workdir } : {}),
         },
       }));
       return;

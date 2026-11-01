@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -421,7 +422,7 @@ export class Connector {
     channel.response.write(`data: ${JSON.stringify(event)}\n\n`);
   }
 
-  openChannel(request, response, { runtime, sessionId, features = [] }) {
+  openChannel(request, response, { runtime, sessionId, features = [], cwd = null }) {
     if (this.stopping) throw localError('Connector is shutting down', 503);
     if (!runtime || !sessionId) throw localError('runtime and session_id are required');
     response.writeHead(200, {
@@ -429,7 +430,7 @@ export class Connector {
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    const channel = { runtime, sessionId, response, workerId: null, deliveries: new Map(), features: new Set(features) };
+    const channel = { runtime, sessionId, cwd, response, workerId: null, deliveries: new Map(), features: new Set(features) };
     const keepalive = setInterval(() => response.write(': keepalive\n\n'), this.channelKeepaliveMs);
     keepalive.unref();
     response.on('close', () => {
@@ -476,7 +477,12 @@ export class Connector {
 
   async announceChannel(workerId, attached) {
     if (!this.ready) return;
-    await this.request('worker.channel', { worker_id: workerId, attached, features: [...(this.channels.get(workerId)?.features ?? [])] }).catch((error) => {
+    await this.request('worker.channel', {
+      worker_id: workerId,
+      attached,
+      features: [...(this.channels.get(workerId)?.features ?? [])],
+      session_cwd: this.channels.get(workerId)?.cwd ?? null,
+    }).catch((error) => {
       this.logger.error?.(`Channel state for ${workerId} not recorded: ${error.message}`);
     });
   }
@@ -748,6 +754,10 @@ export class Connector {
   }
 
   async registerWorker(input) {
+    return (await this.registerWorkerWithWarnings(input)).worker;
+  }
+
+  async registerWorkerWithWarnings(input) {
     await this.whenReady();
     const runtime = typeof input.runtime === 'string' ? input.runtime.trim() : '';
     if (!runtime) throw localError('runtime is required');
@@ -758,13 +768,19 @@ export class Connector {
       throw localError('runtime_session_id is required for an interactive Worker');
     }
     sessionId = sessionId.trim();
+    const channel = [...this.pendingChannels, ...this.channels.values()]
+      .find((item) => item.runtime === runtime && item.sessionId === sessionId);
+    // A symlinked --cwd (/tmp, /var on macOS) is the same place as the real path the Channel reports.
+    const declared = path.resolve(input.cwd ?? process.cwd());
+    const sameDirectory = channel?.cwd && await realpath(declared).catch(() => declared) === channel.cwd;
     const response = await this.request('worker.register', {
       name: input.name ?? `${runtime}-${sessionId.slice(0, 8)}`,
       runtime,
       mode: 'external',
       runtime_session_id: sessionId,
       capabilities: input.capabilities ?? [],
-      cwd: path.resolve(input.cwd ?? process.cwd()),
+      cwd: sameDirectory ? channel.cwd : declared,
+      session_cwd: channel?.cwd ?? null,
       metadata: input.metadata ?? {},
       ...(input.role !== undefined ? { role: input.role } : {}),
     });
@@ -777,7 +793,19 @@ export class Connector {
       this.store.setWorkerPushCapability(worker.worker_id, true);
       await this.announceChannel(worker.worker_id, true);
     }
-    return this.store.getWorker(worker.worker_id);
+    return { worker: this.store.getWorker(worker.worker_id), warnings: response.warnings ?? [] };
+  }
+
+  // The stored copy is what the Hub said at registration; Channels and the Hub link are live here.
+  localWorkerView(worker) {
+    const { last_seen_at: _stale, ...view } = worker;
+    const channel = this.channels.get(worker.worker_id);
+    return {
+      ...view,
+      presence: this.ready ? 'online' : 'offline',
+      session_online: Boolean(channel),
+      session_cwd: channel?.cwd ?? worker.session_cwd ?? null,
+    };
   }
 
   async applyWorkerRetirement(worker) {
@@ -973,7 +1001,7 @@ export class Connector {
       return;
     }
     if (request.method === 'GET' && url.pathname === '/local/v1/workers') {
-      sendJson(response, 200, { workers: this.store.listWorkers() });
+      sendJson(response, 200, { workers: this.store.listWorkers().map((worker) => this.localWorkerView(worker)) });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/local/v1/workers/unregister-current') {
@@ -984,8 +1012,8 @@ export class Connector {
     }
     if (request.method === 'POST' && url.pathname === '/local/v1/workers/register') {
       const body = await readJsonBody(request);
-      const worker = await this.registerWorker(body);
-      sendJson(response, 201, { worker });
+      const { worker, warnings } = await this.registerWorkerWithWarnings(body);
+      sendJson(response, 201, { worker, ...(warnings.length ? { warnings } : {}) });
       return;
     }
     const statusMatch = /^\/local\/v1\/workers\/([^/]+)\/status$/.exec(url.pathname);
@@ -1010,6 +1038,7 @@ export class Connector {
         runtime: url.searchParams.get('runtime') ?? '',
         sessionId: url.searchParams.get('session_id') ?? '',
         features: (url.searchParams.get('features') ?? '').split(',').filter(Boolean),
+        cwd: url.searchParams.get('cwd') || null,
       });
       return;
     }

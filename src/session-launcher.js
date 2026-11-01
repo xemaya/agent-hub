@@ -147,6 +147,27 @@ export async function prepareSessionLaunch(options = {}) {
   };
 }
 
+// Reopening a Session from the wrong directory silently loses that directory's
+// permissions, so --resume without --cwd goes back to where the Session last ran.
+export async function resolveResumeCwd({ runtime, resumeId, currentCwd, lookupWorkers, isDirectory, log = () => {} }) {
+  let workers;
+  try {
+    workers = await lookupWorkers();
+  } catch (error) {
+    log(`Staying in ${currentCwd}: could not read this Session's directory from the Connector (${error.message}). Pass --cwd to choose.`);
+    return currentCwd;
+  }
+  const worker = workers.find((item) => item.runtime === runtime && item.runtime_session_id === resumeId);
+  const recorded = worker?.session_cwd ?? worker?.cwd;
+  if (!recorded || path.resolve(recorded) === path.resolve(currentCwd)) return currentCwd;
+  if (!(await isDirectory(recorded))) {
+    log(`Staying in ${currentCwd}: this Session last ran in ${recorded}, which is not a directory here. Pass --cwd to choose.`);
+    return currentCwd;
+  }
+  log(`Resuming in ${recorded}, where this Session last ran. Pass --cwd to choose another directory.`);
+  return recorded;
+}
+
 export async function startSession(options = {}) {
   const launch = await prepareSessionLaunch(options);
   const spawnProcess = options.spawn ?? spawn;

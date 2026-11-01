@@ -137,7 +137,7 @@ test('Worker directory is live, sanitized and rejects a foreign native identity'
   const entry = directory.workers.find(worker => worker.worker_id === recipient.worker_id);
   assert.deepEqual(Object.keys(entry).sort(), [
     'capabilities', 'connector_name', 'description', 'name', 'presence',
-    'push_capable', 'role', 'runtime', 'work_state', 'worker_id',
+    'push_capable', 'role', 'runtime', 'session_online', 'work_state', 'worker_id',
   ]);
   assert.equal(entry.description, 'QA peer');
   assert.equal(entry.presence, 'online');

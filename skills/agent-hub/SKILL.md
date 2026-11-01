@@ -62,6 +62,8 @@ agent-hub worker register-current \
   --metadata '{"description":"<用户定义的职责与真实限制>"}'
 ```
 
+`--data-dir` 和 `--cwd` 都可以省略：默认分别是本机 Connector 和当前目录；权限白名单不允许命令里出现 `$` 时就省略，不要绕过。再次登记时，没写的能力和描述会保留。响应里有 `warnings` 时要告诉用户，尤其是目录不符的提示：这个窗口接不到岗位的活，要用 `agent-hub session start --resume <session id> --cwd <目录>` 重开。
+
 用户说这个窗口是某个岗位（比如「QA 岗位」）时，加 `--role qa`。同一岗位可以有多个窗口；任务属于岗位，某个窗口关掉后，任务会带着交接包交给同岗位的其他窗口，或者等原窗口回来。不要自己编岗位名。
 
 当前窗口统一登记为 external，不虚报主动推送。Claude/Kimi 使用启动器注入的可信身份，Codex 使用自身注入的 `CODEX_SESSION_ID`。缺少可信身份时停止并说明，**不能随机生成、选择最近会话、手工伪造身份或用另一个 Session 冒充当前窗口**。

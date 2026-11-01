@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { createTestContext, waitFor } from './helpers.js';
-import { taskPart } from '../src/roles.js';
+import { cwdMatches, taskPart } from '../src/roles.js';
 
 // Each Session answers with `answers[name]` (default "done:<name>") and can be
 // held on a gate so it is still running when its window closes.
@@ -235,4 +238,136 @@ test('Role validation and membership', async (t) => {
   assert.equal(cleared.payload.worker.role_key, null);
   const invalid = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { takeover_after_ms: -1 } });
   assert.equal(invalid.response.status, 400);
+});
+
+test('A workdir matches exactly when absolute and by path end when relative', () => {
+  assert.equal(cwdMatches(null, '/anywhere'), true);
+  assert.equal(cwdMatches('youxian-qa', '/Users/a/Workspace/youxian/youxian-qa'), true);
+  assert.equal(cwdMatches('youxian-qa', '/Users/a/Workspace/youxian/youxian-qa/'), true);
+  assert.equal(cwdMatches('youxian/youxian-qa', '/Users/b/code/youxian/youxian-qa'), true);
+  assert.equal(cwdMatches('youxian-qa', '/Users/a/Workspace/youxian'), false);
+  assert.equal(cwdMatches('qa', '/Users/a/youxian-qa'), false, 'matches whole path segments only');
+  assert.equal(cwdMatches('/srv/qa', '/home/srv/qa'), false);
+  assert.equal(cwdMatches('/srv/qa', '/srv/qa/'), true);
+  assert.equal(cwdMatches('youxian-qa', null), false);
+});
+
+test('A live Session in the wrong directory gets no Role work, whatever it declared', async (t) => {
+  const { context, driver } = await setup(t);
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: 'youxian-qa' } });
+
+  // Declares the right directory, but its Channel runs from the workspace root.
+  const misplaced = await context.registerWorker({ name: 'qa-wrong', role: 'qa', cwd: '/w/youxian/youxian-qa', attach: false });
+  await context.attachWorker({ ...misplaced, cwd: '/w/youxian' });
+  const seen = await waitFor(() => {
+    const worker = context.hub.store.getWorker(misplaced.worker_id);
+    return worker.push_capable && worker.session_cwd === '/w/youxian' ? worker : null;
+  });
+  assert.equal(context.hub.roles.available(seen), false);
+
+  const { payload } = await trigger(context, { trigger_key: 'wd1', thread_key: 'feishu:wd', role: 'qa', text: '查一下' });
+  assert.equal(payload.waiting_for_seat, true);
+  const roles = await context.admin('/api/v1/roles');
+  const seat = roles.payload.roles.find((role) => role.role_key === 'qa').seats[0];
+  assert.equal(seat.available, false);
+  assert.match(seat.problem, /runs in \/w\/youxian, but Role qa works in youxian-qa/);
+  const listed = await context.admin('/api/v1/workers');
+  assert.match(listed.payload.workers.find((worker) => worker.worker_id === misplaced.worker_id).seat_problem, /youxian-qa/);
+
+  const right = await context.registerWorker({ name: 'qa-right', role: 'qa', cwd: '/other-mac/youxian-qa' });
+  const handoff = await waitFor(() => {
+    const current = context.hub.store.getHandoff(payload.handoff_id);
+    return current?.status === 'dispatched' ? current : null;
+  });
+  assert.equal(handoff.worker_id, right.worker_id);
+  await finished(context, handoff.command_id);
+  assert.equal(driver.of('qa-wrong').length, 0);
+});
+
+test('Clearing a workdir makes the seat usable again', async (t) => {
+  const { context } = await setup(t);
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: 'youxian-qa' } });
+  const worker = await context.registerWorker({ name: 'qa-any', role: 'qa', cwd: '/w/elsewhere' });
+  assert.equal(context.hub.roles.available(context.hub.store.getWorker(worker.worker_id)), false);
+  const cleared = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: null } });
+  assert.equal(cleared.payload.role.workdir, null);
+  assert.equal(context.hub.roles.available(context.hub.store.getWorker(worker.worker_id)), true);
+  const kept = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: 'keep-me' } });
+  assert.equal(kept.payload.role.workdir, 'keep-me');
+  const renamed = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { name: 'QA2' } });
+  assert.equal(renamed.payload.role.workdir, 'keep-me', 'an unrelated update leaves the workdir alone');
+});
+
+test('Without a reported directory the seat is judged by the declared one', async (t) => {
+  const { context } = await setup(t);
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: 'youxian-qa' } });
+  const fits = { role_key: 'qa', session_cwd: null, cwd: '/a/youxian-qa' };
+  assert.equal(context.hub.roles.seatProblem(fits), null);
+  assert.match(context.hub.roles.seatProblem({ ...fits, cwd: '/a/root' }), /runs in \/a\/root/);
+  assert.equal(context.hub.roles.seatProblem({ role_key: null, cwd: '/a/root' }), null);
+});
+
+test('Registering warns about a wrong directory and a --cwd that disagrees with the Session', async (t) => {
+  const { context } = await setup(t);
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { workdir: 'youxian-qa' } });
+  const body = { name: 'qa-w', runtime: 'test', mode: 'external', runtime_session_id: 'warn-session', capabilities: [], metadata: {}, role: 'qa' };
+  const first = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, cwd: '/w/root' } });
+  assert.match(first.payload.warnings.join(), /will not receive this Role's work/);
+  await context.attachWorker({ ...first.payload.worker, cwd: '/w/root' });
+  await waitFor(() => context.hub.store.getWorker(first.payload.worker.worker_id).session_cwd === '/w/root');
+  const second = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, cwd: '/w/youxian-qa' } });
+  assert.match(second.payload.warnings.join(), /--cwd says \/w\/youxian-qa, but the Session runs in \/w\/root/);
+  assert.match(second.payload.warnings.join(), /will not receive/, 'the real directory decides, not the declared one');
+});
+
+test('Re-registering keeps capabilities and metadata it does not name, and the Role', async (t) => {
+  const { context } = await setup(t);
+  const body = { name: 'keeper', runtime: 'test', mode: 'external', runtime_session_id: 'keep-session', cwd: '/w/keep' };
+  const first = await context.local('/local/v1/workers/register', { method: 'POST', body: {
+    ...body, role: 'qa', capabilities: ['qa', 'review'], metadata: { description: '线上 QA', interactive: true },
+  } });
+  assert.deepEqual(first.payload.worker.capabilities, ['qa', 'review']);
+
+  const bare = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, metadata: { session_origin: 'launcher' } } });
+  assert.equal(bare.payload.worker.worker_id, first.payload.worker.worker_id);
+  assert.deepEqual(bare.payload.worker.capabilities, ['qa', 'review']);
+  assert.deepEqual(bare.payload.worker.metadata, { description: '线上 QA', interactive: true, session_origin: 'launcher' });
+  assert.equal(bare.payload.worker.role_key, 'qa');
+
+  const named = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, capabilities: ['qa'], metadata: { description: '新说明' } } });
+  assert.deepEqual(named.payload.worker.capabilities, ['qa']);
+  assert.equal(named.payload.worker.metadata.description, '新说明');
+  assert.equal(named.payload.worker.metadata.interactive, true);
+});
+
+test('The local worker list reports the Connector and the Session separately, live', async (t) => {
+  const { context } = await setup(t);
+  const worker = await context.registerWorker({ name: 'list-seat', cwd: '/w/list' });
+  const view = async () => (await context.local('/local/v1/workers')).payload.workers.find((item) => item.worker_id === worker.worker_id);
+  const live = await view();
+  assert.equal(live.presence, 'online');
+  assert.equal(live.session_online, true);
+  assert.equal(live.session_cwd, '/w/list');
+  assert.equal('last_seen_at' in live, false, 'the stored registration time must not pass for liveness');
+
+  await context.detachWorker(worker);
+  const gone = await view();
+  assert.equal(gone.presence, 'online', 'the Connector is still up');
+  assert.equal(gone.session_online, false);
+  assert.equal(context.hub.store.getWorker(worker.worker_id).session_online, false);
+});
+
+test('A symlinked --cwd is the same directory as the real path the Channel reports', async (t) => {
+  const { context } = await setup(t);
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hub-link-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const link = path.join(root, 'link');
+  await symlink(root, link);
+  const body = { name: 'linked', runtime: 'test', mode: 'external', runtime_session_id: 'link-session', capabilities: [], metadata: {} };
+  const first = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, cwd: root } });
+  await context.attachWorker(first.payload.worker);
+  await waitFor(() => context.hub.store.getWorker(first.payload.worker.worker_id).session_cwd === root);
+  const second = await context.local('/local/v1/workers/register', { method: 'POST', body: { ...body, cwd: link } });
+  assert.equal(second.payload.warnings, undefined);
+  assert.equal(second.payload.worker.cwd, root);
 });

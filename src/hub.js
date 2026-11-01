@@ -137,6 +137,7 @@ function workerInput(payload) {
     runtime_session_id: requiredString(payload.runtime_session_id, 'runtime_session_id', { max: 300 }),
     capabilities: stringArray(payload.capabilities),
     cwd: requiredString(payload.cwd, 'cwd', { max: 4096 }),
+    session_cwd: optionalString(payload.session_cwd).slice(0, 4096) || null,
     metadata: payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)
       ? payload.metadata
       : {},
@@ -354,7 +355,7 @@ export class Hub {
   }
 
   presentWorker(worker) {
-    return worker ? { ...worker, activity: workerActivity(this.store, worker) } : null;
+    return worker ? { ...worker, activity: workerActivity(this.store, worker), seat_problem: this.roles.seatProblem(worker) } : null;
   }
 
   refreshWorkerState(workerId) {
@@ -942,6 +943,7 @@ export class Hub {
         name: body.name === undefined ? undefined : requiredString(body.name, 'name', { max: 60 }),
         description: body.description === undefined ? undefined : optionalString(body.description).slice(0, 2000),
         takeoverAfterMs: takeover,
+        workdir: body.workdir === undefined ? undefined : optionalString(body.workdir ?? '').slice(0, 4096),
       });
       this.emit('role.updated', { type: 'admin', id: 'admin' }, { payload: { role_key: role.role_key } });
       this.scheduleCoordinator();
@@ -1597,7 +1599,13 @@ export class Hub {
         worker_id: worker.worker_id,
         payload: { name: worker.name, runtime: worker.runtime, mode: worker.mode },
       });
-      this.send(socket, 'worker.registered', { worker }, message.id);
+      const warnings = [];
+      const problem = this.roles.seatProblem(worker);
+      if (problem) warnings.push(`${problem}. It will not receive this Role's work; reopen it with agent-hub session start --resume <session id> --cwd <directory>.`);
+      if (worker.session_cwd && path.resolve(worker.session_cwd) !== path.resolve(worker.cwd)) {
+        warnings.push(`--cwd says ${worker.cwd}, but the Session runs in ${worker.session_cwd}.`);
+      }
+      this.send(socket, 'worker.registered', { worker, warnings }, message.id);
       return;
     }
     if (message.type === 'worker.unregister') {
@@ -1611,7 +1619,8 @@ export class Hub {
       return;
     }
     if (message.type === 'worker.channel') {
-      const worker = this.store.setWorkerChannel(connectorId, requiredString(payload.worker_id, 'worker_id'), payload.attached === true);
+      const worker = this.store.setWorkerChannel(connectorId, requiredString(payload.worker_id, 'worker_id'), payload.attached === true,
+        optionalString(payload.session_cwd).slice(0, 4096) || null);
       if (!worker) throw new Error('Interactive Channel requires a Worker of this Connector');
       this.emit(payload.attached === true ? 'worker.channel_attached' : 'worker.channel_detached', { type: 'worker', id: worker.worker_id }, {
         connector_id: connectorId,

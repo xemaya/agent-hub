@@ -125,7 +125,7 @@ export class KimiChannel {
   }
 
   async streamLoop() {
-    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1' });
+    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1', cwd: this.worker.cwd });
     while (!this.stopped) {
       this.abort = new AbortController();
       try {

@@ -306,6 +306,7 @@ Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状�
 参考 DeepSeek Super-agent 的 Ticket / Assignment 分离（[`research/deepseek-superagent.md`](research/deepseek-superagent.md)）。之前一个 Session 就是一个岗位，这个 Session 断了，岗位上的活也就没人做了。我们控制不了 Session 是否在线，所以不能只靠一个 Session：
 
 - **岗位**（`roles` 表：`role_key`、名称、`takeover_after_ms`，默认 3 分钟）。Session 登记时带 `--role qa` 加入岗位（`worker register-current --role qa`；再次登记不带 `--role` 时保持原岗位，`--role none` 退出），也可以由管理员调整（`PUT /api/v1/workers/:id/role`）。加入不存在的岗位时会自动创建。一个岗位可以有多个座位，可以分布在不同的机器上。
+- **岗位的工作目录**（schema 16：`roles.workdir`，`role set qa --workdir youxian-qa`，`none` 清除）。权限通常跟目录走，开错目录的 Session 接了活也干不了，所以目录不符的座位不算可用：不选它，也不把新工作交给它，任务按没有座位处理。绝对路径要完全相等；相对路径按路径结尾的完整段匹配，这样同一岗位可以坐在不同的 Mac 上。判断依据是 Channel 进程上报的真实目录（`workers.session_cwd`，随 `worker.channel` 上报）；旧 Channel 或旧 Connector 报不了时，退回登记时声明的 `cwd`。`worker register-current` 在目录不符或 `--cwd` 与真实目录不一致时，在响应的 `warnings` 里说明；Dashboard 的员工卡片和 `role list` 的座位也显示原因。
 - **任务属于岗位**（`tasks.role_key`）。`assignee_worker_id` 只表示当前坐在这个任务上的那个 Session。按岗位寻址的入口有：trigger 的 `role`（替代 `worker_id`）、`task create --role`，以及不带 `worker_id`、只带 `task_id` 的 prompt 命令（Admin 和 `send --local` 都支持）。
 - **交接记录**（`handoffs` 表，每个任务最多一条 open）：表示这个任务有工作在等座位。如果工作到达时还有一条交接没送出，新工作会合并进这条交接（`handoff.merged`）。选座规则：
   - 只考虑 Channel 已接通、所在机器在线、未撤下的 Session。
@@ -329,6 +330,7 @@ Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状�
   - 最后是 `本次要处理：` 加上工作本身。
   再次交接时只传递 `本次要处理：` 之后的部分，交接包不会层层嵌套。读取指针按 6.7 的规则成为接手者的凭据。
 - **不做的事**：不维护无状态的 agent loop（Runtime 不归我们管），不自动重跑非岗位任务，不在 Session 之间迁移对话记忆。没有加入岗位的 Worker 和任务，行为与之前完全一样。
+- **登记与列表**：重新登记只更新写明的内容：没传 `--capabilities` 时保留原能力，`--metadata` 按字段合并，岗位不变。`worker list` 里 `presence` 是 Connector 的状态，`session_online` 才是这个 Session 的 Channel 是否接通。`session start --resume` 没传 `--cwd` 时，回到这个 Session 上次运行的目录。本机命令不写 `--data-dir` 时，依次找环境变量、当前目录下的 `.runtime/connector`、`~/.agent-hub/connector`。
 - Dashboard：员工卡片显示所属岗位；「等你处理」顶部列出等座位的交接，并说明是在等原 Session 恢复，还是岗位上没有在线的 Session。
 
 ## 7. WebSocket 协议
@@ -587,7 +589,7 @@ GET    /api/v1/coordinator/chat
 POST   /api/v1/coordinator/chat
 DELETE /api/v1/coordinator/chat
 GET    /api/v1/roles
-PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms? }
+PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms?, workdir? }
 PUT    /api/v1/workers/:id/role           { role: KEY | null }
 GET    /api/v1/handoffs[?status=open|dispatched|cancelled|all&role=KEY]
 GET    /api/v1/attentions[?status=open|answered|dismissed|all]

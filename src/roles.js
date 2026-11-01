@@ -38,6 +38,17 @@ function taskLabel(task) {
   return `${task.task_number ? `#${String(task.task_number).padStart(4, '0')}` : ''}「${task.title}」`;
 }
 
+// An absolute workdir must match exactly. A relative one ("youxian-qa") matches the
+// end of the path, so the same Role can have seats on Macs with different home directories.
+export function cwdMatches(required, actual) {
+  if (!required) return true;
+  if (!actual) return false;
+  const clean = (value) => value.replace(/\/+$/, '');
+  const want = clean(required);
+  const have = clean(actual);
+  return want.startsWith('/') ? have === want : have === want || have.endsWith(`/${want}`);
+}
+
 export class Roles {
   constructor({ store, emit, dispatch, broadcast = () => {}, cancel, now = () => Date.now(), logger = console }) {
     this.store = store;
@@ -74,7 +85,17 @@ export class Roles {
   }
 
   available(worker) {
-    return Boolean(worker && !worker.retired_at && worker.push_capable && worker.presence === 'online');
+    return Boolean(worker && !worker.retired_at && worker.push_capable && worker.presence === 'online' && !this.seatProblem(worker));
+  }
+
+  // Why a live Session still can't do this Role's work. The Channel reports where
+  // the Session really runs; a Connector or Channel too old to say falls back to
+  // the directory declared at registration.
+  seatProblem(worker) {
+    const workdir = worker?.role_key ? this.store.getRole(worker.role_key)?.workdir : null;
+    const actual = worker?.session_cwd ?? worker?.cwd;
+    if (!workdir || cwdMatches(workdir, actual)) return null;
+    return `Session runs in ${actual ?? 'an unknown directory'}, but Role ${worker.role_key} works in ${workdir}`;
   }
 
   // When a seat stopped being reachable; null while it is reachable.
@@ -83,6 +104,7 @@ export class Roles {
     if (worker.retired_at) return Date.parse(worker.retired_at);
     if (worker.presence !== 'online') return Date.parse(worker.last_seen_at) || 0;
     if (!worker.push_capable) return Date.parse(worker.detached_at ?? worker.updated_at) || 0;
+    if (this.seatProblem(worker)) return Date.parse(worker.updated_at) || 0;
     return null;
   }
 
@@ -100,6 +122,8 @@ export class Roles {
       connector_name: worker.connector_name,
       runtime: worker.runtime,
       available: this.available(worker),
+      problem: this.seatProblem(worker),
+      session_cwd: worker.session_cwd,
       active_commands: this.store.activeCommandCount(worker.worker_id),
     }));
     return { ...role, seats, open_handoffs: this.store.listHandoffs({ status: 'open', roleKey: role.role_key }).length };

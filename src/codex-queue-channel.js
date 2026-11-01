@@ -110,7 +110,7 @@ export class CodexQueueChannel {
       this.monitor = setInterval(() => { if (!alive(this.desktopPid)) this.stop(); }, 1000);
       this.monitor.unref();
     }
-    const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId, features: 'mailbox_v1' });
+    const query = new URLSearchParams({ runtime: 'codex', session_id: this.sessionId, features: 'mailbox_v1', cwd: this.cwd });
     try {
       while (!this.stopped) {
         this.abort = new AbortController();

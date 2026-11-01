@@ -168,7 +168,7 @@ export class ChannelServer {
 
   // Holds the Connector's event stream open, reconnecting across Connector restarts.
   async streamLoop() {
-    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1' });
+    const query = new URLSearchParams({ runtime: this.runtime, session_id: this.sessionId, features: 'mailbox_v1', cwd: process.cwd() });
     while (!this.stopped) {
       this.abort = new AbortController();
       try {

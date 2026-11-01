@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
-import { startSession } from '../src/session-launcher.js';
+import { resolveResumeCwd, startSession } from '../src/session-launcher.js';
 
 function fakeChild(code = 0) {
   const child = new EventEmitter();
@@ -201,4 +201,29 @@ test('Kimi native TUI launcher opens the real client with a local Channel', asyn
   assert.equal(channelStopped, 1);
   assert.equal(nativeDriverClosed, 1);
   await assert.rejects(startSession({ runtime: 'kimi', nativeTui: true }), /--native-tui requires --runtime kimi --push/);
+});
+
+test('Resuming without --cwd goes back to where the Session last ran', async () => {
+  const lines = [];
+  const base = {
+    runtime: 'claude', resumeId: 'abc', currentCwd: '/w/root', isDirectory: async () => true, log: (line) => lines.push(line),
+  };
+  const workers = (extra) => async () => [{ runtime: 'claude', runtime_session_id: 'abc', cwd: '/w/declared', ...extra }];
+
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: workers({ session_cwd: '/w/real' }) }), '/w/real');
+  assert.match(lines.at(-1), /Resuming in \/w\/real/);
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: workers({ session_cwd: null }) }), '/w/declared');
+
+  lines.length = 0;
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: workers({ cwd: '/w/root' }) }), '/w/root');
+  assert.deepEqual(lines, [], 'nothing to say when it is already there');
+
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: async () => [] }), '/w/root', 'an unregistered Session stays put');
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: workers({ runtime: 'kimi' }) }), '/w/root', 'same id on another runtime is not it');
+
+  assert.equal(await resolveResumeCwd({ ...base, isDirectory: async () => false, lookupWorkers: workers({}) }), '/w/root');
+  assert.match(lines.at(-1), /not a directory here/);
+
+  assert.equal(await resolveResumeCwd({ ...base, lookupWorkers: async () => { throw new Error('refused'); } }), '/w/root');
+  assert.match(lines.at(-1), /could not read .*refused/);
 });

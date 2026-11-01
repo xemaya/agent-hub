@@ -756,6 +756,7 @@ function renderWorkers() {
           <button class="worker-mention" type="button" data-mention-worker="${escapeHtml(worker.worker_id)}" title="${escapeHtml(mentionHint)}" aria-label="${escapeHtml(mentionHint)}" ${canMention ? '' : 'disabled'}>@</button>
         </summary>
         <div class="worker-details">
+          ${worker.seat_problem ? `<p class="worker-runtime">⚠️ 不接岗位的活：工作目录不对（${escapeHtml(worker.session_cwd ?? worker.cwd ?? '未知')}）</p>` : ''}
           <p class="worker-runtime">${worker.role_key ? `岗位 ${escapeHtml(roleName(worker.role_key))} · ` : ''}${escapeHtml(worker.connector_name ?? '未知机器')} · ${escapeHtml(worker.runtime)} · ${state.coordinator?.enabled && worker.worker_id === state.coordinator.worker_id ? '中央大脑' : worker.push_capable ? '交互会话 · 已接通' : '人工协作 · 会话未接通'}</p>
           <div class="capabilities">${worker.capabilities.map((capability) => `<span>${escapeHtml(capability)}</span>`).join('')}</div>
           ${active ? `<div class="worker-current">

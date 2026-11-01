@@ -43,6 +43,9 @@ function workerView(row) {
     retired_at: row.retired_at ?? null,
     role_key: row.role_key ?? null,
     detached_at: row.detached_at ?? null,
+    // presence is the Connector's; session_online is this Session's own Channel.
+    session_online: Boolean(row.push_capable),
+    session_cwd: row.session_cwd ?? null,
   };
 }
 
@@ -57,6 +60,7 @@ function workerDirectoryView(worker) {
     description: typeof worker.metadata?.description === 'string' ? worker.metadata.description.slice(0, 2000) : '',
     role: worker.role_key,
     push_capable: worker.push_capable,
+    session_online: worker.session_online,
     presence: worker.presence,
     work_state: worker.work_state,
   };
@@ -183,6 +187,7 @@ function roleView(row) {
     name: row.name,
     description: row.description,
     takeover_after_ms: Number(row.takeover_after_ms),
+    workdir: row.workdir ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -469,6 +474,9 @@ export class HubStore {
     }
     if (!workerColumns.has('role_key')) this.db.exec('ALTER TABLE workers ADD COLUMN role_key TEXT');
     if (!workerColumns.has('detached_at')) this.db.exec('ALTER TABLE workers ADD COLUMN detached_at TEXT');
+    if (!workerColumns.has('session_cwd')) this.db.exec('ALTER TABLE workers ADD COLUMN session_cwd TEXT');
+    const roleColumns = new Set(this.db.prepare('PRAGMA table_info(roles)').all().map((column) => column.name));
+    if (!roleColumns.has('workdir')) this.db.exec('ALTER TABLE roles ADD COLUMN workdir TEXT');
     const taskColumns = new Set(this.db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name));
     if (!taskColumns.has('task_number')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN task_number INTEGER');
@@ -511,7 +519,7 @@ export class HubStore {
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
     `);
     this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 15');
+    this.db.exec('PRAGMA user_version = 16');
   }
 
   close() {
@@ -572,21 +580,25 @@ export class HubStore {
   registerWorker(connectorId, data) {
     const timestamp = now();
     const existing = this.db.prepare(`
-      SELECT worker_id FROM workers
+      SELECT worker_id, capabilities_json, metadata_json FROM workers
       WHERE connector_id = ? AND runtime = ? AND runtime_session_id = ?
     `).get(connectorId, data.runtime, data.runtime_session_id);
     const workerId = existing?.worker_id ?? createId('worker');
+    // Re-registering updates what it names and keeps what it leaves out.
+    const capabilities = data.capabilities?.length ? data.capabilities : parseJson(existing?.capabilities_json, []);
+    const metadata = { ...parseJson(existing?.metadata_json, {}), ...data.metadata };
     this.db.prepare(`
       INSERT INTO workers (
         worker_id, connector_id, name, runtime, mode, runtime_session_id,
         capabilities_json, cwd, metadata_json, push_capable, work_state,
-        created_at, updated_at, last_seen_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?)
+        created_at, updated_at, last_seen_at, session_cwd
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)
       ON CONFLICT(connector_id, runtime, runtime_session_id) DO UPDATE SET
         name = excluded.name, mode = excluded.mode, capabilities_json = excluded.capabilities_json,
         cwd = excluded.cwd, metadata_json = excluded.metadata_json,
         push_capable = excluded.push_capable, updated_at = excluded.updated_at,
-        last_seen_at = excluded.last_seen_at, retired_at = NULL
+        last_seen_at = excluded.last_seen_at, retired_at = NULL,
+        session_cwd = COALESCE(excluded.session_cwd, workers.session_cwd)
     `).run(
       workerId,
       connectorId,
@@ -594,13 +606,14 @@ export class HubStore {
       data.runtime,
       'external',
       data.runtime_session_id,
-      stringifyJson(data.capabilities ?? []),
+      stringifyJson(capabilities),
       data.cwd,
-      stringifyJson(data.metadata ?? {}),
+      stringifyJson(metadata),
       0,
       timestamp,
       timestamp,
       timestamp,
+      data.session_cwd ?? null,
     );
     return this.getWorker(workerId);
   }
@@ -685,15 +698,16 @@ export class HubStore {
   }
 
   // Push capability always follows the attached interactive Channel.
-  setWorkerChannel(connectorId, workerId, attached) {
+  setWorkerChannel(connectorId, workerId, attached, sessionCwd = null) {
     const worker = this.getWorkerForConnector(workerId, connectorId);
     if (!worker) return null;
     const timestamp = now();
     this.db.prepare(`
       UPDATE workers SET push_capable = ?, updated_at = ?, last_seen_at = ?,
-        detached_at = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(detached_at, ?) END
+        detached_at = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(detached_at, ?) END,
+        session_cwd = CASE WHEN ? = 1 THEN ? ELSE session_cwd END
       WHERE worker_id = ?
-    `).run(attached ? 1 : 0, timestamp, timestamp, attached ? 1 : 0, timestamp, workerId);
+    `).run(attached ? 1 : 0, timestamp, timestamp, attached ? 1 : 0, timestamp, attached ? 1 : 0, sessionCwd, workerId);
     return this.getWorker(workerId);
   }
 
@@ -988,19 +1002,20 @@ export class HubStore {
     return this.db.prepare('SELECT * FROM roles ORDER BY role_key').all().map(roleView);
   }
 
-  upsertRole({ roleKey, name, description, takeoverAfterMs }) {
+  upsertRole({ roleKey, name, description, takeoverAfterMs, workdir }) {
     const timestamp = now();
     const current = this.getRole(roleKey);
     this.db.prepare(`
-      INSERT INTO roles (role_key, name, description, takeover_after_ms, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO roles (role_key, name, description, takeover_after_ms, workdir, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(role_key) DO UPDATE SET name = excluded.name, description = excluded.description,
-        takeover_after_ms = excluded.takeover_after_ms, updated_at = excluded.updated_at
+        takeover_after_ms = excluded.takeover_after_ms, workdir = excluded.workdir, updated_at = excluded.updated_at
     `).run(
       roleKey,
       name ?? current?.name ?? roleKey,
       description ?? current?.description ?? '',
       takeoverAfterMs ?? current?.takeover_after_ms ?? 3 * 60 * 1000,
+      workdir === undefined ? current?.workdir ?? null : workdir || null,
       timestamp,
       timestamp,
     );

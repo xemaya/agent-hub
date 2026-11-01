@@ -29,7 +29,7 @@ agent-hub session start --runtime claude --push --cwd /path/to/project
 agent-hub session start --runtime claude --push --resume <session-id> --cwd /path/to/project
 ```
 
-`--resume` 不写 `--cwd` 时，回到这个 Session 上次运行的目录。岗位设了工作目录（`role set KEY --workdir DIR`）时，目录不符的窗口不算可用座位。看窗口是否接通，用 `worker list` 的 `session_online`；`presence` 只表示 Connector 在线。
+`--resume` 不写 `--cwd` 时，回到这个 Session 上次运行的目录。岗位设了工作目录（`role set KEY --workdir DIR`）时，目录不符的窗口不算可用座位。一个座位同时只做一件事，全忙时任务在 Hub 排队，谁先空出来谁接；想并行就多开几个窗口登记到同一岗位。看窗口是否接通，用 `worker list` 的 `session_online`；`presence` 只表示 Connector 在线。
 
 在窗口中执行 `register-current`。Channel 接通后，命令以 `<channel source="agent-hub" command_id="...">` 到达；先调用 `agent_hub_ack`；耗时较长的工作在每个有意义的步骤后可调用 `agent_hub_progress` 写一行进展（变化、下一步或阻塞，几分钟最多一次），看门狗据此区分真实推进和空转；完成后调用 `agent_hub_report` 返回完整结果，每个 command_id 一次；缺人的决定或信息时用 `outcome: needs_input` + 一个 `question`，被卡住用 `blocked`，无事可做用 `dropped`。终端文字不会自动回传。首次启动选择“本地开发”，权限确认仍在终端处理。关闭窗口会退回 `waiting_manual`；加入了岗位（`register-current --role KEY`）的窗口除外：它负责的岗位任务会在接手等待时间（默认 3 分钟）后带着交接包转给同岗位的其他在线窗口，原窗口在这之前回来则继续由它做。
 

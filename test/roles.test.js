@@ -84,6 +84,69 @@ test('Work addressed to a Role waits for a seat and goes to the first Session th
   assert.equal(qa.open_handoffs, 0);
 });
 
+test('Each seat does one job at a time and queued work goes to whichever seat frees up first', async (t) => {
+  const { context, driver, hold } = await setup(t);
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  await context.registerWorker({ name: 'qa-b', role: 'qa', runtime_session_id: 'other-window' });
+  const releaseA = hold('qa-a');
+  const releaseB = hold('qa-b');
+
+  const first = (await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'first' })).payload;
+  const second = (await trigger(context, { trigger_key: 'm2', thread_key: 'feishu:t2', role: 'qa', text: 'second' })).payload;
+  assert.ok(first.command_id && second.command_id);
+  assert.notEqual(context.hub.store.getCommand(first.command_id).worker_id, context.hub.store.getCommand(second.command_id).worker_id, 'the idle seat gets the second job');
+
+  const third = (await trigger(context, { trigger_key: 'm3', thread_key: 'feishu:t3', role: 'qa', text: 'third' })).payload;
+  const fourth = (await trigger(context, { trigger_key: 'm4', thread_key: 'feishu:t4', role: 'qa', text: 'fourth' })).payload;
+  for (const queued of [third, fourth]) {
+    assert.equal(queued.waiting_for_seat, true);
+    assert.equal(queued.seats_busy, true);
+    assert.equal(queued.command_id, null);
+    assert.equal(queued.task.assignee_worker_id, null);
+  }
+
+  // The seat that finishes first takes the oldest queued job, while the other stays held.
+  const firstSeat = context.hub.store.getCommand(first.command_id).worker_id;
+  const freedName = context.hub.store.getWorker(firstSeat).name;
+  (freedName === 'qa-a' ? releaseA : releaseB)();
+  await finished(context, first.command_id);
+  const handoff = await waitFor(() => {
+    const current = context.hub.store.getHandoff(third.handoff_id);
+    return current?.status === 'dispatched' ? current : null;
+  });
+  assert.equal(handoff.worker_id, firstSeat);
+  await waitFor(() => driver.of(freedName).some((item) => item.input === 'third'));
+  assert.equal(context.hub.store.getHandoff(fourth.handoff_id).status, 'open', 'one job per seat, so the next one keeps waiting');
+  assert.equal(context.hub.store.getCommand(second.command_id).status, 'running');
+});
+
+test('Follow-ups stay with the busy seat that holds the task', async (t) => {
+  const { context, hold } = await setup(t);
+  const seat = await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  hold('qa-a');
+  await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'first' });
+  const followup = (await trigger(context, { trigger_key: 'm2', thread_key: 'feishu:t1', role: 'qa', text: 'more' })).payload;
+  assert.equal(followup.routed, 'followup');
+  assert.equal(context.hub.store.getCommand(followup.command_id).worker_id, seat.worker_id);
+  assert.equal(followup.waiting_for_seat, undefined);
+});
+
+test('seats_busy stays false when nobody is on the Role', async (t) => {
+  const { context } = await setup(t);
+  const { payload } = await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'anyone?' });
+  assert.equal(payload.waiting_for_seat, true);
+  assert.equal(payload.seats_busy, false);
+});
+
+test('A seat in the wrong directory does not count as busy', async (t) => {
+  const { context } = await setup(t);
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { name: 'QA', workdir: 'youxian-qa' } });
+  await context.registerWorker({ name: 'qa-a', role: 'qa', cwd: '/tmp/elsewhere' });
+  const { payload } = await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'anyone?' });
+  assert.equal(payload.waiting_for_seat, true);
+  assert.equal(payload.seats_busy, false);
+});
+
 test('A Session that dies mid-run is replaced by another seat with a handoff package', async (t) => {
   const { context, driver, hold } = await setup(t);
   const first = await context.registerWorker({ name: 'qa-a', role: 'qa' });

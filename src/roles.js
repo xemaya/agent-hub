@@ -108,11 +108,17 @@ export class Roles {
     return null;
   }
 
+  // A seat does one job at a time. When every seat is busy the work stays in its
+  // open handoff, and whichever seat frees up first takes the oldest one. Pushing
+  // it onto a busy seat would strand it there even if another seat went idle.
   pickSeat(roleKey) {
     return this.store.listRoleWorkers(roleKey)
-      .filter((worker) => this.available(worker))
-      .map((worker, order) => ({ worker, order, load: this.store.activeCommandCount(worker.worker_id) }))
-      .sort((a, b) => a.load - b.load || a.order - b.order)[0]?.worker ?? null;
+      .find((worker) => this.available(worker) && this.store.activeCommandCount(worker.worker_id) === 0) ?? null;
+  }
+
+  // Seats exist but none is free, as opposed to nobody being there at all.
+  seatsBusy(roleKey) {
+    return !this.pickSeat(roleKey) && this.store.listRoleWorkers(roleKey).some((worker) => this.available(worker));
   }
 
   present(role) {

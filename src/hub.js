@@ -602,7 +602,7 @@ export class Hub {
       duplicate: false,
       task: target ? this.store.getTask(target.task_id) : null,
       command_id: command?.command_id ?? seated ?? attention?.answer_command_id ?? null,
-      ...(waiting ? { waiting_for_seat: true, handoff_id: handoff.handoff_id, role: handoff.role_key } : {}),
+      ...(waiting ? { waiting_for_seat: true, seats_busy: this.roles.seatsBusy(handoff.role_key), handoff_id: handoff.handoff_id, role: handoff.role_key } : {}),
     };
   }
 

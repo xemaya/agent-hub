@@ -461,13 +461,15 @@ test('No seat: the owner is told, and told differently when seats are merely bus
   release();
 });
 
-test('Groups: a new group starts from now, a left group loses its cursor, one failing group does not stop the rest', async (t) => {
+test('Groups: a new group starts at the previous tick, a left group loses its cursor, one failing group does not stop the rest', async (t) => {
   const { context, driver, feishu, bridge } = await setup(t);
   await context.registerWorker({ name: 'qa-a', role: 'qa' });
   feishu.chats.push({ chat_id: 'oc_new', name: '新群', external: false });
   feishu.post('oc_new', '@_user_1 历史消息', { mentions: [BOT], at: feishu.clock - 60_000 });
+  const fresh = feishu.post('oc_new', '@_user_1 刚拉进群就问', { mentions: [BOT], at: feishu.clock - 2000 });
   await bridge.tick();
-  assert.equal(feishu.replies().length, 0, 'history before joining is not replayed');
+  assert.equal(feishu.replies().length, 1, 'history before joining is not replayed, but an @ since the last tick is');
+  assert.equal(feishu.replies()[0].target, fresh.message_id);
   assert.ok(bridge.state.cursor.oc_new);
 
   feishu.chats = feishu.chats.filter((chat) => chat.chat_id !== ORDINARY);
@@ -482,8 +484,8 @@ test('Groups: a new group starts from now, a left group loses its cursor, one fa
   assert.equal(bridge.state.cursor[FEEDBACK], before, 'a failed group keeps its cursor');
   feishu.failing.clear();
   assert.equal(await bridge.tick(), 0);
-  assert.equal(feishu.replies().length, 1, 'the message is handled once the group works again');
-  await waitFor(() => driver.of('qa-a')[0]);
+  assert.equal(feishu.replies().length, 2, 'the message is handled once the group works again');
+  await waitFor(() => driver.of('qa-a')[1]);
 });
 
 test('When the chat list fails the known groups are still read', async (t) => {

@@ -540,6 +540,7 @@ export class FeishuBridge {
       for (const chat of await this.feishu.listChats()) if (chat.chat_id !== this.ownerDm()) this.follow(chat.chat_id, nowS);
       const start = await this.hub.eventsAfter(null, NOTIFY_EVENTS).catch(() => null);
       this.state.eventCursor = start?.cursor ?? null;
+      this.state.lastOkAt = nowS;
       await this.save();
       this.log('cursors set at now; next tick starts handling new messages');
       return 0;
@@ -564,15 +565,17 @@ export class FeishuBridge {
       chats = Object.fromEntries(Object.keys(this.state.cursor).filter((chat) => chat !== this.ownerDm()).map((chat) => [chat, { chat_id: chat }]));
     }
     for (const [chatId, chat] of Object.entries(chats)) if (chat.name) this.names[chatId] = chat.name;
+    // A group seen for the first time starts at the previous tick, not at now: the bot
+    // can be @'d in the seconds between being added and the bridge noticing the group.
     const newChats = Object.keys(chats).filter((chat) => !(chat in this.state.cursor));
-    for (const chat of newChats) this.follow(chat, nowS);
+    for (const chat of newChats) this.follow(chat, this.state.lastOkAt ?? nowS);
 
     const groupRoute = (message) => {
       if (this.mentionsBot(message)) return (m) => this.onMention(m, chats[m.chat_id]);
       if (message.sender?.sender_type === 'user' && message.thread_id && this.state.threads[message.thread_id]) return (m) => this.onThreadFollowup(m);
       return null;
     };
-    for (const chatId of Object.keys(chats).filter((chat) => !newChats.includes(chat))) {
+    for (const chatId of Object.keys(chats)) {
       try {
         for (const message of await this.feishu.chatMessagesSince(chatId, this.state.cursor[chatId] - OVERLAP_S)) {
           await this.process({ ...message, chat_id: chatId }, groupRoute);

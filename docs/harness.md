@@ -159,7 +159,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 
 ### 9.3 顺序与切换
 
-> 进度（2026-11-01）：1、2 已在 `huanghaibin` 工作区完成（Hub schema 17、`agent-hub bridge feishu`、191 条测试通过，`design.md` §6.9），待提交和部署；3 起要在 Hub 机器上放飞书应用密钥后进行。
+> 进度（2026-11-02）：1、2 已提交（9ef8267）并部署到 Hub 机器（schema 17 已迁移，桥的 systemd 单元和 `/var/lib/agent-hub/bridge/feishu.json` 已装好但未启用）；3 起要在 Hub 机器上放飞书应用密钥（`/var/lib/agent-hub/bridge/feishu-app-secret`）后进行：先 `--observe` 与 Mac 上的 watch 并跑一天，再切换。
 
 1. Hub：`POST /api/v1/triggers`、事件游标、`needs_approval` Attention（schema 17）。单测 + smoke。
 2. 桥：移植 watch.py 的逻辑（所有群、普通群话题轮询、私信、gate、ack、通知、审批执行），配置先只写问题反馈群 / FindU / 数字员工迭代三群。

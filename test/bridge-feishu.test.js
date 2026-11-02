@@ -1,0 +1,482 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { createTestContext, waitFor } from './helpers.js';
+import { FeishuBridge, HubAdmin, loadConfig } from '../src/bridge-feishu.js';
+import { FeishuApi, messageText, readableText } from '../src/feishu-api.js';
+
+const BOT = 'ou_bot';
+const OWNER = 'ou_owner';
+const OWNER_DM = 'oc_owner_dm';
+const FEEDBACK = 'oc_feedback'; // topic-mode group: thread replies appear in the chat listing
+const ORDINARY = 'oc_ordinary'; // ordinary group: thread replies do not
+const EXTERNAL = 'oc_external';
+
+// An in-memory Feishu: chats, messages (with threads), sends and replies with
+// uuid de-duplication, and a per-call failure switch.
+class FakeFeishu {
+  constructor() {
+    this.chats = [
+      { chat_id: FEEDBACK, name: '问题反馈群', external: true },
+      { chat_id: ORDINARY, name: '数字员工迭代', external: false },
+      { chat_id: OWNER_DM, name: '', external: false },
+    ];
+    this.messages = []; // { message_id, chat_id, thread_id, listed, create_time, sender, mentions, body, parent_id }
+    this.sent = []; // outbound: { kind, target, text, uuid, message_id }
+    this.failing = new Set();
+    this.seq = 0;
+    this.clock = 1_700_000_000_000;
+    this.tokens = 0;
+  }
+
+  id(prefix = 'om') { this.seq += 1; return `${prefix}_${this.seq}`; }
+
+  post(chatId, text, { from = 'ou_colleague', senderType = 'user', mentions = [], threadId = null, listed = true, parentId = null, at = null } = {}) {
+    this.clock += 1000;
+    const message = {
+      message_id: this.id(), chat_id: chatId, thread_id: threadId ?? (chatId === FEEDBACK ? this.id('omt') : null), listed, parent_id: parentId,
+      create_time: String(at ?? this.clock), msg_type: 'text', deleted: false,
+      sender: { id: from, id_type: 'open_id', sender_type: senderType },
+      mentions: mentions.map((id, index) => ({ key: `@_user_${index + 1}`, id, id_type: 'open_id', name: id === BOT ? 'QA机器人' : id })),
+      body: { content: JSON.stringify({ text }) },
+    };
+    this.messages.push(message);
+    return message;
+  }
+
+  // The fetch() the bridge's FeishuApi talks to.
+  fetch = async (url, init = {}) => {
+    const { pathname, searchParams } = new URL(url);
+    const body = init.body ? JSON.parse(init.body) : {};
+    const json = (payload, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(payload) });
+    if (pathname.endsWith('/tenant_access_token/internal')) {
+      this.tokens += 1;
+      return json({ code: 0, tenant_access_token: `t${this.tokens}`, expire: 7200 });
+    }
+    if (this.failing.has(pathname) || this.failing.has('*')) return json({ code: 99991400, msg: 'injected failure' });
+    if (pathname === '/open-apis/im/v1/chats') return json({ code: 0, data: { items: this.chats, has_more: false } });
+    if (pathname === '/open-apis/im/v1/messages' && init.method === 'GET') {
+      const type = searchParams.get('container_id_type');
+      const container = searchParams.get('container_id');
+      let rows;
+      if (type === 'chat') {
+        const start = Number(searchParams.get('start_time')) * 1000;
+        rows = this.messages.filter((m) => m.chat_id === container && m.listed && Number(m.create_time) >= start).sort((a, b) => a.create_time - b.create_time);
+      } else {
+        rows = this.messages.filter((m) => m.thread_id === container).sort((a, b) => b.create_time - a.create_time);
+      }
+      return json({ code: 0, data: { items: rows, has_more: false } });
+    }
+    const one = /^\/open-apis\/im\/v1\/messages\/([^/]+)$/.exec(pathname);
+    if (one && init.method === 'GET') {
+      const message = this.messages.find((m) => m.message_id === one[1]);
+      return json({ code: 0, data: { items: message ? [message] : [] } });
+    }
+    const reply = /^\/open-apis\/im\/v1\/messages\/([^/]+)\/reply$/.exec(pathname);
+    if (reply && init.method === 'POST') {
+      if (this.failing.has('reply')) return json({ code: 230001, msg: 'reply refused' });
+      const existing = this.sent.find((s) => s.uuid && s.uuid === body.uuid);
+      if (existing) return json({ code: 0, data: { message_id: existing.message_id } });
+      const target = this.messages.find((m) => m.message_id === reply[1]);
+      if (!target) return json({ code: 230011, msg: 'no such message' });
+      // The first in-thread reply opens the thread; the bot's reply in an ordinary group is not listed with the chat.
+      target.thread_id ??= this.id('omt');
+      const message = this.post(target.chat_id, JSON.parse(body.content).text, { from: BOT, senderType: 'app', threadId: target.thread_id, listed: target.chat_id === FEEDBACK });
+      this.sent.push({ kind: 'reply', target: reply[1], text: JSON.parse(body.content).text, uuid: body.uuid, message_id: message.message_id });
+      return json({ code: 0, data: { message_id: message.message_id } });
+    }
+    if (pathname === '/open-apis/im/v1/messages' && init.method === 'POST') {
+      if (this.failing.has('send')) return json({ code: 230002, msg: 'send refused' });
+      const existing = this.sent.find((s) => s.uuid && s.uuid === body.uuid);
+      if (existing) return json({ code: 0, data: { message_id: existing.message_id } });
+      const chat = body.receive_id === OWNER ? OWNER_DM : body.receive_id;
+      const message = this.post(chat, JSON.parse(body.content).text, { from: BOT, senderType: 'app' });
+      this.sent.push({ kind: 'send', target: body.receive_id, text: JSON.parse(body.content).text, uuid: body.uuid, message_id: message.message_id });
+      return json({ code: 0, data: { message_id: message.message_id } });
+    }
+    return json({ code: 404, msg: `unhandled ${init.method} ${pathname}` }, 404);
+  };
+
+  dms() { return this.sent.filter((s) => s.kind === 'send' && s.target === OWNER).map((s) => s.text); }
+  replies() { return this.sent.filter((s) => s.kind === 'reply'); }
+}
+
+function seatDriver() {
+  const driver = {
+    executions: [],
+    answers: {},
+    async execute({ worker, command, onState }) {
+      driver.executions.push({ worker: worker.name, input: command.input, command_id: command.command_id });
+      await onState({ started: true });
+      const answer = driver.answers[worker.name];
+      const value = typeof answer === 'function' ? answer(command) : answer ?? `done:${worker.name}`;
+      return typeof value === 'string' ? { text: value, session_id: worker.runtime_session_id } : { session_id: worker.runtime_session_id, ...value };
+    },
+    of(name) { return driver.executions.filter((item) => item.worker === name).map((item) => ({ ...item, input: driver.store?.getCommand(item.command_id)?.input ?? item.input })); },
+    async close() {},
+  };
+  return driver;
+}
+
+const CONFIG = {
+  app_id: 'cli_test', bot_open_id: BOT, role: 'qa',
+  owner: { name: '黄海斌', open_id: OWNER, dm_chat: OWNER_DM },
+  groups: { [FEEDBACK]: { name: '问题反馈群', policy: 'auto' } },
+  default_policy: { internal: 'auto', external: 'confirm' },
+  people: { ou_colleague: 'Anya' },
+  prompt_hint: '按 AGENTS.md「群里 @ 的跟进」处理。',
+};
+
+async function setup(t, { observe = false, config = {} } = {}) {
+  const context = await createTestContext(t, { hub: { watchdogIntervalMs: 60 * 60 * 1000 } });
+  const driver = seatDriver();
+  driver.store = context.hub.store;
+  context.driver = driver;
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { name: 'QA', takeover_after_ms: 0 } });
+  const feishu = new FakeFeishu();
+  const api = new FeishuApi({ appId: 'cli_test', appSecret: 's', fetch: feishu.fetch, now: () => feishu.clock });
+  const hub = new HubAdmin({ baseUrl: context.hub.url, token: 'test-admin' });
+  const bridge = new FeishuBridge({
+    config: loadConfig({ ...CONFIG, ...config }), feishu: api, hub,
+    stateFile: path.join(context.root, 'bridge', 'state.json'), observe, now: () => feishu.clock, logger: { log() {}, error() {} },
+  });
+  await bridge.load();
+  assert.equal(await bridge.tick(), 0, 'first tick only sets cursors');
+  // Time moves on so new messages fall after the cursors.
+  feishu.clock += 5000;
+  return { context, driver, feishu, bridge };
+}
+
+const finished = (context, commandId) => waitFor(() => {
+  const command = context.hub.store.getCommand(commandId);
+  return ['succeeded', 'failed'].includes(command?.status) ? command : null;
+});
+const liveTask = (context, threadKey) => context.hub.store.liveTaskByThread(threadKey);
+
+test('message text helpers read text and post messages and name mentions', () => {
+  assert.equal(messageText({ msg_type: 'text', body: { content: '{"text":"hi @_user_1"}' } }), 'hi @_user_1');
+  assert.equal(readableText({ msg_type: 'text', body: { content: '{"text":"@_user_1 查一下"}' }, mentions: [{ key: '@_user_1', name: 'QA机器人' }] }), '@QA机器人 查一下');
+  assert.equal(messageText({ msg_type: 'post', body: { content: '{"zh_cn":{"title":"t","content":[[{"tag":"text","text":"a"},{"tag":"text","text":"b"}]]}}' } }), 'a b');
+  assert.equal(messageText({ msg_type: 'image', body: { content: '{}' } }), '');
+  assert.equal(messageText({ deleted: true, msg_type: 'text', body: { content: '{"text":"x"}' } }), '');
+});
+
+test('loadConfig fills defaults and refuses unknown policies', () => {
+  const config = loadConfig(CONFIG);
+  assert.equal(config.default_policy.external, 'confirm');
+  assert.equal(config.loose_ttl_days, 7);
+  assert.throws(() => loadConfig({ ...CONFIG, groups: { x: { policy: 'maybe' } } }), /policy must be/);
+  assert.throws(() => loadConfig({ ...CONFIG, role: undefined }), /needs role/);
+});
+
+test('An @ in a topic group is acked in the thread and opens a Role task with the thread as context', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(FEEDBACK, '@_user_1 为什么搜索不到我的帖子？', { mentions: [BOT] });
+  assert.equal(await bridge.tick(), 0);
+
+  const [ack] = feishu.replies();
+  assert.equal(ack.target, at.message_id);
+  assert.equal(ack.uuid, `bridge-ack-${at.message_id}`);
+  assert.match(ack.text, /收到/);
+  const task = liveTask(context, `feishu:${at.thread_id}`);
+  assert.ok(task, 'the task follows the thread the ack opened');
+  assert.equal(task.role_key, 'qa');
+  assert.equal(task.title, '问题反馈群 @：为什么搜索不到我的帖子？');
+  const command = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(command.input, /飞书群「问题反馈群」里 Anya @ 了机器人/);
+  assert.match(command.input, /Anya：@QA机器人 为什么搜索不到我的帖子？/, 'the thread excerpt names the sender');
+  assert.match(command.input, new RegExp(`"target":"${at.message_id}"`), 'the reply target is the @ message');
+  assert.match(command.input, /needs_approval/);
+  assert.match(command.input, /按 AGENTS.md「群里 @ 的跟进」处理/);
+  assert.deepEqual(feishu.dms(), [], 'a seated task does not bother the owner');
+  assert.equal(bridge.state.threads[at.thread_id], at.message_id);
+  assert.equal(bridge.state.looseThreads[at.thread_id], undefined, 'topic-group threads are listed with the chat');
+
+  // A second tick does not ack or trigger again.
+  await bridge.tick();
+  assert.equal(feishu.replies().length, 1);
+  assert.equal(context.hub.store.listTasks().length, 1);
+});
+
+test('An @ in an ordinary group finds the thread the ack opened and follows it separately', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(ORDINARY, '@_user_1 看板上待验证的有几条？', { mentions: [BOT] });
+  await bridge.tick();
+  assert.ok(at.thread_id, 'the ack opened a thread');
+  assert.ok(liveTask(context, `feishu:${at.thread_id}`));
+  assert.ok(bridge.state.looseThreads[at.thread_id], 'ordinary-group threads are polled on their own');
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  await finished(context, first.command_id);
+
+  // A reply inside the thread is not in the chat listing, yet reaches the task.
+  feishu.clock += 2000;
+  feishu.post(ORDINARY, '追问：是哪一条？', { threadId: at.thread_id, listed: false });
+  await bridge.tick();
+  const followup = await waitFor(() => driver.of('qa-a')[1]);
+  assert.match(followup.input, /【跟进】/);
+  assert.match(followup.input, /追问：是哪一条？/);
+  assert.equal(feishu.replies().length, 1, 'follow-ups are not acked');
+
+  // Once the task is done the thread is dropped.
+  await finished(context, followup.command_id);
+  await context.admin(`/api/v1/tasks/${liveTask(context, `feishu:${at.thread_id}`).task_id}`, { method: 'PATCH', body: { status: 'done' } });
+  feishu.clock += 2000;
+  feishu.post(ORDINARY, '谢谢', { threadId: at.thread_id, listed: false });
+  await bridge.tick();
+  assert.equal(bridge.state.threads[at.thread_id], undefined);
+  assert.equal(bridge.state.looseThreads[at.thread_id], undefined);
+});
+
+test('An @ in an external group without a policy asks the owner first and nothing is said in the group', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  feishu.chats.push({ chat_id: EXTERNAL, name: 'FindU', external: true });
+  await bridge.tick(); // the new group gets a cursor at now
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  feishu.clock += 2000;
+  const at = feishu.post(EXTERNAL, '@_user_1 能帮我查个订单吗', { mentions: [BOT] });
+  await bridge.tick();
+  assert.equal(feishu.replies().length, 0);
+  assert.equal(context.hub.store.listTasks().length, 0);
+  const [ask] = feishu.dms();
+  assert.match(ask, /【外部群】FindU里 Anya @ 了机器人/);
+  assert.match(ask, /能帮我查个订单吗/);
+  assert.equal(Object.keys(bridge.state.confirms).length, 1);
+
+  // The owner quotes the DM and says 查.
+  const dm = feishu.messages.find((m) => m.chat_id === OWNER_DM && m.sender.sender_type === 'app');
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '查', { from: OWNER, parentId: dm.message_id });
+  await bridge.tick();
+  assert.equal(feishu.replies().length, 1, 'now the group gets the ack');
+  assert.ok(liveTask(context, `feishu:${at.thread_id}`));
+  await waitFor(() => driver.of('qa-a')[0]);
+  assert.deepEqual(bridge.state.confirms, {});
+});
+
+test('A draft reported as needs_approval reaches the owner, 「发」 sends it and the seat hears the result', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  driver.answers['qa-a'] = (command) => (/【跟进】飞书群/.test(command.input)
+    ? { text: '草稿好了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '查过了：是缓存，已修。', key: 'qa-cache-1101', note: '回 Anya：缓存问题' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(FEEDBACK, '@_user_1 搜索有问题', { mentions: [BOT] });
+  await bridge.tick();
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  await finished(context, first.command_id);
+  const attention = await waitFor(() => context.hub.store.openAttentionForTask(liveTask(context, `feishu:${at.thread_id}`).task_id));
+  assert.equal(attention.outcome, 'needs_approval');
+
+  feishu.clock += 2000;
+  await bridge.tick();
+  const [draft] = feishu.dms();
+  assert.match(draft, /【待确认】回 Anya：缓存问题，feishu 回到话题（消息 om_\d+）/);
+  assert.match(draft, /查过了：是缓存，已修。/);
+  assert.match(draft, /回「发」就按这个发出去/);
+  const draftDm = feishu.messages.find((m) => m.chat_id === OWNER_DM && m.sender.sender_type === 'app');
+  assert.equal(bridge.state.approvals[draftDm.message_id], attention.attention_id);
+  await bridge.tick();
+  assert.equal(feishu.dms().length, 1, 'the draft is DMed once');
+
+  // The owner approves without quoting: it is the only pending decision.
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '发', { from: OWNER });
+  await bridge.tick();
+  const sent = feishu.replies().find((r) => r.text === '查过了：是缓存，已修。');
+  assert.ok(sent, 'the bridge sent the approved text');
+  assert.equal(sent.target, at.message_id);
+  assert.equal(sent.uuid, 'bridge-action-qa-cache-1101');
+  const settled = context.hub.store.getAttention(attention.attention_id);
+  assert.equal(settled.status, 'executed');
+  assert.equal(settled.execution.message_id, sent.message_id);
+  assert.equal(settled.decided_by, '黄海斌');
+  assert.match(feishu.dms().at(-1), /已发出（回 Anya：缓存问题）：消息 om_\d+/);
+  const notice = await waitFor(() => driver.of('qa-a')[1]);
+  assert.match(notice.input, /已获批准并发出/);
+  assert.deepEqual(bridge.state.approvals, {});
+
+  // Replaying the approval event never sends twice.
+  bridge.state.eventCursor = null;
+  const before = feishu.replies().length;
+  await bridge.tick();
+  assert.equal(feishu.replies().length, before);
+});
+
+test('Feedback instead of 「发」 goes back to the seat; several pending decisions need a quote', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  const drafts = [];
+  driver.answers['qa-a'] = (command) => {
+    if (!/【跟进】飞书群/.test(command.input)) return 'done:qa-a';
+    const target = /"target":"(om_\d+)"/.exec(command.input)[1];
+    drafts.push(target);
+    return { text: '草稿', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target, text: `回复 ${target}` } };
+  };
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const a = feishu.post(FEEDBACK, '@_user_1 问题一', { mentions: [BOT] });
+  await bridge.tick();
+  await finished(context, (await waitFor(() => driver.of('qa-a')[0])).command_id);
+  feishu.clock += 2000;
+  const b = feishu.post(FEEDBACK, '@_user_1 问题二', { mentions: [BOT] });
+  await bridge.tick();
+  await finished(context, (await waitFor(() => driver.of('qa-a')[1])).command_id);
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.equal(Object.keys(bridge.state.approvals).length, 2);
+  assert.ok(a && b);
+
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '发', { from: OWNER });
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /有 2 条在等你决定，请引用/);
+  assert.equal(feishu.replies().length, 2, 'only the two acks went out');
+
+  const draftDms = feishu.messages.filter((m) => m.chat_id === OWNER_DM && /【待确认】/.test(messageText(m)));
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '太啰嗦，两句话', { from: OWNER, parentId: draftDms[0].message_id });
+  await bridge.tick();
+  const revise = await waitFor(() => driver.of('qa-a')[2]);
+  assert.match(revise.input, /没有被批准/);
+  assert.match(revise.input, /太啰嗦，两句话/);
+  assert.equal(Object.keys(bridge.state.approvals).length, 1);
+  assert.match(feishu.dms().at(-1), /已把你的意见发回/);
+});
+
+test('A question from a seat is DMed and the quoted reply answers it; a message to the owner needs no approval', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  driver.answers['qa-a'] = (command) => {
+    // The Channel wraps every command in the task's context, so the answer is matched first.
+    if (/问题：查 staging 还是 prod？/.test(command.input)) return { text: '查完了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'send', target: OWNER, text: 'prod 上有 3 条待验证。' } };
+    if (/【跟进】黄海斌 在飞书私信里/.test(command.input)) return { text: '要问', outcome: 'needs_input', question: '查 staging 还是 prod？' };
+    return 'done:qa-a';
+  };
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const ask = feishu.post(OWNER_DM, '看板上有几条待验证？', { from: OWNER });
+  await bridge.tick();
+  assert.ok(liveTask(context, `feishu-dm:${ask.message_id}`), 'an owner DM is a task of its own');
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(first.input, /"kind":"send","target":"ou_owner"/);
+  await finished(context, first.command_id);
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /【需要你回答】qa-a在任务「黄海斌私信：看板上有几条待验证？」里问：\n查 staging 还是 prod？/);
+  const questionDm = feishu.messages.filter((m) => m.chat_id === OWNER_DM && m.sender.sender_type === 'app').at(-1);
+  assert.equal(Object.values(bridge.state.questions)[0], context.hub.store.listAttentions({ status: 'open' })[0].attention_id);
+
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, 'prod', { from: OWNER, parentId: questionDm.message_id });
+  await bridge.tick();
+  const second = await waitFor(() => driver.of('qa-a')[1]);
+  assert.match(second.input, /回答：prod/);
+  await finished(context, second.command_id);
+  await waitFor(() => context.hub.store.listAttentions({ status: 'open' }).length === 1);
+  assert.deepEqual(bridge.state.questions, {});
+
+  // The result addressed to the owner is auto-approved and sent by the bridge.
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.ok(feishu.dms().includes('prod 上有 3 条待验证。'));
+  assert.equal(context.hub.store.listAttentions({ status: 'executed' }).length, 1);
+  assert.ok(!feishu.dms().some((text) => /【待确认】/.test(text)), 'no approval DM for a message to the approver');
+  assert.equal(context.hub.store.listTasks().length, 1, 'the owner\'s reply was an answer, not a new task');
+});
+
+test('No seat: the owner is told, and told differently when seats are merely busy', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  feishu.post(FEEDBACK, '@_user_1 没人在', { mentions: [BOT] });
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /没有可用的会话/);
+  const release = (() => { let r; const p = new Promise((resolve) => { r = resolve; }); driver.answers['qa-a'] = () => p.then(() => 'done:qa-a'); return r; })();
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  await waitFor(() => driver.of('qa-a')[0]);
+  feishu.clock += 2000;
+  feishu.post(FEEDBACK, '@_user_1 都在忙', { mentions: [BOT] });
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /都在忙/);
+  release();
+});
+
+test('Groups: a new group starts from now, a left group loses its cursor, one failing group does not stop the rest', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  feishu.chats.push({ chat_id: 'oc_new', name: '新群', external: false });
+  feishu.post('oc_new', '@_user_1 历史消息', { mentions: [BOT], at: feishu.clock - 60_000 });
+  await bridge.tick();
+  assert.equal(feishu.replies().length, 0, 'history before joining is not replayed');
+  assert.ok(bridge.state.cursor.oc_new);
+
+  feishu.chats = feishu.chats.filter((chat) => chat.chat_id !== ORDINARY);
+  await bridge.tick();
+  assert.equal(bridge.state.cursor[ORDINARY], undefined);
+
+  feishu.failing.add('/open-apis/im/v1/messages');
+  feishu.clock += 2000;
+  feishu.post(FEEDBACK, '@_user_1 失败期间', { mentions: [BOT] });
+  const before = bridge.state.cursor[FEEDBACK];
+  assert.equal(await bridge.tick(), 1);
+  assert.equal(bridge.state.cursor[FEEDBACK], before, 'a failed group keeps its cursor');
+  feishu.failing.clear();
+  assert.equal(await bridge.tick(), 0);
+  assert.equal(feishu.replies().length, 1, 'the message is handled once the group works again');
+  await waitFor(() => driver.of('qa-a')[0]);
+});
+
+test('When the chat list fails the known groups are still read', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  feishu.failing.add('/open-apis/im/v1/chats');
+  feishu.post(FEEDBACK, '@_user_1 群列表挂了', { mentions: [BOT] });
+  assert.equal(await bridge.tick(), 1);
+  assert.equal(feishu.replies().length, 1);
+  await waitFor(() => driver.of('qa-a')[0]);
+});
+
+test('Observe mode advances cursors but never acks, triggers, DMs or sends', async (t) => {
+  const { context, feishu, bridge } = await setup(t, { observe: true });
+  feishu.post(FEEDBACK, '@_user_1 只看不动', { mentions: [BOT] });
+  feishu.post(OWNER_DM, '随便说点什么', { from: OWNER });
+  assert.equal(await bridge.tick(), 0);
+  assert.equal(feishu.sent.length, 0);
+  assert.equal(context.hub.store.listTasks().length, 0);
+  assert.equal(Object.keys(bridge.state.handled).length, 2);
+});
+
+test('A send that fails is reported to the Hub as failed and the owner is told', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  driver.answers['qa-a'] = (command) => (/【跟进】飞书群/.test(command.input)
+    ? { text: '草稿', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '回复' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  feishu.post(FEEDBACK, '@_user_1 x', { mentions: [BOT] });
+  await bridge.tick();
+  await finished(context, (await waitFor(() => driver.of('qa-a')[0])).command_id);
+  feishu.clock += 2000;
+  await bridge.tick();
+  feishu.failing.add('reply');
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '发', { from: OWNER });
+  await bridge.tick();
+  assert.equal(context.hub.store.listAttentions({ status: 'failed' }).length, 1);
+  assert.match(feishu.dms().at(-1), /没发出去/);
+  const notice = await waitFor(() => driver.of('qa-a')[1]);
+  assert.match(notice.input, /渠道发送失败/);
+});
+
+test('Exhausted handoffs and long outages are reported to the owner once', async (t) => {
+  const { context, feishu, bridge } = await setup(t);
+  context.hub.emit('handoff.exhausted', { type: 'hub', id: 'roles' }, { task_id: 'task_x', payload: { role_key: 'qa', limit: 3 } });
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /交接了 3 次都没做完/);
+
+  feishu.failing.add('*');
+  feishu.clock += 11 * 60 * 1000;
+  await bridge.tick();
+  feishu.failing.clear();
+  feishu.failing.add('/open-apis/im/v1/chats'); // partial failure keeps the tick incomplete, but DMs work
+  await bridge.tick();
+  assert.match(feishu.dms().at(-1), /飞书桥已经 \d+ 分钟没有完整跑通一轮/);
+  const count = feishu.dms().length;
+  feishu.clock += 60 * 1000;
+  await bridge.tick();
+  assert.equal(feishu.dms().length, count, 'alerted once until a full tick succeeds');
+});

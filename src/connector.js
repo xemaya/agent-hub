@@ -10,15 +10,44 @@ import { readBuildInfo, shortCommit } from './build-info.js';
 import { commandPrompt } from './drivers/prompt.js';
 
 const PROGRESS_NOTE_LIMIT = 500;
-const REPORT_OUTCOMES = new Set(['done', 'needs_input', 'blocked', 'dropped']);
+const REPORT_OUTCOMES = new Set(['done', 'needs_input', 'blocked', 'dropped', 'needs_approval']);
+const ACTION_TEXT_LIMIT = 20000;
+
+// An outward action (a group reply, a post, a comment) that a person must
+// approve before the channel bridge carries it out. The Worker never holds the
+// channel's credentials; it only describes what should go out.
+export function approvalAction(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw localError('action is required when outcome is needs_approval');
+  const field = (name, max, { required = true } = {}) => {
+    const value = typeof input[name] === 'string' ? input[name].trim() : '';
+    if (required && !value) throw localError(`action.${name} is required`);
+    if (value.length > max) throw localError(`action.${name} must be at most ${max} characters`);
+    return value;
+  };
+  const action = {
+    channel: field('channel', 40),
+    kind: field('kind', 40),
+    target: field('target', 300),
+    text: field('text', ACTION_TEXT_LIMIT),
+  };
+  const key = field('key', 200, { required: false });
+  const note = field('note', 300, { required: false });
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(action.channel)) throw localError('action.channel must be lowercase letters, digits, - or _');
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(action.kind)) throw localError('action.kind must be lowercase letters, digits, - or _');
+  return { ...action, ...(key ? { key } : {}), ...(note ? { note } : {}) };
+}
 
 // Optional structured fields of a successful report. A question is required
 // when the Worker cannot continue without a person.
 export function reportOutcome(body) {
   if (body.outcome === undefined || body.outcome === null || body.outcome === '') return {};
-  if (!REPORT_OUTCOMES.has(body.outcome)) throw localError('outcome must be done, needs_input, blocked or dropped');
+  if (!REPORT_OUTCOMES.has(body.outcome)) throw localError('outcome must be done, needs_input, blocked, dropped or needs_approval');
   const question = typeof body.question === 'string' ? body.question.trim().slice(0, 2000) : '';
   if (['needs_input', 'blocked'].includes(body.outcome) && !question) throw localError('question is required when outcome is needs_input or blocked');
+  if (body.outcome === 'needs_approval') {
+    const action = approvalAction(body.action);
+    return { outcome: body.outcome, action, question: question || action.note || `${action.channel} ${action.kind} → ${action.target}` };
+  }
   return { outcome: body.outcome, ...(question ? { question } : {}) };
 }
 

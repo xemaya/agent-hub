@@ -924,7 +924,7 @@ function renderAttentions() {
   const count = state.attentions.length + state.handoffs.length;
   panel.hidden = count === 0;
   $('#attention-count').textContent = count ? `${count} 项` : '';
-  $('#attention-list').innerHTML = state.handoffs.map(handoffCard).join('') + state.attentions.map((attention) => `
+  $('#attention-list').innerHTML = state.handoffs.map(handoffCard).join('') + state.attentions.map((attention) => (attention.outcome === 'needs_approval' ? approvalCard(attention) : `
     <form class="attention-card" data-attention-id="${escapeHtml(attention.attention_id)}">
       <p class="attention-meta">${escapeHtml(attention.worker_name ?? '数字员工')}${attention.task_title ? ` · ${escapeHtml(attention.task_title)}` : ''} · ${escapeHtml(attention.outcome === 'blocked' ? '被卡住' : '需要你回答')} · ${escapeHtml(time(attention.created_at))}</p>
       <p class="attention-question">${escapeHtml(attention.question)}</p>
@@ -934,7 +934,27 @@ function renderAttentions() {
         <button class="button button-quiet" type="button" data-attention-dismiss>不用处理</button>
         <button class="button button-accent" type="submit">回答</button>
       </div>
-    </form>`).join('');
+    </form>`)).join('');
+}
+
+// An outward action waiting for approval: the exact text is shown, approving
+// hands it to the channel bridge, anything typed goes back as feedback.
+function approvalCard(attention) {
+  const action = attention.action ?? {};
+  const where = `${action.channel ?? ''} ${action.kind ?? ''} → ${action.target ?? ''}`.trim();
+  return `
+    <form class="attention-card is-approval" data-attention-id="${escapeHtml(attention.attention_id)}">
+      <p class="attention-meta">${escapeHtml(attention.worker_name ?? '数字员工')}${attention.task_title ? ` · ${escapeHtml(attention.task_title)}` : ''} · 等你批准发出 · ${escapeHtml(where)} · ${escapeHtml(time(attention.created_at))}</p>
+      ${action.note ? `<p class="attention-question">${escapeHtml(action.note)}</p>` : ''}
+      <pre class="attention-draft">${escapeHtml(action.text ?? attention.question)}</pre>
+      <label class="sr-only" for="answer-${escapeHtml(attention.attention_id)}">修改意见</label>
+      <textarea id="answer-${escapeHtml(attention.attention_id)}" name="answer" rows="2" maxlength="20000" placeholder="不批准时写修改意见，会发回给员工改；批准直接点右边"></textarea>
+      <div class="attention-actions">
+        <button class="button button-quiet" type="button" data-attention-dismiss>不用发了</button>
+        <button class="button" type="submit">发回修改</button>
+        <button class="button button-accent" type="button" data-attention-approve>批准发出</button>
+      </div>
+    </form>`;
 }
 
 function render() {
@@ -1146,12 +1166,14 @@ $('#attention-list').addEventListener('submit', async (event) => {
   }
 });
 $('#attention-list').addEventListener('click', async (event) => {
-  const button = event.target.closest('[data-attention-dismiss]');
+  const button = event.target.closest('[data-attention-dismiss], [data-attention-approve]');
   if (!button) return;
   const form = button.closest('[data-attention-id]');
+  const approve = button.hasAttribute('data-attention-approve');
   button.disabled = true;
   try {
-    await api(`/api/v1/attentions/${encodeURIComponent(form.dataset.attentionId)}/dismiss`, { method: 'POST', body: {} });
+    await api(`/api/v1/attentions/${encodeURIComponent(form.dataset.attentionId)}/${approve ? 'approve' : 'dismiss'}`, { method: 'POST', body: {} });
+    if (approve) toast('已批准，渠道正在发出');
     await refresh();
   } catch (error) {
     toast(error.message, true);

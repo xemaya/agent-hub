@@ -78,7 +78,7 @@ export class KimiChannel {
         status: 'succeeded',
         result: result.text,
         output_gap: result.output_gap === true,
-        ...(result.outcome ? { outcome: result.outcome, question: result.question } : {}),
+        ...(result.outcome ? { outcome: result.outcome, question: result.question, ...(result.action ? { action: result.action } : {}) } : {}),
       });
     } catch (error) {
       if (this.stopped) return;

@@ -1,0 +1,28 @@
+[Unit]
+Description=Agent Hub Feishu channel bridge
+After=network-online.target agent-hub-hub.service
+Wants=network-online.target
+Requires=agent-hub-hub.service
+
+[Service]
+Type=simple
+User=agent-hub
+Group=agent-hub
+WorkingDirectory=/opt/agent-hub/app
+Environment=HOME=/var/lib/agent-hub
+Environment=PATH=/opt/agent-hub/node/bin:/usr/local/bin:/usr/bin:/bin
+# Secrets stay in 0600 files named by the config (app_secret_file, admin_token_file); nothing here.
+ExecStart=/opt/agent-hub/node/bin/node /opt/agent-hub/app/bin/agent-hub.js bridge feishu --config /var/lib/agent-hub/bridge/feishu.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-hub/bridge
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

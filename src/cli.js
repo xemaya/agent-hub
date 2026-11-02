@@ -8,6 +8,7 @@ import { readBuildInfo, shortCommit } from './build-info.js';
 import { selfUpdate } from './updater.js';
 import { connectorServiceStatus, installConnectorService, uninstallConnectorService } from './service.js';
 import { ChannelServer } from './channel.js';
+import { FeishuBridge, loadConfig } from './bridge-feishu.js';
 import { CodexQueueChannel, bridgeLock, checkNativeQueue, commandRecord, currentDesktopPid, startQueueBridge } from './codex-queue-channel.js';
 
 const HELP = `Agent Hub
@@ -23,6 +24,7 @@ Usage:
   agent-hub session start --runtime claude|kimi --push [--resume SESSION_ID] [--data-dir DIR]
   agent-hub session start --runtime kimi --push --native-tui [--resume SESSION_ID] [--cwd DIR]
   agent-hub channel [--data-dir DIR]           (spawned by Claude Code for --push sessions)
+  agent-hub bridge feishu --config FILE [--once] [--observe] [--interval-ms 60000] [--status]
   agent-hub desktop attach --push [--name NAME] [--cwd DIR] [--data-dir DIR]
   agent-hub desktop report --command-id ID --status succeeded|failed
                          [--outcome done|needs_input|blocked|dropped] [--question TEXT] [--data-dir DIR] < result.txt
@@ -55,7 +57,7 @@ Usage:
   agent-hub role list | set KEY [--name NAME] [--description TEXT] [--takeover-after-ms MS] [--workdir DIR|none]
   agent-hub role assign WORKER_ID --role KEY | unassign WORKER_ID
   agent-hub handoff list [--status open|dispatched|cancelled|all]
-  agent-hub attention list|answer|dismiss [ATTENTION_ID] [--answer TEXT]
+  agent-hub attention list|answer|dismiss|approve [ATTENTION_ID] [--answer TEXT]
   agent-hub orchestration list [--local]
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub history clear --yes
@@ -72,7 +74,7 @@ Environment:
   AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS      Other command timeout (default 3600000)
 `;
 
-const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread', 'followup-only']);
+const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread', 'followup-only', 'observe']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -670,6 +672,51 @@ async function orchestrationCommand(positionals, flags) {
   print(await request(flags, flags.local ? '/local/v1/orchestrations' : '/api/v1/orchestrations'));
 }
 
+// The Feishu channel bridge runs beside the Hub. Secrets never sit in the config
+// file: the app secret and the Admin token are read from 0600 files (or env).
+async function bridgeCommand(positionals, flags) {
+  if (positionals[0] !== 'feishu' || !flags.config) throw new Error('Usage: agent-hub bridge feishu --config FILE [--once] [--observe] [--interval-ms 60000] [--status]');
+  const configPath = path.resolve(flags.config);
+  const config = loadConfig(JSON.parse(await readFile(configPath, 'utf8')));
+  const secretFrom = async (envName, fileKey) => {
+    if (process.env[envName]) return process.env[envName].trim();
+    if (!config[fileKey]) throw new Error(`Set ${envName} or ${fileKey} in the bridge config`);
+    return (await readFile(path.resolve(path.dirname(configPath), config[fileKey]), 'utf8')).trim();
+  };
+  const appSecret = await secretFrom('AGENT_HUB_FEISHU_APP_SECRET', 'app_secret_file');
+  let adminToken = process.env.AGENT_HUB_ADMIN_TOKEN;
+  if (!adminToken) {
+    if (!config.admin_token_file) throw new Error('Set AGENT_HUB_ADMIN_TOKEN or admin_token_file in the bridge config');
+    const stored = JSON.parse(await readFile(path.resolve(path.dirname(configPath), config.admin_token_file), 'utf8'));
+    adminToken = stored.adminToken ?? stored.token;
+    if (!adminToken) throw new Error(`${config.admin_token_file} has no adminToken`);
+  }
+  const stateFile = path.resolve(path.dirname(configPath), config.state_file ?? 'feishu-bridge-state.json');
+  const bridge = await FeishuBridge.create({ config, stateFile, observe: flags.observe === true, appSecret, adminToken });
+  if (flags.status === true) {
+    print(bridge.status());
+    return;
+  }
+  if (flags.once === true) {
+    process.exitCode = await bridge.tick();
+    return;
+  }
+  const interval = milliseconds(flags['interval-ms'], 60000);
+  let stopped = false;
+  const loop = (async () => {
+    while (!stopped) {
+      try {
+        await bridge.tick();
+      } catch (error) {
+        console.error(`${new Date().toISOString()} bridge tick crashed: ${error.message}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, interval));
+    }
+  })();
+  console.log(`Feishu bridge for role ${config.role} running${flags.observe === true ? ' in observe mode (no acks, triggers, DMs or sends)' : ''}; state ${stateFile}`);
+  await waitForSignal(async () => { stopped = true; await loop; });
+}
+
 async function historyCommand(positionals, flags) {
   if (positionals[0] !== 'clear') throw new Error('Usage: agent-hub history clear --yes');
   if (flags.yes !== true) throw new Error('History clearing requires explicit --yes; a database backup is created first');
@@ -696,6 +743,10 @@ export async function run(argv) {
   }
   if (command === 'channel') {
     await channelCommand(flags);
+    return;
+  }
+  if (command === 'bridge') {
+    await bridgeCommand(positionals.slice(1), flags);
     return;
   }
   if (command === 'desktop') {
@@ -803,7 +854,7 @@ export async function run(argv) {
       print(await adminRequest(flags, `/api/v1/attentions?status=${encodeURIComponent(flags.status ?? 'open')}`));
       return;
     }
-    if (!['answer', 'dismiss'].includes(action) || !positionals[2]) throw new Error('Usage: agent-hub attention list|answer|dismiss ATTENTION_ID [--answer TEXT]');
+    if (!['answer', 'dismiss', 'approve'].includes(action) || !positionals[2]) throw new Error('Usage: agent-hub attention list|answer|dismiss|approve ATTENTION_ID [--answer TEXT]');
     if (action === 'answer' && !flags.answer) throw new Error('--answer is required');
     print(await adminRequest(flags, `/api/v1/attentions/${encodeURIComponent(positionals[2])}/${action}`, {
       method: 'POST', body: action === 'answer' ? { answer: flags.answer } : {},

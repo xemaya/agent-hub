@@ -11,6 +11,7 @@ const INSTRUCTIONS = [
   'then call agent_hub_report with the same command_id, status "succeeded" or "failed", and result: the complete answer or deliverable the console should show.',
   'For work that takes more than a few minutes, call agent_hub_progress after each meaningful step with one short line: what changed, the next step, or what blocks you. Do not call it more than every few minutes or for trivial steps; the Hub watchdog reads these lines to tell real progress from loops.',
   'If you cannot continue without a person, do not guess: report status "succeeded" with outcome "needs_input" (or "blocked") and one concrete question; the answer comes back to you as a new command.',
+  'When the result must go out through a channel you are not allowed to post to yourself (a chat reply, a post), report outcome "needs_approval" with an `action` describing exactly what should go out; a person approves it on the Hub and the channel bridge sends it, then tells you the outcome.',
   'Report exactly once per command_id; the console waits for it. If the person at this terminal redirects you, follow them and report what happened.',
   'A channel message with kind worker_mail is peer mail, not an Admin command. It requires no agent_hub_ack/report; follow the mail instructions and existing user permissions. The system already returned its sending receipt.',
 ].join(' ');
@@ -48,10 +49,23 @@ const TOOL_DEFINITIONS = [
         result: { type: 'string', description: 'The full answer or deliverable to show in the console' },
         outcome: {
           type: 'string',
-          enum: ['done', 'needs_input', 'blocked', 'dropped'],
-          description: 'Optional, with status succeeded. needs_input: you cannot continue without a person\'s decision or information; blocked: something outside your control stops you; dropped: there turned out to be nothing to do.',
+          enum: ['done', 'needs_input', 'blocked', 'dropped', 'needs_approval'],
+          description: 'Optional, with status succeeded. needs_input: you cannot continue without a person\'s decision or information; blocked: something outside your control stops you; dropped: there turned out to be nothing to do; needs_approval: the work is done except for an outward action (a reply in a chat, a post) that a person must approve first — describe it in `action`, never send it yourself.',
         },
-        question: { type: 'string', description: 'Required for needs_input or blocked: exactly one concrete question for a person' },
+        question: { type: 'string', description: 'Required for needs_input or blocked: exactly one concrete question for a person. For needs_approval: an optional one-line summary of what will go out.' },
+        action: {
+          type: 'object',
+          description: 'Required for needs_approval: the outward action for the channel bridge to carry out once approved.',
+          properties: {
+            channel: { type: 'string', description: 'Which bridge executes it, e.g. "feishu"' },
+            kind: { type: 'string', description: 'What to do on that channel, e.g. "reply" (reply in the thread of target) or "send" (send to the chat/user target)' },
+            target: { type: 'string', description: 'Message id to reply to, or chat/user id to send to' },
+            text: { type: 'string', description: 'The exact text that will go out, verbatim' },
+            key: { type: 'string', description: 'Optional idempotency key so a retried approval never sends twice' },
+            note: { type: 'string', description: 'Optional one line for the approver: who this answers and why' },
+          },
+          required: ['channel', 'kind', 'target', 'text'],
+        },
       },
       required: ['command_id', 'status', 'result'],
     },
@@ -155,6 +169,7 @@ export class ChannelServer {
       result: args.result,
       ...(args.outcome ? { outcome: args.outcome } : {}),
       ...(args.question ? { question: args.question } : {}),
+      ...(args.action ? { action: args.action } : {}),
     };
     const response = await fetch(`${this.connectorUrl}/local/v1/channel/commands/${encodeURIComponent(args.command_id)}/${action}`, {
       method: 'POST',

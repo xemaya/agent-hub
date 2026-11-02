@@ -46,7 +46,7 @@ test('v2 orchestration schema migrates without losing old records', async (t) =>
   assert.ok(columns.includes('auto_start'));
   assert.ok(columns.includes('source_message_id'));
   assert.ok(columns.includes('review_reason'));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 16);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 17);
   assert.ok(store.db.prepare('PRAGMA table_info(tasks)').all().some((column) => column.name === 'deleted_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(workers)').all().some((column) => column.name === 'retired_at'));
   assert.ok(store.db.prepare('PRAGMA table_info(coordinator_chat_messages)').all().some((column) => column.name === 'mentions_json'));
@@ -198,5 +198,43 @@ test('interactive-only migration preserves Worker identity, work history and Coo
   assert.equal(store.getCommand(command.command_id).sender_worker_id, null);
   assert.equal(store.getCommand(command.command_id).last_activity_at, command.created_at);
   assert.equal(store.getCoordinatorConfig().worker_id, worker.worker_id);
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 16);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 17);
+});
+
+test('Schema 16 attentions are rebuilt for approval statuses without losing rows', async (t) => {
+  const root = await databaseRoot(t);
+  const filename = path.join(root, 'hub.db');
+  let store = new HubStore(filename);
+  const connector = store.createConnector({ name: 'mac', tokenHash: 'hash' });
+  const worker = store.registerWorker(connector.connector_id, {
+    name: 'qa', runtime: 'claude', mode: 'external', runtime_session_id: 'sess-1', cwd: root, capabilities: [], metadata: {},
+  });
+  const task = store.createTask({ title: 'Ask', assignee_worker_id: worker.worker_id });
+  const command = store.createCommand({ worker_id: worker.worker_id, task_id: task.task_id, input: 'q', push_capable: true });
+  const attention = store.createAttention({ commandId: command.command_id, taskId: task.task_id, workerId: worker.worker_id, outcome: 'needs_input', question: '哪个账号？' });
+  // Back to the schema-16 shape: narrow CHECK, no action columns.
+  store.db.exec(`
+    CREATE TABLE attentions_v16 (
+      attention_id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, task_id TEXT, worker_id TEXT NOT NULL,
+      orchestration_id TEXT, step_key TEXT, outcome TEXT NOT NULL, question TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('open', 'answered', 'dismissed')), answer TEXT, answer_command_id TEXT,
+      created_at TEXT NOT NULL, resolved_at TEXT
+    );
+    INSERT INTO attentions_v16 SELECT attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question,
+      status, answer, answer_command_id, created_at, resolved_at FROM attentions;
+    DROP TABLE attentions;
+    ALTER TABLE attentions_v16 RENAME TO attentions;
+    PRAGMA user_version = 16;
+  `);
+  store.close();
+
+  store = new HubStore(filename);
+  const migrated = store.getAttention(attention.attention_id);
+  assert.equal(migrated.question, '哪个账号？');
+  assert.equal(migrated.status, 'open');
+  assert.equal(migrated.action, null);
+  assert.equal(store.resolveAttention(attention.attention_id, { status: 'approved', decidedBy: 'owner' }).changed, true);
+  assert.equal(store.settleAttention(attention.attention_id, { status: 'executed', execution: { message_id: 'om_1' } }).attention.execution.message_id, 'om_1');
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 17);
+  store.close();
 });

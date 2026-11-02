@@ -21,7 +21,10 @@ const STATIC_FILES = new Map([
   ['/markdown.js', ['markdown.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
-const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked']);
+const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked', 'needs_approval']);
+// Only a question can be answered by a message in the task's thread; an
+// approval is a decision for the owner, never for whoever writes next.
+const ANSWERABLE_OUTCOMES = ['needs_input', 'blocked'];
 const WORK_COMMAND_KINDS = new Set(['prompt', 'handoff', 'review_request', 'status_request']);
 const TASK_STATUSES = new Set(['ready', 'in_progress', 'blocked', 'review', 'done', 'cancelled']);
 const WORK_STATES = new Set(['idle', 'working', 'waiting', 'blocked']);
@@ -403,12 +406,15 @@ export class Hub {
     if (!ATTENTION_OUTCOMES.has(outcome)) return null;
     const question = String(command.result?.question ?? '').trim()
       || String(command.result?.text ?? '').trim().slice(0, 1000) || '需要人工决定';
+    const action = outcome === 'needs_approval' && command.result?.action && typeof command.result.action === 'object' ? command.result.action : null;
+    if (outcome === 'needs_approval' && !action) return null;
     const attention = this.store.createAttention({
       commandId: command.command_id,
       taskId: command.task_id,
       workerId: command.worker_id,
       outcome,
       question,
+      action,
     });
     if (command.task_id) {
       const task = this.store.updateTask(command.task_id, { status: 'blocked' });
@@ -434,35 +440,26 @@ export class Hub {
     let handoff = null;
     // Resolve first so a handoff package built for a new seat does not list
     // the question as still open.
-    const resolve = () => this.store.resolveAttention(attentionId, { status: 'answered', answer: text, answerCommandId: commandId }).attention;
+    const resolve = () => this.store.resolveAttention(attentionId, { status: 'answered', answer: text, answerCommandId: commandId, decidedBy: actor.id }).attention;
     let resolved = null;
     if (!step) {
-      const task = attention.task_id ? this.store.getTask(attention.task_id) : null;
-      const input = [
-        `命令 ${attention.command_id} 里提出的问题有了回答，请在原任务范围内继续，完成后照常回报。`,
-        `问题：${attention.question}`,
-        `回答：${text}`,
-        `需要回看那次的完整回报：${resultPointer(attention.command_id)}`,
-      ].join('\n\n');
-      if (task?.role_key && !task.deleted_at) {
-        resolved = resolve();
-        const delivered = this.roles.deliver(task, input, { reason: 'answer', actor });
-        handoff = delivered.handoff;
-        commandId = delivered.command?.command_id ?? null;
-        if (commandId) resolved = this.store.setAttentionAnswerCommand(attentionId, commandId);
-      } else {
-        const worker = this.store.getWorker(attention.worker_id);
-        if (!worker || worker.retired_at) throw protocolError('The Worker that asked is no longer available', 409, 'worker_retired');
-        const command = this.store.createCommand({
-          task_id: task && !task.deleted_at ? task.task_id : null,
-          worker_id: worker.worker_id,
-          kind: 'prompt',
-          input,
-          push_capable: worker.push_capable,
-        });
-        commandId = command.command_id;
-        this.dispatch(command);
-      }
+      const input = attention.outcome === 'needs_approval'
+        ? [
+          `你在命令 ${attention.command_id} 里提交待审批的对外内容（${attention.action?.channel ?? ''} ${attention.action?.kind ?? ''} → ${attention.action?.target ?? ''}）没有被批准，审批人说：`,
+          text,
+          '如果这是修改意见，按它改好后重新用 outcome needs_approval 提交；如果是不用发了，回报 done 并说明。什么都没有发出去。',
+          `需要回看那次的完整回报：${resultPointer(attention.command_id)}`,
+        ].join('\n\n')
+        : [
+          `命令 ${attention.command_id} 里提出的问题有了回答，请在原任务范围内继续，完成后照常回报。`,
+          `问题：${attention.question}`,
+          `回答：${text}`,
+          `需要回看那次的完整回报：${resultPointer(attention.command_id)}`,
+        ].join('\n\n');
+      const delivered = this.instructAttentionOwner(attention, input, { actor, beforeDispatch: () => { resolved = resolve(); } });
+      handoff = delivered.handoff;
+      commandId = delivered.command?.command_id ?? null;
+      if (resolved && commandId) resolved = this.store.setAttentionAnswerCommand(attentionId, commandId);
     }
     resolved ??= resolve();
     this.emit('attention.answered', actor, {
@@ -474,6 +471,85 @@ export class Hub {
     this.broadcast('attention.updated', { attention: resolved });
     this.scheduleCoordinator();
     return resolved;
+  }
+
+  // A new instruction for the Worker that raised an Attention: through its
+  // Role when the task has one (so a gone seat hands off), else to it directly.
+  instructAttentionOwner(attention, input, { actor, beforeDispatch = () => {} }) {
+    const task = attention.task_id ? this.store.getTask(attention.task_id) : null;
+    if (task?.role_key && !task.deleted_at) {
+      beforeDispatch();
+      return this.roles.deliver(task, input, { reason: 'answer', actor });
+    }
+    const worker = this.store.getWorker(attention.worker_id);
+    if (!worker || worker.retired_at) throw protocolError('The Worker that asked is no longer available', 409, 'worker_retired');
+    beforeDispatch();
+    const command = this.store.createCommand({
+      task_id: task && !task.deleted_at ? task.task_id : null,
+      worker_id: worker.worker_id,
+      kind: 'prompt',
+      input,
+      push_capable: worker.push_capable,
+    });
+    this.dispatch(command);
+    return { command, handoff: null };
+  }
+
+  // The owner approves an outward action. Nothing goes out here: the channel
+  // bridge that owns `action.channel` picks up the approval and executes it.
+  approveAttention(attentionId, actor = { type: 'admin', id: 'admin' }) {
+    const attention = this.store.getAttention(attentionId);
+    if (!attention) throw protocolError('Attention not found', 404, 'attention_not_found');
+    if (attention.outcome !== 'needs_approval') throw protocolError('Only a needs_approval Attention can be approved', 409, 'attention_not_approval');
+    const { attention: approved, changed } = this.store.resolveAttention(attentionId, { status: 'approved', decidedBy: actor.id });
+    if (!changed) throw protocolError('Attention is already resolved', 409, 'attention_resolved');
+    this.emit('attention.approved', actor, {
+      worker_id: attention.worker_id,
+      task_id: attention.task_id,
+      command_id: attention.command_id,
+      payload: { attention_id: attentionId, action: attention.action },
+    });
+    this.broadcast('attention.updated', { attention: approved });
+    return approved;
+  }
+
+  // The bridge reports what happened to an approved action. The Worker that
+  // asked hears the outcome so it can close the task or try again.
+  settleAttention(attentionId, { status, result = null, error = null }, actor = { type: 'admin', id: 'admin' }) {
+    const attention = this.store.getAttention(attentionId);
+    if (!attention) throw protocolError('Attention not found', 404, 'attention_not_found');
+    if (!['executed', 'failed'].includes(status)) throw protocolError('status must be executed or failed', 400, 'invalid_status');
+    if (attention.status !== 'approved') throw protocolError('Attention is not approved', 409, 'attention_not_approved');
+    const execution = status === 'executed'
+      ? { ...(result && typeof result === 'object' ? result : {}), by: actor.id }
+      : { error: optionalString(error, 'execution failed').slice(0, 2000), by: actor.id };
+    const { attention: settled, changed } = this.store.settleAttention(attentionId, { status, execution });
+    if (!changed) throw protocolError('Attention is already settled', 409, 'attention_resolved');
+    const where = `${attention.action?.channel ?? ''} ${attention.action?.kind ?? ''} → ${attention.action?.target ?? ''}`;
+    const input = status === 'executed'
+      ? [
+        `你在命令 ${attention.command_id} 里提交的对外内容已获批准并发出（${where}${result?.message_id ? `，消息 ${result.message_id}` : ''}）。`,
+        '不要再发一遍。如果这个任务没有别的事了，回报 outcome done 并把任务改成 done；否则继续剩下的部分。',
+      ].join('\n\n')
+      : [
+        `你在命令 ${attention.command_id} 里提交的对外内容已获批准，但渠道发送失败：${execution.error}`,
+        '什么都没有发出去。查明原因后重新用 outcome needs_approval 提交，或回报 blocked 说明。',
+      ].join('\n\n');
+    let delivered = { command: null, handoff: null };
+    try {
+      delivered = this.instructAttentionOwner(attention, input, { actor });
+    } catch (error) {
+      if (error.code !== 'worker_retired') throw error;
+    }
+    this.emit(`attention.${status}`, actor, {
+      worker_id: attention.worker_id,
+      task_id: attention.task_id,
+      command_id: delivered.command?.command_id ?? attention.command_id,
+      payload: { attention_id: attentionId, execution, ...(delivered.handoff ? { handoff_id: delivered.handoff.handoff_id } : {}) },
+    });
+    this.broadcast('attention.updated', { attention: settled });
+    this.scheduleCoordinator();
+    return settled;
   }
 
   dismissAttention(attentionId) {
@@ -489,12 +565,14 @@ export class Hub {
   // thread_key is the subscription: while a live Task follows the thread, its
   // later messages go straight to the Task's assignee (or answer its open
   // question) without the Coordinator. trigger_key makes delivery idempotent.
+  // Comes from a Connector (a tool on some Mac) or, with `connectorId` null,
+  // from an Admin-authenticated source such as a channel bridge.
   receiveTrigger(connectorId, payload) {
     const triggerKey = requiredString(payload.trigger_key, 'trigger_key', { max: 300 });
     const threadKey = requiredString(payload.thread_key, 'thread_key', { max: 300 });
     const source = requiredString(payload.source ?? 'external', 'source', { max: 60 });
     const text = requiredString(payload.text, 'text', { max: 20000 });
-    const actor = { type: 'connector', id: connectorId };
+    const actor = connectorId ? { type: 'connector', id: connectorId } : { type: 'source', id: source };
     const previous = this.store.getTrigger(triggerKey);
     if (previous) {
       return { routed: previous.routed, duplicate: true, task: previous.task_id ? this.store.getTask(previous.task_id) : null, command_id: previous.command_id };
@@ -506,7 +584,7 @@ export class Hub {
     let created = null;
     let handoff = null;
     if (task) {
-      const open = this.store.openAttentionForTask(task.task_id);
+      const open = this.store.openAttentionForTask(task.task_id, { outcomes: ANSWERABLE_OUTCOMES });
       const followup = [
         `【跟进】你负责的任务 ${task.task_number ? `#${String(task.task_number).padStart(4, '0')} ` : ''}「${task.title}」所在的话题（${threadKey}）有新消息，直接转给你，没有经过中央大脑。`,
         '它可能是补充、追问、感谢或与任务无关；在任务范围内处理，不需要回应的就简短回报「无需处理」。超出任务范围的新工作不要做，回报时说明。',
@@ -550,8 +628,8 @@ export class Hub {
       handoff = this.roles.enqueue(created, { reason: 'initial', input: text, actor });
     } else if (payload.followup_only !== true) {
       const workerId = requiredString(payload.worker_id, 'worker_id', { max: 100 });
-      const worker = this.store.getWorkerForConnector(workerId, connectorId);
-      if (!worker || worker.retired_at) throw protocolError('Worker does not belong to this connector', 403, 'worker_forbidden');
+      const worker = connectorId ? this.store.getWorkerForConnector(workerId, connectorId) : this.store.getWorker(workerId);
+      if (!worker || worker.retired_at) throw protocolError(connectorId ? 'Worker does not belong to this connector' : 'Worker not found', connectorId ? 403 : 404, 'worker_forbidden');
       created = this.store.createTask({
         title: requiredString(payload.title ?? text.slice(0, 80), 'title', { max: 300 }),
         goal: optionalString(payload.goal, text),
@@ -974,17 +1052,44 @@ export class Hub {
       sendJson(response, 200, { attentions: this.store.listAttentions({ status: status === 'all' ? null : status }) });
       return;
     }
-    const attentionMatch = /^\/api\/v1\/attentions\/([^/]+)\/(answer|dismiss)$/.exec(pathname);
+    const attentionGet = /^\/api\/v1\/attentions\/([^/]+)$/.exec(pathname);
+    if (request.method === 'GET' && attentionGet) {
+      const attention = this.store.getAttention(decodeURIComponent(attentionGet[1]));
+      if (attention) sendJson(response, 200, { attention });
+      else sendJson(response, 404, { error: 'Attention not found' });
+      return;
+    }
+    const attentionMatch = /^\/api\/v1\/attentions\/([^/]+)\/(answer|dismiss|approve|execution)$/.exec(pathname);
     if (request.method === 'POST' && attentionMatch) {
       const body = await readJsonBody(request);
-      const attention = attentionMatch[2] === 'answer'
-        ? this.answerAttention(attentionMatch[1], body.answer)
-        : this.dismissAttention(attentionMatch[1]);
+      const attentionId = decodeURIComponent(attentionMatch[1]);
+      const by = body.by === undefined ? 'admin' : requiredString(body.by, 'by', { max: 100 });
+      const actor = { type: 'admin', id: by };
+      const attention = {
+        answer: () => this.answerAttention(attentionId, body.answer, actor),
+        dismiss: () => this.dismissAttention(attentionId),
+        approve: () => this.approveAttention(attentionId, actor),
+        execution: () => this.settleAttention(attentionId, { status: body.status, result: body.result, error: body.error }, actor),
+      }[attentionMatch[2]]();
       sendJson(response, 200, { attention });
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/events') {
+      if (url.searchParams.has('after')) {
+        const types = url.searchParams.get('types')?.split(',').map((type) => type.trim()).filter(Boolean) ?? null;
+        const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 200, 1), 1000);
+        const events = this.store.listEventsAfter(url.searchParams.get('after') || null, { limit, types });
+        if (!events) sendJson(response, 404, { error: 'Unknown event cursor; start again without `after` to get the current position' });
+        else sendJson(response, 200, { events, cursor: events.at(-1)?.event_id ?? (url.searchParams.get('after') || this.store.latestEventId()) });
+        return;
+      }
       sendJson(response, 200, { events: this.store.listEvents() });
+      return;
+    }
+    // A channel bridge or another Admin-side source delivers an external event.
+    if (request.method === 'POST' && pathname === '/api/v1/triggers') {
+      const body = await readJsonBody(request);
+      sendJson(response, 200, this.receiveTrigger(null, body));
       return;
     }
     if (request.method === 'GET' && pathname === '/api/v1/commands') {

@@ -464,5 +464,6 @@ button:disabled { cursor: wait; }
 .attention-meta { margin: 0 0 6px; color: var(--muted); font-size: 11px; }
 .attention-card.is-handoff .attention-question { margin: 0; color: var(--muted); font-size: 13px; }
 .attention-question { margin: 0 0 10px; color: var(--ink); font-size: 14px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.attention-draft { margin: 0 0 10px; padding: 10px 12px; max-height: 320px; overflow: auto; border: 1px dashed var(--line); background: var(--paper); color: var(--ink); font: inherit; font-size: 13px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
 .attention-card textarea { display: block; width: 100%; padding: 8px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font-size: 13px; line-height: 1.6; resize: vertical; }
 .attention-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }

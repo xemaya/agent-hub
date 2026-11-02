@@ -172,9 +172,14 @@ function attentionView(row) {
     step_key: row.step_key ?? null,
     outcome: row.outcome,
     question: row.question,
+    // needs_approval: the outward action waiting for a person's approval; the
+    // channel bridge that owns `action.channel` executes it once approved.
+    action: row.action_json ? parseJson(row.action_json, null) : null,
     status: row.status,
     answer: row.answer ?? null,
     answer_command_id: row.answer_command_id ?? null,
+    decided_by: row.decided_by ?? null,
+    execution: row.execution_json ? parseJson(row.execution_json, null) : null,
     created_at: row.created_at,
     resolved_at: row.resolved_at ?? null,
   };
@@ -391,9 +396,12 @@ export class HubStore {
         step_key TEXT,
         outcome TEXT NOT NULL,
         question TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('open', 'answered', 'dismissed')),
+        status TEXT NOT NULL CHECK(status IN ('open', 'answered', 'dismissed', 'approved', 'executed', 'failed')),
         answer TEXT,
         answer_command_id TEXT,
+        action_json TEXT,
+        execution_json TEXT,
+        decided_by TEXT,
         created_at TEXT NOT NULL,
         resolved_at TEXT
       );
@@ -493,6 +501,37 @@ export class HubStore {
     if (!commandColumns.has('last_activity_at')) {
       this.db.exec('ALTER TABLE commands ADD COLUMN last_activity_at TEXT');
     }
+    // schema 17: approval Attentions need new statuses, and SQLite cannot widen
+    // a CHECK constraint in place, so the table is rebuilt once.
+    const attentionColumns = new Set(this.db.prepare('PRAGMA table_info(attentions)').all().map((column) => column.name));
+    if (!attentionColumns.has('action_json')) {
+      this.db.exec(`
+        CREATE TABLE attentions_v17 (
+          attention_id TEXT PRIMARY KEY,
+          command_id TEXT NOT NULL UNIQUE REFERENCES commands(command_id),
+          task_id TEXT REFERENCES tasks(task_id),
+          worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+          orchestration_id TEXT,
+          step_key TEXT,
+          outcome TEXT NOT NULL,
+          question TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('open', 'answered', 'dismissed', 'approved', 'executed', 'failed')),
+          answer TEXT,
+          answer_command_id TEXT,
+          action_json TEXT,
+          execution_json TEXT,
+          decided_by TEXT,
+          created_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        INSERT INTO attentions_v17 (attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question,
+          status, answer, answer_command_id, created_at, resolved_at)
+          SELECT attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question,
+            status, answer, answer_command_id, created_at, resolved_at FROM attentions;
+        DROP TABLE attentions;
+        ALTER TABLE attentions_v17 RENAME TO attentions;
+      `);
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS task_number_sequence (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -519,7 +558,7 @@ export class HubStore {
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
     `);
     this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 16');
+    this.db.exec('PRAGMA user_version = 17');
   }
 
   close() {
@@ -1200,14 +1239,14 @@ export class HubStore {
     return this.getTrigger(triggerKey);
   }
 
-  createAttention({ commandId, taskId = null, workerId, orchestrationId = null, stepKey = null, outcome, question }) {
+  createAttention({ commandId, taskId = null, workerId, orchestrationId = null, stepKey = null, outcome, question, action = null }) {
     const existing = this.db.prepare('SELECT attention_id FROM attentions WHERE command_id = ?').get(commandId);
     if (existing) return this.getAttention(existing.attention_id);
     const attentionId = createId('attn');
     this.db.prepare(`
-      INSERT INTO attentions (attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-    `).run(attentionId, commandId, taskId, workerId, orchestrationId, stepKey, outcome, question, now());
+      INSERT INTO attentions (attention_id, command_id, task_id, worker_id, orchestration_id, step_key, outcome, question, action_json, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+    `).run(attentionId, commandId, taskId, workerId, orchestrationId, stepKey, outcome, question, action ? stringifyJson(action) : null, now());
     return this.getAttention(attentionId);
   }
 
@@ -1221,16 +1260,31 @@ export class HubStore {
       .all(...(status ? [status] : [])).map(attentionView);
   }
 
-  openAttentionForTask(taskId) {
-    const row = this.db.prepare(`SELECT attention_id FROM attentions WHERE task_id = ? AND status = 'open' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(taskId);
+  // The newest Attention of the task that still waits for a person: open, or
+  // approved but not yet executed by its channel. `outcomes` narrows the kind.
+  openAttentionForTask(taskId, { outcomes = null } = {}) {
+    const kinds = outcomes ? `AND outcome IN (${outcomes.map(() => '?').join(', ')})` : '';
+    const row = this.db.prepare(`
+      SELECT attention_id FROM attentions WHERE task_id = ? AND status IN ('open', 'approved') ${kinds}
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(taskId, ...(outcomes ?? []));
     return row ? this.getAttention(row.attention_id) : null;
   }
 
-  resolveAttention(attentionId, { status, answer = null, answerCommandId = null }) {
+  resolveAttention(attentionId, { status, answer = null, answerCommandId = null, decidedBy = null }) {
     const result = this.db.prepare(`
-      UPDATE attentions SET status = ?, answer = ?, answer_command_id = ?, resolved_at = ?
+      UPDATE attentions SET status = ?, answer = ?, answer_command_id = ?, decided_by = ?, resolved_at = ?
       WHERE attention_id = ? AND status = 'open'
-    `).run(status, answer, answerCommandId, now(), attentionId);
+    `).run(status, answer, answerCommandId, decidedBy, now(), attentionId);
+    return { attention: this.getAttention(attentionId), changed: result.changes === 1 };
+  }
+
+  // An approved outward action was carried out (or could not be) by its channel.
+  settleAttention(attentionId, { status, execution }) {
+    const result = this.db.prepare(`
+      UPDATE attentions SET status = ?, execution_json = ?, resolved_at = ?
+      WHERE attention_id = ? AND status = 'approved'
+    `).run(status, stringifyJson(execution ?? {}), now(), attentionId);
     return { attention: this.getAttention(attentionId), changed: result.changes === 1 };
   }
 
@@ -1479,5 +1533,25 @@ export class HubStore {
 
   listEvents(limit = 300) {
     return this.db.prepare('SELECT * FROM events ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit).map(eventView);
+  }
+
+  // Events after a known one, oldest first: a cursor for bridges that turn Hub
+  // events into notifications. An empty `after` starts from the latest event.
+  listEventsAfter(afterEventId, { limit = 200, types = null } = {}) {
+    let since = 0;
+    if (afterEventId) {
+      const row = this.db.prepare('SELECT rowid FROM events WHERE event_id = ?').get(afterEventId);
+      if (!row) return null;
+      since = row.rowid;
+    } else {
+      since = this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS rowid FROM events').get().rowid;
+    }
+    const kinds = types?.length ? `AND event_type IN (${types.map(() => '?').join(', ')})` : '';
+    return this.db.prepare(`SELECT * FROM events WHERE rowid > ? ${kinds} ORDER BY rowid ASC LIMIT ?`)
+      .all(since, ...(types ?? []), limit).map(eventView);
+  }
+
+  latestEventId() {
+    return this.db.prepare('SELECT event_id FROM events ORDER BY rowid DESC LIMIT 1').get()?.event_id ?? null;
   }
 }

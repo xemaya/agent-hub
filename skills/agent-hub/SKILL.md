@@ -142,6 +142,7 @@ agent-hub send --local --wait \
 
 - 收到的指令里给了 `agent-hub command result <command_id>`：那是被截断的上游结果，需要细节时再读全文，没读的部分不要声称读过。
 - 没有人的决定或信息就无法继续时不要猜：回报 `outcome: needs_input`（Claude 的 `agent_hub_report`；Codex 用 `desktop report --outcome needs_input --question "<一个问题>"`），被外部条件卡住用 `blocked`。Hub 把问题放进「等你处理」，回答会作为新指令回到本会话。查下来其实无事可做时用 `dropped`。
+- 结果要发到你自己不能（或不该）直接发的渠道（群里回复、发帖）时，不要自己发：回报 `outcome: needs_approval`，`action = {channel, kind, target, text, key?, note?}` 写清楚发到哪、发什么（`text` 就是最终原文，`key` 是防重发的唯一键，`note` 一句话给审批人看）。审批人批准后由渠道桥发出，结果（消息 id 或失败原因）会作为新指令回到本会话；不批准时他的意见也会回来，改好再提交一次。发给审批人本人的消息通常不需要他再批。
 - 被直接 @ 的问答里，如果对方其实是在派一项需要立项的新工作，只回复一行 `HANDBACK: <原因>`，Hub 会交给中央大脑安排。
 - 收到以【交接】开头的指令，说明你是接手的人，没有前任的记忆：以交接包为准，先按恢复提示核对现场（git status / log、已发出的消息或草稿、外部系统），确认哪些对外动作已经做过，再做「本次要处理」的部分，绝不重复已经发生的对外动作。【恢复】是你自己上一次执行被中断，同样先核对现场。
 - 外部话题接入（飞书话题、PR 讨论）：`agent-hub trigger --trigger-key <消息唯一键> --thread-key <话题唯一键> --text ... --role <岗位> --title ...`（或 `--worker-id <负责人>`）为新话题建任务。岗位上暂时没有在线窗口时，返回 `waiting_for_seat: true`，任务会排队，第一个登记到这个岗位的窗口会接手；同一话题后面的消息加 `--followup-only`，任务没结束前会直接交给负责人，或作为它提过的问题的回答。

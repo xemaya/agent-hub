@@ -1,0 +1,24 @@
+{
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret_file": "feishu-app-secret",
+  "admin_token_file": "../hub/credentials.json",
+  "hub_url": "http://127.0.0.1:8787",
+  "state_file": "feishu-bridge-state.json",
+
+  "bot_open_id": "ou_bot_open_id_in_this_app",
+  "owner": { "name": "黄海斌", "open_id": "ou_owner_open_id", "dm_chat": "oc_bot_owner_dm_chat" },
+  "people": { "ou_colleague_open_id": "Anya" },
+
+  "role": "qa",
+  "ack": "收到，QA 在查，查完回在这个话题里。",
+  "prompt_hint": "按 youxian-qa/AGENTS.md「群里 @ 的跟进」处理。",
+
+  "groups": {
+    "oc_feedback_group": { "name": "问题反馈群", "policy": "auto" },
+    "oc_internal_group": { "name": "数字员工迭代", "policy": "auto" },
+    "oc_external_group": { "name": "FindU", "policy": "confirm" }
+  },
+  "default_policy": { "internal": "auto", "external": "confirm" },
+  "loose_ttl_days": 7,
+  "auto_approve_to_owner": true
+}

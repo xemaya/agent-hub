@@ -272,7 +272,11 @@ export class Roles {
       ].join('\n'));
     }
     const open = this.store.openAttentionForTask(task.task_id);
-    if (open) lines.push(`还没回答的问题：${open.question}`);
+    if (open?.outcome === 'needs_approval') {
+      lines.push(`前任已提交待审批的对外内容（${open.status === 'approved' ? '已批准，渠道正在发出' : '等审批人决定'}，${open.action?.channel ?? ''} ${open.action?.kind ?? ''} → ${open.action?.target ?? ''}）：${clip(open.action?.text ?? open.question, 600)}\n不要再提交一遍；结果会以新指令告诉你。`);
+    } else if (open) {
+      lines.push(`还没回答的问题：${open.question}`);
+    }
     if (interrupted) lines.push(`被中断的那次执行：命令 ${interrupted.command_id}（${resultPointer(interrupted.command_id)} 可看它的状态）`);
     lines.push('恢复提示：先核对现场——工作目录的 git status / git log、已经发出的消息或草稿、外部系统里的状态——确认哪些对外动作已经做过，再决定下一步。不要重复已经发生的对外动作（发消息、发帖、提交、部署、写线上数据）；拿不准就用 needs_input 回报问人。');
     lines.push(`${TASK_MARK.trim()}\n${work}`);

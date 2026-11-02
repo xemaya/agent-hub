@@ -334,6 +334,26 @@ Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状�
 - **登记与列表**：重新登记只更新写明的内容：没传 `--capabilities` 时保留原能力，`--metadata` 按字段合并，岗位不变。`worker list` 里 `presence` 是 Connector 的状态，`session_online` 才是这个 Session 的 Channel 是否接通。`session start --resume` 没传 `--cwd` 时，回到这个 Session 上次运行的目录。本机命令不写 `--data-dir` 时，依次找环境变量、当前目录下的 `.runtime/connector`、`~/.agent-hub/connector`。
 - Dashboard：员工卡片显示所属岗位；「等你处理」顶部列出等座位的交接，并说明是在等原 Session 恢复，还是岗位上没有在线的 Session。
 
+### 6.9 渠道桥与审批型 Attention（schema 17）
+
+参考 [`harness.md`](harness.md) §9：把「飞书 Source」「对外动作审批」「通知出口」从具体 agent（youxian-qa）抽到 Hub 这一层，第二个渠道或第二个 agent 接入时只写配置。
+
+- **Source 入口**：`POST /api/v1/triggers`（Admin Token）与 Connector 的 `trigger.receive` 等价，事件 actor 记为 `source:<source>`；`worker_id` 寻址时不再要求属于某个 Connector。渠道桥用它投递，不需要在 Hub 机器上跑 Connector。
+- **事件游标**：`GET /api/v1/events?after=<event_id>[&types=a,b][&limit=N]` 按 rowid 升序返回之后的事件和新的 `cursor`；`after=` 为空时返回空列表和当前位置，所以新起的消费者从现在开始、不回放历史。未知游标返回 404。
+- **审批型 Attention**：回报 `outcome: needs_approval` 并带 `action = { channel, kind, target, text, key?, note? }`（Connector 校验：channel/kind 为小写标识，text ≤ 20,000 字；`question` 可省略，默认用 note）。Hub 生成 Attention（`attentions.action_json`），任务改为 blocked。它和 needs_input 的区别：**话题里的消息不会被当成它的回答**（`ANSWERABLE_OUTCOMES` 只含 needs_input / blocked），只有审批人能决定。
+  - `POST /api/v1/attentions/:id/approve {by?}`：open → approved，写 `attention.approved` 事件（payload 带 action）。Hub 自己不发任何东西。
+  - `POST /api/v1/attentions/:id/execution {status: executed|failed, result?|error?, by?}`：由拥有 `action.channel` 的渠道桥在执行后调用，approved → executed / failed（`attentions.execution_json`），并给提出的 Worker 一条新指令：已发出（带消息 id，「不要再发一遍，没别的事就回报 done 并把任务改 done」）或发送失败（「什么都没发出去」）。Worker 不在了就走岗位交接。
+  - `answer` 对审批型 Attention 表示不批准：文字作为修改意见发回 Worker（「改好后重新用 needs_approval 提交；什么都没有发出去」）。`dismiss` 照旧只关闭。
+  - 交接包里列出前任「已提交待审批的对外内容（等审批 / 已批准渠道正在发出）」，并写明不要再提交一遍。
+  - `GET /api/v1/attentions/:id` 读单条；Dashboard 的「等你处理」把审批卡片单独呈现：原文、「批准发出」「发回修改」「不用发了」。CLI `agent-hub attention approve ID`。
+  - Claude 的 `agent_hub_report` 工具 schema 和 Channel 提示词新增 `action` 与 needs_approval 的说明；Kimi Channel 透传 `action`。
+- **飞书渠道桥**（`agent-hub bridge feishu --config FILE [--once] [--observe] [--status]`，`src/bridge-feishu.js` + `src/feishu-api.js`）：Hub 机器上的一个 systemd 服务（`ops/agent-hub-bridge-feishu.service`，配置样例 `ops/feishu-bridge.example.json`），直接调飞书 Open API，凭证只在这台机器的 0600 文件里；Worker 完全不持有飞书凭证。每轮：
+  1. 拉 Hub 事件（游标）：`attention.created` 的 needs_approval → 私信审批人草稿原文（记 DM 消息 id → attention）；needs_input / blocked → 私信问题（同样记录）；发给审批人本人的 `feishu send` 默认自动批准（`auto_approve_to_owner`）；`attention.approved` 且 channel 为 feishu → 执行 reply / send（uuid = `bridge-action-<key>`，重放不重复发），再回 `execution`，并私信回执；`handoff.exhausted` → 私信。
+  2. 现查机器人所在的群：新群从现在开始（`floor`，之前的历史不处理），退出的群忘掉；每个群按群策略处理 @：`auto` 回 ack 并投 trigger（trigger 文本带话题最近 ≤1,500 字原文和「用 needs_approval 提交回复」的说明）；`confirm`（外部群默认）不在群里出声，先私信审批人，引用回「查」才处理；`ignore` 不管。普通群由 ack 开出的话题单独轮询（最多 `loose_ttl_days`）；话题里后续消息以 `followup_only` 直达任务，Hub 回 `ignored` 就不再盯。
+  3. 审批人的私信：引用草稿回「发」→ approve，回别的 → answer（修改意见）；引用问题 → answer；引用外部群确认 → 「查」就处理；不引用时只有恰好一条待决定才生效，多条要求引用；其余文字 = 岗位上的一个新任务（`feishu-dm:<消息 id>`），回复发给审批人本人无需再批。
+  4. 一个群出错不影响其他群，游标不动下轮重查；连续 10 分钟没有完整跑通一轮私信审批人一次。`--observe` 只记录「本来会做什么」，用于和旧 watcher 并跑对账。
+  幂等：Hub `trigger_key`、飞书消息 `uuid`、桥的 `handled` / `executed` 记录，三层保证重启、重跑都不会重复回复或重复发送。
+
 ## 7. WebSocket 协议
 
 消息统一为 JSON：
@@ -593,9 +613,14 @@ GET    /api/v1/roles
 PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms?, workdir? }
 PUT    /api/v1/workers/:id/role           { role: KEY | null }
 GET    /api/v1/handoffs[?status=open|dispatched|cancelled|all&role=KEY]
-GET    /api/v1/attentions[?status=open|answered|dismissed|all]
-POST   /api/v1/attentions/:id/answer
+GET    /api/v1/attentions[?status=open|answered|dismissed|approved|executed|failed|all]
+GET    /api/v1/attentions/:id
+POST   /api/v1/attentions/:id/answer       { answer, by? }
 POST   /api/v1/attentions/:id/dismiss
+POST   /api/v1/attentions/:id/approve      { by? }                      (needs_approval only)
+POST   /api/v1/attentions/:id/execution    { status: executed|failed, result?, error?, by? }
+POST   /api/v1/triggers                    (same body as the Connector trigger; for channel bridges)
+GET    /api/v1/events?after=EVENT_ID[&types=a,b][&limit=N]
 GET    /api/v1/watchdog
 PUT    /api/v1/watchdog
 POST   /api/v1/watchdog/check
@@ -631,6 +656,10 @@ Local REST 只绑定回环地址，并校验 Host/Origin，不开放给 Tailscal
 
 ```bash
 agent-hub hub --host 127.0.0.1 --port 8787 --data-dir .runtime/hub
+
+# Feishu channel bridge beside the Hub (see 6.9); --observe only logs what it would do
+agent-hub bridge feishu --config /var/lib/agent-hub/bridge/feishu.json [--once] [--observe] [--status]
+agent-hub attention approve ATTENTION_ID
 
 agent-hub connector \
   --hub-url http://127.0.0.1:8787 \

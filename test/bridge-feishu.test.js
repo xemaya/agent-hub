@@ -7,6 +7,7 @@ import { FeishuApi, messageText, readableText } from '../src/feishu-api.js';
 
 const BOT = 'ou_bot';
 const OWNER = 'ou_owner';
+const OWNER_UNION = 'on_owner'; // the owner's union_id: the same under every app
 const OWNER_DM = 'oc_owner_dm';
 const FEEDBACK = 'oc_feedback'; // topic-mode group: thread replies appear in the chat listing
 const ORDINARY = 'oc_ordinary'; // ordinary group: thread replies do not
@@ -88,7 +89,8 @@ class FakeFeishu {
     }
     if (pathname === '/open-apis/im/v1/messages' && init.method === 'POST') {
       if (this.failing.has('send')) return json({ code: 230002, msg: 'send refused' });
-      const chat = body.receive_id === OWNER ? OWNER_DM : body.receive_id;
+      if (body.receive_id === OWNER_UNION && searchParams.get('receive_id_type') !== 'union_id') return json({ code: 99992361, msg: 'open_id cross app' });
+      const chat = [OWNER, OWNER_UNION].includes(body.receive_id) ? OWNER_DM : body.receive_id;
       const existing = this.sent.find((s) => s.uuid && s.uuid === body.uuid);
       if (existing) return json({ code: 0, data: { message_id: existing.message_id, chat_id: chat } });
       const message = this.post(chat, JSON.parse(body.content).text, { from: BOT, senderType: 'app' });
@@ -98,7 +100,7 @@ class FakeFeishu {
     return json({ code: 404, msg: `unhandled ${init.method} ${pathname}` }, 404);
   };
 
-  dms() { return this.sent.filter((s) => s.kind === 'send' && s.target === OWNER).map((s) => s.text); }
+  dms() { return this.sent.filter((s) => s.kind === 'send' && [OWNER, OWNER_UNION].includes(s.target)).map((s) => s.text); }
   replies() { return this.sent.filter((s) => s.kind === 'reply'); }
 }
 
@@ -201,6 +203,35 @@ test('Without bot_open_id and dm_chat the bridge discovers both on its first tic
   const at = feishu.post(FEEDBACK, '@_user_1 看看这个', { mentions: [BOT] });
   await again.tick();
   assert.ok(liveTask(context, `feishu:${at.thread_id}`), 'the @ on the discovered bot id opened a task');
+});
+
+test('An owner named only by union_id is reached by union_id and recognised by their DM chat', async (t) => {
+  const context = await createTestContext(t, { hub: { watchdogIntervalMs: 60 * 60 * 1000 } });
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { name: 'QA', takeover_after_ms: 0 } });
+  const driver = seatDriver();
+  driver.store = context.hub.store;
+  context.driver = driver;
+  const feishu = new FakeFeishu();
+  const api = new FeishuApi({ appId: 'cli_test', appSecret: 's', fetch: feishu.fetch, now: () => feishu.clock });
+  const hub = new HubAdmin({ baseUrl: context.hub.url, token: 'test-admin' });
+  assert.throws(() => loadConfig({ ...CONFIG, bot_open_id: undefined, owner: { name: '黄海斌' } }), /owner.open_id or owner.union_id/);
+  const config = loadConfig({ ...CONFIG, bot_open_id: undefined, owner: { name: '黄海斌', union_id: OWNER_UNION } });
+  const bridge = new FeishuBridge({ config, feishu: api, hub, stateFile: path.join(context.root, 'bridge', 'state.json'), now: () => feishu.clock, logger: { log() {}, error() {} } });
+  await bridge.load();
+  assert.equal(await bridge.tick(), 0);
+  assert.equal(bridge.ownerDm(), OWNER_DM);
+  assert.equal(feishu.sent.at(-1).target, OWNER_UNION, 'the hello went out by union_id');
+  assert.equal(bridge.ownerOpenId(), null, 'the open_id is not known until the owner writes');
+
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  feishu.clock += 5000;
+  feishu.post(OWNER_DM, '看看昨天的日报有没有问题', { from: OWNER });
+  await bridge.tick();
+  assert.equal(bridge.ownerOpenId(), OWNER, 'learned from the DM');
+  assert.equal(bridge.ownerId(), OWNER, 'later messages go to the open_id');
+  const task = context.hub.store.listTasks().find((item) => /日报/.test(item.title ?? '') || /日报/.test(item.description ?? ''));
+  assert.ok(task, 'a plain DM from the owner is a task for the role');
+  assert.ok(bridge.personName(OWNER_UNION) === '黄海斌' && bridge.personName(OWNER) === '黄海斌');
 });
 
 test('An @ in a topic group is acked in the thread and opens a Role task with the thread as context', async (t) => {

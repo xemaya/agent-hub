@@ -5,7 +5,7 @@
   "hub_url": "http://127.0.0.1:8787",
   "state_file": "feishu-bridge-state.json",
 
-  "owner": { "name": "黄海斌", "open_id": "ou_owner_open_id" },
+  "owner": { "name": "黄海斌", "union_id": "on_owner_union_id" },
   "people": { "ou_colleague_open_id": "Anya" },
 
   "role": "qa",

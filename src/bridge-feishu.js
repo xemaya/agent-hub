@@ -79,7 +79,9 @@ export function loadConfig(raw) {
     ...raw,
   };
   if (!config.app_id) throw new Error('feishu bridge config needs app_id');
-  if (!config.owner?.open_id) throw new Error('feishu bridge config needs owner.open_id');
+  // open_id is per app; union_id (on_…) is shared by every app of the same developer,
+  // so a bridge on its own app can name the owner by union_id and learn the open_id.
+  if (!config.owner?.open_id && !config.owner?.union_id) throw new Error('feishu bridge config needs owner.open_id or owner.union_id');
   // bot_open_id and owner.dm_chat are optional: the bridge asks Feishu for its bot
   // identity and learns the owner DM chat from its first message to the owner.
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
@@ -134,6 +136,7 @@ export class FeishuBridge {
       cursor: this.ownerDm() ? { [this.ownerDm()]: nowSeconds } : {},
       botOpenId: null, // discovered from /bot/v3/info when the config does not name it
       ownerDm: null, // discovered from the first DM to the owner when the config does not name it
+      ownerOpenId: null, // the owner's open_id under this app, learned from their first DM when the config names only union_id
       floor: {}, // chat id → when we started following it; older messages are history, never handled
       eventCursor: null,
       handled: {},
@@ -169,10 +172,14 @@ export class FeishuBridge {
       this.log(`owner DM chat is ${sent.chat_id}`);
     }
   }
-  ownerId() { return this.config.owner.open_id; }
+  // Where messages to the owner are addressed: the per-app open_id when known, else the union_id.
+  ownerId() { return this.ownerOpenId() ?? this.config.owner.union_id; }
+  // The owner's open_id under this app, configured or learned from their first DM.
+  ownerOpenId() { return this.config.owner.open_id ?? this.state?.ownerOpenId ?? null; }
+  isOwner(id) { return Boolean(id) && [this.config.owner.open_id, this.config.owner.union_id, this.state?.ownerOpenId].includes(id); }
   ownerName() { return this.config.owner.name ?? '业主'; }
   chatName(chatId) { return this.names[chatId] || '飞书群'; }
-  personName(openId) { return this.config.people?.[openId] ?? (openId === this.ownerId() ? this.ownerName() : null); }
+  personName(openId) { return this.config.people?.[openId] ?? (this.isOwner(openId) ? this.ownerName() : null); }
 
   log(line) { this.logger.log?.(`${new Date(this.now()).toISOString()} ${this.observe ? '[observe] ' : ''}${line}`); }
   would(line) { this.log(`would: ${line}`); }
@@ -183,8 +190,19 @@ export class FeishuBridge {
     return message.sender?.sender_type === 'user' && (message.mentions ?? []).some((mention) => mention.id === this.botId());
   }
 
+  // A person writing in the bot's DM chat with the owner is the owner: that chat has
+  // no one else. Seeing them there is how the bridge learns their open_id under this app.
   fromOwner(message) {
-    return message.sender?.sender_type === 'user' && message.sender?.id === this.ownerId();
+    if (message.sender?.sender_type !== 'user') return false;
+    if (this.isOwner(message.sender?.id)) return true;
+    if (this.ownerDm() && message.chat_id === this.ownerDm() && message.sender?.id) {
+      if (!this.config.owner.open_id && this.state && this.state.ownerOpenId !== message.sender.id) {
+        this.state.ownerOpenId = message.sender.id;
+        this.log(`owner open_id under this app is ${message.sender.id}`);
+      }
+      return true;
+    }
+    return false;
   }
 
   policy(chatId, chat) {
@@ -428,7 +446,7 @@ export class FeishuBridge {
     const task = attention.task_title ? `「${attention.task_title}」` : '';
     if (attention.outcome === 'needs_approval') {
       const action = attention.action ?? {};
-      if (this.config.auto_approve_to_owner && action.channel === 'feishu' && action.kind === 'send' && action.target === this.ownerId()) {
+      if (this.config.auto_approve_to_owner && action.channel === 'feishu' && action.kind === 'send' && this.isOwner(action.target)) {
         if (this.observe) return this.would(`auto-approve ${attention.attention_id} (a message to the owner)`);
         await this.hub.approve(attention.attention_id, 'bridge:feishu').catch((error) => this.log(`auto-approve ${attention.attention_id}: ${error.message}`));
         return;
@@ -464,7 +482,7 @@ export class FeishuBridge {
         await this.save();
       }
       await this.hub.execution(attention.attention_id, { status: 'executed', result: { message_id: messageId, channel: 'feishu', kind: action.kind, target: action.target }, by: 'bridge:feishu' });
-      if (action.target !== this.ownerId()) {
+      if (!this.isOwner(action.target)) {
         await this.dmOwner(`已发出（${action.note || action.kind}）：消息 ${messageId}`, `bridge-sent-${attention.attention_id}`);
       }
     } catch (error) {

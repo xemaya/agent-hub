@@ -55,6 +55,7 @@ class FakeFeishu {
     }
     if (this.failing.has(pathname) || this.failing.has('*')) return json({ code: 99991400, msg: 'injected failure' });
     if (pathname === '/open-apis/im/v1/chats') return json({ code: 0, data: { items: this.chats, has_more: false } });
+    if (pathname === '/open-apis/bot/v3/info') return json({ code: 0, msg: 'ok', bot: { app_name: 'Agent Hub', open_id: BOT, activate_status: 2 } });
     if (pathname === '/open-apis/im/v1/messages' && init.method === 'GET') {
       const type = searchParams.get('container_id_type');
       const container = searchParams.get('container_id');
@@ -87,12 +88,12 @@ class FakeFeishu {
     }
     if (pathname === '/open-apis/im/v1/messages' && init.method === 'POST') {
       if (this.failing.has('send')) return json({ code: 230002, msg: 'send refused' });
-      const existing = this.sent.find((s) => s.uuid && s.uuid === body.uuid);
-      if (existing) return json({ code: 0, data: { message_id: existing.message_id } });
       const chat = body.receive_id === OWNER ? OWNER_DM : body.receive_id;
+      const existing = this.sent.find((s) => s.uuid && s.uuid === body.uuid);
+      if (existing) return json({ code: 0, data: { message_id: existing.message_id, chat_id: chat } });
       const message = this.post(chat, JSON.parse(body.content).text, { from: BOT, senderType: 'app' });
       this.sent.push({ kind: 'send', target: body.receive_id, text: JSON.parse(body.content).text, uuid: body.uuid, message_id: message.message_id });
-      return json({ code: 0, data: { message_id: message.message_id } });
+      return json({ code: 0, data: { message_id: message.message_id, chat_id: chat } });
     }
     return json({ code: 404, msg: `unhandled ${init.method} ${pathname}` }, 404);
   };
@@ -167,6 +168,39 @@ test('loadConfig fills defaults and refuses unknown policies', () => {
   assert.equal(config.loose_ttl_days, 7);
   assert.throws(() => loadConfig({ ...CONFIG, groups: { x: { policy: 'maybe' } } }), /policy must be/);
   assert.throws(() => loadConfig({ ...CONFIG, role: undefined }), /needs role/);
+});
+
+test('Without bot_open_id and dm_chat the bridge discovers both on its first tick', async (t) => {
+  const context = await createTestContext(t, { hub: { watchdogIntervalMs: 60 * 60 * 1000 } });
+  await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { name: 'QA', takeover_after_ms: 0 } });
+  const driver = seatDriver();
+  driver.store = context.hub.store;
+  context.driver = driver;
+  const feishu = new FakeFeishu();
+  const api = new FeishuApi({ appId: 'cli_test', appSecret: 's', fetch: feishu.fetch, now: () => feishu.clock });
+  const hub = new HubAdmin({ baseUrl: context.hub.url, token: 'test-admin' });
+  const config = loadConfig({ ...CONFIG, bot_open_id: undefined, owner: { name: '黄海斌', open_id: OWNER } });
+  assert.equal(config.bot_open_id, undefined);
+  const bridge = new FeishuBridge({ config, feishu: api, hub, stateFile: path.join(context.root, 'bridge', 'state.json'), now: () => feishu.clock, logger: { log() {}, error() {} } });
+  await bridge.load();
+  assert.equal(await bridge.tick(), 0);
+  assert.equal(bridge.botId(), BOT);
+  assert.equal(bridge.ownerDm(), OWNER_DM, 'the DM chat comes from the hello message');
+  assert.match(feishu.dms().at(-1), /飞书桥已上线/);
+  assert.ok(bridge.state.cursor[OWNER_DM], 'the owner DM is followed from now');
+
+  // A second bridge with the same state file does not say hello again.
+  const again = new FeishuBridge({ config, feishu: api, hub, stateFile: path.join(context.root, 'bridge', 'state.json'), now: () => feishu.clock, logger: { log() {}, error() {} } });
+  await again.load();
+  feishu.clock += 5000;
+  await again.tick();
+  assert.equal(feishu.dms().filter((text) => /飞书桥已上线/.test(text)).length, 1);
+
+  // The discovered identity is what makes @ detection and owner replies work.
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(FEEDBACK, '@_user_1 看看这个', { mentions: [BOT] });
+  await again.tick();
+  assert.ok(liveTask(context, `feishu:${at.thread_id}`), 'the @ on the discovered bot id opened a task');
 });
 
 test('An @ in a topic group is acked in the thread and opens a Role task with the thread as context', async (t) => {

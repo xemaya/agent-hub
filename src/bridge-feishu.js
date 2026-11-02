@@ -78,8 +78,10 @@ export function loadConfig(raw) {
     auto_approve_to_owner: true,
     ...raw,
   };
-  for (const key of ['app_id', 'bot_open_id']) if (!config[key]) throw new Error(`feishu bridge config needs ${key}`);
+  if (!config.app_id) throw new Error('feishu bridge config needs app_id');
   if (!config.owner?.open_id) throw new Error('feishu bridge config needs owner.open_id');
+  // bot_open_id and owner.dm_chat are optional: the bridge asks Feishu for its bot
+  // identity and learns the owner DM chat from its first message to the owner.
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
   for (const [chat, group] of Object.entries(config.groups)) {
     if (group.policy && !['auto', 'confirm', 'ignore'].includes(group.policy)) throw new Error(`group ${chat}: policy must be auto, confirm or ignore`);
@@ -129,7 +131,9 @@ export class FeishuBridge {
 
   fresh(nowSeconds) {
     return {
-      cursor: { [this.ownerDm()]: nowSeconds },
+      cursor: this.ownerDm() ? { [this.ownerDm()]: nowSeconds } : {},
+      botOpenId: null, // discovered from /bot/v3/info when the config does not name it
+      ownerDm: null, // discovered from the first DM to the owner when the config does not name it
       floor: {}, // chat id → when we started following it; older messages are history, never handled
       eventCursor: null,
       handled: {},
@@ -145,7 +149,26 @@ export class FeishuBridge {
     };
   }
 
-  ownerDm() { return this.config.owner.dm_chat ?? null; }
+  ownerDm() { return this.config.owner.dm_chat ?? this.state?.ownerDm ?? null; }
+  botId() { return this.config.bot_open_id ?? this.state?.botOpenId ?? null; }
+
+  // Fills in what the config left out: the bot's own open_id, and the DM chat with
+  // the owner (learned from a hello message, which also proves the app can reach them).
+  async discover(nowS) {
+    if (!this.botId()) {
+      const bot = await this.feishu.botInfo();
+      if (!bot.open_id) throw new Error('Feishu did not return the bot open_id; is the 机器人 capability enabled?');
+      this.state.botOpenId = bot.open_id;
+      this.log(`bot is ${bot.app_name ?? ''} ${bot.open_id}`);
+    }
+    if (!this.ownerDm()) {
+      const sent = await this.feishu.send(this.ownerId(), `飞书桥已上线${this.observe ? '（观察模式，只记录不动手）' : ''}，群里 @ 机器人的消息会从现在起处理；待确认、待审批的内容会发到这里。`, { uuid: `bridge-hello-${this.config.app_id}` });
+      if (!sent.chat_id) throw new Error('Feishu did not return the owner DM chat_id');
+      this.state.ownerDm = sent.chat_id;
+      this.state.cursor[sent.chat_id] = nowS;
+      this.log(`owner DM chat is ${sent.chat_id}`);
+    }
+  }
   ownerId() { return this.config.owner.open_id; }
   ownerName() { return this.config.owner.name ?? '业主'; }
   chatName(chatId) { return this.names[chatId] || '飞书群'; }
@@ -157,7 +180,7 @@ export class FeishuBridge {
   // ---- Feishu helpers ----------------------------------------------------
 
   mentionsBot(message) {
-    return message.sender?.sender_type === 'user' && (message.mentions ?? []).some((mention) => mention.id === this.config.bot_open_id);
+    return message.sender?.sender_type === 'user' && (message.mentions ?? []).some((mention) => mention.id === this.botId());
   }
 
   fromOwner(message) {
@@ -490,6 +513,12 @@ export class FeishuBridge {
     if (!this.state) {
       // First run: every group the bot is in starts at now, so no history is replayed.
       this.state = this.fresh(nowS);
+      try {
+        await this.discover(nowS);
+      } catch (error) {
+        this.state = null; // nothing persisted; the next tick starts over
+        throw error;
+      }
       for (const chat of await this.feishu.listChats()) if (chat.chat_id !== this.ownerDm()) this.follow(chat.chat_id, nowS);
       const start = await this.hub.eventsAfter(null, NOTIFY_EVENTS).catch(() => null);
       this.state.eventCursor = start?.cursor ?? null;
@@ -503,6 +532,8 @@ export class FeishuBridge {
       this.logger.error?.(`${new Date(this.now()).toISOString()} ${source} failed, retried next tick: ${error.message}`);
     };
 
+    // A state file from before the config lost bot_open_id / dm_chat still needs them.
+    await this.discover(nowS).catch((error) => fail('discover', error));
     await this.pumpEvents().catch((error) => fail('hub-events', error));
 
     // Groups the bot is in right now; a new one starts at now, a left one is forgotten.

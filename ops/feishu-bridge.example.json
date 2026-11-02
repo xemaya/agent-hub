@@ -5,8 +5,7 @@
   "hub_url": "http://127.0.0.1:8787",
   "state_file": "feishu-bridge-state.json",
 
-  "bot_open_id": "ou_bot_open_id_in_this_app",
-  "owner": { "name": "黄海斌", "open_id": "ou_owner_open_id", "dm_chat": "oc_bot_owner_dm_chat" },
+  "owner": { "name": "黄海斌", "open_id": "ou_owner_open_id" },
   "people": { "ou_colleague_open_id": "Anya" },
 
   "role": "qa",

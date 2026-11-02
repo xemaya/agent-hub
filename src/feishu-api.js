@@ -124,13 +124,32 @@ export class FeishuApi {
     return data.message_id ?? null;
   }
 
-  async sendText(receiveId, text, { uuid } = {}) {
+  // Sends a text message; the result also carries the chat it landed in, which is how
+  // the bot learns its own DM chat with a person.
+  async send(receiveId, text, { uuid } = {}) {
     const type = receiveId.startsWith('oc_') ? 'chat_id' : receiveId.startsWith('ou_') ? 'open_id' : receiveId.startsWith('on_') ? 'union_id' : 'user_id';
     const data = await this.call('POST', '/open-apis/im/v1/messages', {
       query: { receive_id_type: type },
       body: { receive_id: receiveId, msg_type: 'text', content: JSON.stringify({ text }), ...(uuid ? { uuid } : {}) },
     });
-    return data.message_id ?? null;
+    return { message_id: data.message_id ?? null, chat_id: data.chat_id ?? null };
+  }
+
+  async sendText(receiveId, text, options = {}) {
+    return (await this.send(receiveId, text, options)).message_id;
+  }
+
+  // The app's own bot identity. This endpoint answers at the top level, not under `data`.
+  async botInfo() {
+    let token = await this.tenantToken();
+    let payload = await this.raw('GET', '/open-apis/bot/v3/info', { token });
+    if (TOKEN_EXPIRED.has(payload.code)) {
+      this.token = null;
+      token = await this.tenantToken();
+      payload = await this.raw('GET', '/open-apis/bot/v3/info', { token });
+    }
+    if (payload.code !== 0) throw new FeishuError(`Feishu GET /open-apis/bot/v3/info failed: ${payload.code} ${payload.msg ?? ''}`.trim(), { code: payload.code });
+    return payload.bot ?? payload.data?.bot ?? {};
   }
 }
 

@@ -159,7 +159,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 
 ### 9.3 顺序与切换
 
-> 进度（2026-11-02）：1、2 已提交并部署到 Hub 机器（3a49902，schema 17）。桥用自己的飞书应用「Agent Hub」（cli_aa62f32e06799c13，1.0.0 已发布；1.0.1 勾了对外共享两项，等企业管理员审核），密钥在 `/var/lib/agent-hub/bridge/feishu-app-secret`，`agent-hub-bridge-feishu.service` 以 `--observe` 运行中，与 Mac 上的 watch 并跑对账；机器人已在数字员工迭代，问题反馈群 / FindU 要等 1.0.1 过审才能拉进去。切换时再改 youxian-qa。
+> 进度（2026-11-03）：桥已转正。1、2、3 完成，Hub 机器跑 3a49902（schema 17）；桥暂用老应用「黄海斌的Claude code助理」（cli_a93f3eeeafb89cb1，已在三个群里），新应用「Agent Hub」（cli_aa62f32e06799c13）的 1.0.1 等企业管理员审核，过了再决定留哪个；三个群策略都是 auto（业主 11-03 定：问题反馈群、FindU 也不审批直接发），未配置的外部群仍是 confirm。Mac 上的 launchd watch 已停并 disable，`qa` 岗位只留 QA-4 一个座位。4 的后半（youxian-qa 改 needs_approval、去掉 lark-cli 和 watch.py）另行安排。
 
 1. Hub：`POST /api/v1/triggers`、事件游标、`needs_approval` Attention（schema 17）。单测 + smoke。
 2. 桥：移植 watch.py 的逻辑（所有群、普通群话题轮询、私信、gate、ack、通知、审批执行），配置先只写问题反馈群 / FindU / 数字员工迭代三群。

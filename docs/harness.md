@@ -159,7 +159,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 
 ### 9.3 顺序与切换
 
-> 进度（2026-11-03）：桥已转正。1、2、3 完成，Hub 机器跑 3a49902（schema 17）；桥暂用老应用「黄海斌的Claude code助理」（cli_a93f3eeeafb89cb1，已在三个群里），新应用「Agent Hub」（cli_aa62f32e06799c13）的 1.0.1 等企业管理员审核，过了再决定留哪个；三个群策略都是 auto（业主 11-03 定：问题反馈群、FindU 也不审批直接发），未配置的外部群仍是 confirm。Mac 上的 launchd watch 已停并 disable，`qa` 岗位只留 QA-4 一个座位。4 的后半（youxian-qa 改 needs_approval、去掉 lark-cli 和 watch.py）另行安排。
+> 进度（2026-11-03）：桥已转正。1、2、3 完成，Hub 机器跑 3a49902（schema 17）；桥暂用老应用「黄海斌的Claude code助理」（cli_a93f3eeeafb89cb1，已在三个群里），新应用「Agent Hub」（cli_aa62f32e06799c13）的 1.0.1 等企业管理员审核，过了再决定留哪个；三个群策略都是 auto（业主 11-03 定：问题反馈群、FindU 也不审批直接发），未配置的外部群仍是 confirm。Mac 上的 launchd watch 已停并 disable，`qa` 岗位只留 QA-4 一个座位。4 的后半也完成（732f72c）：桥对 auto 群的回复自动批准并私信回执、`@名字` 换成飞书 at；youxian-qa 的 AGENTS.md 改成 `needs_approval` 回报，watch.py、草稿 /「发」流程、launchd 安装脚本删除，`projecttest feishu` 只剩业主确认后发项目测试报告。5 待第二个渠道 / agent 接入时验收。
 
 1. Hub：`POST /api/v1/triggers`、事件游标、`needs_approval` Attention（schema 17）。单测 + smoke。
 2. 桥：移植 watch.py 的逻辑（所有群、普通群话题轮询、私信、gate、ack、通知、审批执行），配置先只写问题反馈群 / FindU / 数字员工迭代三群。

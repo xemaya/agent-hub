@@ -159,7 +159,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 
 ### 9.3 顺序与切换
 
-> 进度（2026-11-02）：1、2 已提交并部署到 Hub 机器（a6469aa，schema 17 已迁移）。桥用自己的飞书应用「Agent Hub」（cli_aa62f32e06799c13，已发布 1.0.0，对外共享暂未开启），密钥在 `/var/lib/agent-hub/bridge/feishu-app-secret`，`agent-hub-bridge-feishu.service` 以 `--observe` 运行中，与 Mac 上的 watch 并跑对账；机器人还要被拉进群。切换时再改 youxian-qa。
+> 进度（2026-11-02）：1、2 已提交并部署到 Hub 机器（3a49902，schema 17）。桥用自己的飞书应用「Agent Hub」（cli_aa62f32e06799c13，1.0.0 已发布；1.0.1 勾了对外共享两项，等企业管理员审核），密钥在 `/var/lib/agent-hub/bridge/feishu-app-secret`，`agent-hub-bridge-feishu.service` 以 `--observe` 运行中，与 Mac 上的 watch 并跑对账；机器人已在数字员工迭代，问题反馈群 / FindU 要等 1.0.1 过审才能拉进去。切换时再改 youxian-qa。
 
 1. Hub：`POST /api/v1/triggers`、事件游标、`needs_approval` Attention（schema 17）。单测 + smoke。
 2. 桥：移植 watch.py 的逻辑（所有群、普通群话题轮询、私信、gate、ack、通知、审批执行），配置先只写问题反馈群 / FindU / 数字员工迭代三群。
@@ -181,3 +181,40 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 | 确定性桌面 harness | `desktop-agents/ldh` |
 | 每个 agent 的流程、权限、用例 | 各自仓（`youxian-qa`、`desktop-agents/skills/ldh-watch`） |
 | 跨仓的平台级决策 | `findu-docs/engineering/` |
+
+## 11. 网络拓扑（2026-11-02 现状）
+
+```text
+                    飞书开放平台 (open.feishu.cn)
+                         ▲  HTTPS 拉群消息 / 发消息（每分钟轮询，未开回调）
+                         │
+ ┌───────────────────────┼──────────── AWS i-095d9d33dcdc71faa ──────────────┐
+ │   agent-hub-bridge-feishu ──HTTP──▶ 127.0.0.1:8787 ◀──── Caddy :443/:80    │
+ │   (按游标轮询 /api/v1/events)         Hub (node, sqlite)     hub.findu.work  │
+ │                                      /ws/connector  /api/v1  / 控制台页面   │
+ └──────────────────────────────────────────▲──────────────▲──────────────────┘
+                                 WSS 长连接 │              │ HTTPS / WS
+                        ┌───────────────────┤              └── 浏览器控制台
+                        │                   │
+          Mac A (MacBook Pro)         Mac B / Mac mini / ZenasMBP（同构）
+   ┌────────────────────────────────┐
+   │ Connector  launchd 常驻        │
+   │   127.0.0.1:8788 本机 HTTP     │
+   │     ├─ SSE /local/v1/channel ──▶ Claude 会话的 MCP channel 进程 ──stdio──▶ Claude Code
+   │     ├─ SSE /local/v1/channel ──▶ Codex 队列桥 ──`codex queue`──▶ Codex 桌面
+   │     ├─ SSE /local/v1/channel ──▶ Kimi channel
+   │     └─ /local/v1/mail、/commands、/directory ◀── agent-hub CLI（各会话里敲的命令）
+   └────────────────────────────────┘
+```
+
+**中心：Hub。** 唯一一个，跑在 AWS 那台机器上，只监听 127.0.0.1:8787；Caddy 同机做 TLS，把 `hub.findu.work` 的 443 反代到 8787。三类入口：Connector 的 WebSocket `/ws/connector`、管理 API `/api/v1/*`（admin token）、浏览器控制台（静态页 + dashboard WebSocket）。所有状态在 `hub.db` 一个 SQLite 里。本机 Mac 上没有 Hub，只有 Connector。
+
+**边缘一：每台 Mac 一个 Connector。** 常驻进程，向 Hub 维持一条出站 WSS 长连接；Hub 在这条连接上推命令、邮件门铃、取消、角色变更，Connector 用它回报注册、回执、进度。Connector 只在本机开 8788，会话内的 CLI 和桥都走这个本机口、拿本机 token，不直接碰 Hub。Mac 没有任何公网入站端口。
+
+**边缘二：每个原生会话一个桥进程。** 挂在 Connector 的 SSE 长流上，收到事件按 runtime 投进去：Claude 走 MCP channel 的 stdio 通知，Codex 走 `codex queue` 塞一个原生回合，Kimi 走自己的 channel。回执反方向：会话里调 CLI 或 MCP 工具，打到 Connector 本机口，再经 WSS 回 Hub。
+
+**边缘三：飞书桥。** 与 Hub 同机，直接连 127.0.0.1:8787，是拓扑里唯一的轮询者：每分钟拉飞书群消息，按游标拉 Hub 事件流，投任务用 `/api/v1/triggers`，审批通过后调飞书 API 发出去。飞书凭证只在这里，Worker 侧没有。
+
+**连接方向与延迟。** 所有长连接都是边缘主动出站到中心（Connector → Hub，桥 → Connector），中心从不主动连边缘。Hub 到会话是两跳推送，没有定时拉取；飞书到 Hub 最多一分钟。
+
+**单点。** Hub 这台机器和它的 SQLite 是唯一单点，Caddy 和飞书桥同机。Connector 掉线不丢数据：邮件和命令都持久化在 Hub，重连后按状态续投，不重放。

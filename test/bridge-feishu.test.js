@@ -320,8 +320,39 @@ test('An @ in an external group without a policy asks the owner first and nothin
   assert.deepEqual(bridge.state.confirms, {});
 });
 
-test('A draft reported as needs_approval reaches the owner, 「发」 sends it and the seat hears the result', async (t) => {
+const REPLY_CONFIRM = { groups: { [FEEDBACK]: { name: '问题反馈群', policy: 'auto', reply: 'confirm' } } };
+
+test('In an auto group the seat reply goes out without asking; the owner is only told afterwards', async (t) => {
   const { context, driver, feishu, bridge } = await setup(t);
+  driver.answers['qa-a'] = (command) => (/【跟进】飞书群/.test(command.input)
+    ? { text: '查完了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '@Anya 状态：已修复，回测通过。', key: 'qa-fixed-1103', note: '回 Anya：已修复' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(FEEDBACK, '@_user_1 修了吗', { mentions: [BOT] });
+  await bridge.tick();
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  await finished(context, first.command_id);
+  const attention = await waitFor(() => context.hub.store.openAttentionForTask(liveTask(context, `feishu:${at.thread_id}`).task_id));
+  feishu.clock += 2000;
+  await bridge.tick();
+  await waitFor(() => context.hub.store.getAttention(attention.attention_id).status === 'executed' ? true : null);
+  feishu.clock += 2000;
+  await bridge.tick();
+  const sent = feishu.replies().find((r) => /状态：已修复，回测通过。/.test(r.text));
+  assert.ok(sent, 'the reply was sent without an approval round');
+  assert.equal(sent.text, '<at user_id="ou_colleague">Anya</at> 状态：已修复，回测通过。', '@name becomes a Feishu mention');
+  assert.equal(sent.target, at.message_id);
+  assert.equal(sent.uuid, 'bridge-action-qa-fixed-1103');
+  assert.equal(context.hub.store.getAttention(attention.attention_id).decided_by, 'bridge:feishu');
+  assert.ok(!feishu.dms().some((text) => /【待确认】/.test(text)), 'no draft was DMed');
+  assert.match(feishu.dms().at(-1), /已发出（回 Anya：已修复）：消息 om_\d+/);
+  assert.deepEqual(bridge.state.approvals, {});
+  const notice = await waitFor(() => driver.of('qa-a')[1]);
+  assert.match(notice.input, /已获批准并发出/);
+});
+
+test('A draft reported as needs_approval reaches the owner, 「发」 sends it and the seat hears the result', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t, { config: REPLY_CONFIRM });
   driver.answers['qa-a'] = (command) => (/【跟进】飞书群/.test(command.input)
     ? { text: '草稿好了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '查过了：是缓存，已修。', key: 'qa-cache-1101', note: '回 Anya：缓存问题' } }
     : 'done:qa-a');
@@ -369,7 +400,7 @@ test('A draft reported as needs_approval reaches the owner, 「发」 sends it a
 });
 
 test('Feedback instead of 「发」 goes back to the seat; several pending decisions need a quote', async (t) => {
-  const { context, driver, feishu, bridge } = await setup(t);
+  const { context, driver, feishu, bridge } = await setup(t, { config: REPLY_CONFIRM });
   const drafts = [];
   driver.answers['qa-a'] = (command) => {
     if (!/【跟进】飞书群/.test(command.input)) return 'done:qa-a';
@@ -517,11 +548,10 @@ test('A send that fails is reported to the Hub as failed and the owner is told',
   feishu.post(FEEDBACK, '@_user_1 x', { mentions: [BOT] });
   await bridge.tick();
   await finished(context, (await waitFor(() => driver.of('qa-a')[0])).command_id);
+  feishu.failing.add('reply'); // the auto group approves by itself; the send is what fails
   feishu.clock += 2000;
   await bridge.tick();
-  feishu.failing.add('reply');
   feishu.clock += 2000;
-  feishu.post(OWNER_DM, '发', { from: OWNER });
   await bridge.tick();
   assert.equal(context.hub.store.listAttentions({ status: 'failed' }).length, 1);
   assert.match(feishu.dms().at(-1), /没发出去/);

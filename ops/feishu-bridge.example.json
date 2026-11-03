@@ -14,7 +14,7 @@
 
   "groups": {
     "oc_feedback_group": { "name": "问题反馈群", "policy": "auto" },
-    "oc_internal_group": { "name": "数字员工迭代", "policy": "auto" },
+    "oc_internal_group": { "name": "数字员工迭代", "policy": "auto", "reply": "confirm" },
     "oc_external_group": { "name": "FindU", "policy": "confirm" }
   },
   "default_policy": { "internal": "auto", "external": "confirm" },

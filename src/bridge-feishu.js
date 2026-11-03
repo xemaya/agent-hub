@@ -87,6 +87,7 @@ export function loadConfig(raw) {
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
   for (const [chat, group] of Object.entries(config.groups)) {
     if (group.policy && !['auto', 'confirm', 'ignore'].includes(group.policy)) throw new Error(`group ${chat}: policy must be auto, confirm or ignore`);
+    if (group.reply && !['auto', 'confirm'].includes(group.reply)) throw new Error(`group ${chat}: reply must be auto or confirm`);
   }
   return config;
 }
@@ -180,6 +181,14 @@ export class FeishuBridge {
   ownerName() { return this.config.owner.name ?? '业主'; }
   chatName(chatId) { return this.names[chatId] || '飞书群'; }
   personName(openId) { return this.config.people?.[openId] ?? (this.isOwner(openId) ? this.ownerName() : null); }
+  // Outgoing text: "@Anya" for a person named in `people` becomes a real Feishu mention.
+  withMentions(text) {
+    let out = String(text ?? '');
+    for (const [openId, name] of Object.entries(this.config.people ?? {})) {
+      if (name) out = out.split(`@${name}`).join(`<at user_id="${openId}">${name}</at>`);
+    }
+    return out;
+  }
 
   log(line) { this.logger.log?.(`${new Date(this.now()).toISOString()} ${this.observe ? '[observe] ' : ''}${line}`); }
   would(line) { this.log(`would: ${line}`); }
@@ -285,7 +294,7 @@ export class FeishuBridge {
     if (result.waiting_for_seat) {
       await this.dmOwner(`${where}里 ${who} @ 了机器人（消息 ${mid}），已回「收到」。${result.seats_busy ? SEATS_BUSY : NO_SEAT}`, `bridge-noseat-${mid}`);
     }
-    return { state: result.waiting_for_seat ? 'queued' : 'dispatched', routed: result.routed, task: result.task?.task_id ?? null, thread: threadId, loose };
+    return { state: result.waiting_for_seat ? 'queued' : 'dispatched', routed: result.routed, task: result.task?.task_id ?? null, thread: threadId, loose, chat: chatId };
   }
 
   async askConfirm(message, chat) {
@@ -446,8 +455,10 @@ export class FeishuBridge {
     const task = attention.task_title ? `「${attention.task_title}」` : '';
     if (attention.outcome === 'needs_approval') {
       const action = attention.action ?? {};
-      if (this.config.auto_approve_to_owner && action.channel === 'feishu' && action.kind === 'send' && this.isOwner(action.target)) {
-        if (this.observe) return this.would(`auto-approve ${attention.attention_id} (a message to the owner)`);
+      const reason = await this.autoApproves(action);
+      if (reason) {
+        if (this.observe) return this.would(`auto-approve ${attention.attention_id} (${reason})`);
+        this.log(`auto-approve ${attention.attention_id} (${reason})`);
         await this.hub.approve(attention.attention_id, 'bridge:feishu').catch((error) => this.log(`auto-approve ${attention.attention_id}: ${error.message}`));
         return;
       }
@@ -466,6 +477,30 @@ export class FeishuBridge {
     if (dm) this.state.questions[dm] = attention.attention_id;
   }
 
+  // Why an approval-type action goes out without asking the owner, or null when the
+  // owner must decide: a message to the owner needs no approval; a reply into a group
+  // whose policy is auto is sent as it is (the owner is told afterwards) unless the group
+  // sets reply: confirm. Anything the bridge cannot place in a known group is asked.
+  async autoApproves(action) {
+    if (action.channel !== 'feishu') return null;
+    if (action.kind === 'send' && this.isOwner(action.target)) return this.config.auto_approve_to_owner ? 'a message to the owner' : null;
+    const chatId = await this.actionChat(action);
+    if (!chatId) return null;
+    const group = this.config.groups[chatId];
+    const chat = this.knownChats?.[chatId];
+    if (!group && !chat) return null;
+    const reply = group?.reply ?? this.policy(chatId, chat);
+    return reply === 'auto' ? `${this.chatName(chatId)} sends replies without approval` : null;
+  }
+
+  async actionChat(action) {
+    if (action.kind === 'send') return /^oc_/.test(action.target ?? '') ? action.target : null;
+    if (action.kind !== 'reply' || !action.target) return null;
+    const known = this.state.handled[action.target]?.chat;
+    if (known) return known;
+    try { return (await this.feishu.getMessage(action.target))?.chat_id ?? null; } catch { return null; }
+  }
+
   async executeApproved(attention) {
     const action = attention.action ?? {};
     if (action.channel !== 'feishu') return;
@@ -475,8 +510,8 @@ export class FeishuBridge {
     let messageId = this.state.executed[attention.attention_id] ?? null;
     try {
       if (!messageId) {
-        if (action.kind === 'reply') messageId = await this.feishu.replyText(action.target, action.text, { uuid });
-        else if (action.kind === 'send') messageId = await this.feishu.sendText(action.target, action.text, { uuid });
+        if (action.kind === 'reply') messageId = await this.feishu.replyText(action.target, this.withMentions(action.text), { uuid });
+        else if (action.kind === 'send') messageId = await this.feishu.sendText(action.target, this.withMentions(action.text), { uuid });
         else throw new Error(`unsupported feishu action kind ${action.kind}`);
         this.state.executed[attention.attention_id] = messageId;
         await this.save();
@@ -565,6 +600,7 @@ export class FeishuBridge {
       chats = Object.fromEntries(Object.keys(this.state.cursor).filter((chat) => chat !== this.ownerDm()).map((chat) => [chat, { chat_id: chat }]));
     }
     for (const [chatId, chat] of Object.entries(chats)) if (chat.name) this.names[chatId] = chat.name;
+    this.knownChats = chats;
     // A group seen for the first time starts at the previous tick, not at now: the bot
     // can be @'d in the seconds between being added and the bridge noticing the group.
     const newChats = Object.keys(chats).filter((chat) => !(chat in this.state.cursor));

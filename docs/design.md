@@ -269,7 +269,9 @@ external Worker: queued → waiting_manual
 
 发送方提供 `client_message_id` 作为幂等键；相同内容重试返回同一回执，不同内容冲突。分页使用自增 sequence 游标，列表只返回正文摘要。read 操作仅能标记接收人的读状态；管理员检查不会替员工标读。
 
-Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状态为 pending / offered / accepted / unknown / unsupported，accepted 仅表示原生桥接接受通知，不表示代理已读。通知前持久化本地去重记录；未知投递结果不重放模型回合，邮件始终可以从 inbox 主动读取。旧桥接升级后仅恢复明确未支持的通知，不重试 unknown 通知。
+Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状态为 pending / offered / accepted / unknown / unsupported / coalesced / checked，accepted 仅表示原生桥接接受通知，不表示代理已读。通知前持久化本地去重记录；未知投递结果不重放模型回合，邮件始终可以从 inbox 主动读取。旧桥接升级后仅恢复明确未支持的通知，不重试 unknown 通知。
+
+通知是门铃，不是信。原生回合里只有未读数和最新一封的元数据（发件人、主题、message_id），没有正文；代理用 `message inbox --unread` 自己决定拉多少封、是否合并处理。一个收件箱同一时间只挂一个门铃：门铃已响（offered / accepted）且接收人还没查看收件箱时，后续来信只记为 coalesced，不再排新的原生回合；接收人一调 `mail.list`（inbox）、`mail.get` 或 `mail.read`，这些通知记为 checked，门铃复位，下一封来信再响。门铃挂起超过 `mailRingIntervalMs`（默认 15 分钟）仍未查看，下一封来信会再响一次，保证代理不会被永久静音。这样消息堆积只增加未读数，不增加模型回合，也不会让代理按过时的先后顺序逐封执行。
 
 旧 `worker_message` Command 及其 wait 接口保留作为显式兼容路径；普通 message send 默认使用邮箱。任务执行继续使用原有 Command 的 check/report，不将普通来信包装成任务，也不为每封来信要求业务回复。
 

@@ -104,8 +104,11 @@ export class MailStore {
       const { body, ...message } = view(row);
       return { ...message, preview: body.slice(0, 600), body_length: body.length };
     });
-    return { folder, messages, next_cursor: hasMore ? messages.at(-1).sequence : null,
-      unread_count: Number(this.db.prepare('SELECT count(*) AS count FROM worker_mail WHERE recipient_worker_id=? AND read_at IS NULL').get(workerId).count) };
+    return { folder, messages, next_cursor: hasMore ? messages.at(-1).sequence : null, unread_count: this.unreadCount(workerId) };
+  }
+
+  unreadCount(workerId) {
+    return Number(this.db.prepare('SELECT count(*) AS count FROM worker_mail WHERE recipient_worker_id=? AND read_at IS NULL').get(workerId).count);
   }
 
   read(messageId, workerId) {
@@ -127,11 +130,29 @@ export class MailStore {
     return changed ? this.get(messageId) : null;
   }
 
+  // The notification is a doorbell for the inbox, not a letter: while one
+  // ring is outstanding, later mail is coalesced into it and the agent reads
+  // everything at once. Looking at the inbox re-arms the bell.
+  ringing(workerId, since) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM worker_mail WHERE recipient_worker_id=? AND read_at IS NULL
+      AND notification_status IN ('offered','accepted') AND notification_attempted_at>? LIMIT 1`).get(workerId, since));
+  }
+
+  coalesce(messageId) {
+    return this.db.prepare(`UPDATE worker_mail SET notification_status='coalesced',notification_attempted_at=?
+      WHERE message_id=? AND notification_status='pending' AND read_at IS NULL`).run(new Date().toISOString(), messageId).changes > 0;
+  }
+
+  checked(workerId) {
+    return this.db.prepare(`UPDATE worker_mail SET notification_status='checked'
+      WHERE recipient_worker_id=? AND read_at IS NULL AND notification_status IN ('offered','accepted','coalesced')`).run(workerId).changes;
+  }
+
   notification(messageId, status, error = null) {
     if (!['pending', 'accepted', 'unknown', 'unsupported'].includes(status)) throw mailError('Invalid notification status');
     this.db.prepare(`UPDATE worker_mail SET notification_status=?,notification_error=?,
       notified_at=CASE WHEN ?='accepted' THEN COALESCE(notified_at,?) ELSE notified_at END
-      WHERE message_id=? AND notification_status<>'accepted'`)
+      WHERE message_id=? AND notification_status NOT IN ('accepted','checked')`)
       .run(status, error, status, new Date().toISOString(), messageId);
     return this.get(messageId);
   }

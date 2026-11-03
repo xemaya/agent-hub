@@ -80,13 +80,13 @@ export class CodexQueueChannel {
     }
   }
 
-  async deliverMail(message) {
+  async deliverMail(message, unreadCount = null) {
     if (this.seenMail.has(message.message_id)) return;
     this.seenMail.add(message.message_id);
     let status = 'accepted';
     let failure = null;
     try {
-      const text = `Agent Hub 邮件，当前原生会话必须为 ${this.sessionId}，身份不符则停止。\n\n${mailPrompt(message)}`;
+      const text = `Agent Hub 收件箱门铃，当前原生会话必须为 ${this.sessionId}，身份不符则停止。\n\n${mailPrompt(message, unreadCount)}`;
       const { stdout } = await this.queue(this.executable, ['queue', '--thread', this.sessionId, '--message', text],
         { cwd: this.cwd, timeout: 45000, maxBuffer: 256 * 1024 });
       if (!stdout?.trim().startsWith('Queued message ') || !stdout.trim().endsWith(` for thread ${this.sessionId}.`)) {
@@ -132,7 +132,7 @@ export class CodexQueueChannel {
               try { await this.deliver(event); }
               catch (error) { deliveryFailed = !error.transportOnly; throw error; }
             }
-            if (event.type === 'mail') await this.deliverMail(event.message);
+            if (event.type === 'mail') await this.deliverMail(event.message, event.unread_count);
           }
         } catch (error) {
           if (this.stopped) break;

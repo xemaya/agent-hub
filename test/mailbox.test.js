@@ -261,3 +261,46 @@ test('Schema 11 upgrades retain legacy waiting commands without converting or re
   assert.equal(ctx.driver.executions.length, 0);
   assert.equal((await send(ctx, sender, recipient)).response.status, 202);
 });
+
+test('The notification is a doorbell: later mail is coalesced until the agent looks at its inbox, then rings again', async t => {
+  const ctx = await createTestContext(t);
+  const sender = await ctx.registerWorker({ attach: false });
+  const recipient = await ctx.registerWorker({ attach: false, runtime: 'codex', runtime_session_id: 'doorbell' });
+  const queued = [];
+  const channel = new CodexQueueChannel({ connectorUrl: ctx.connector.localUrl, token: ctx.connector.store.credentials.localToken, sessionId: recipient.runtime_session_id,
+    dataDir: path.join(ctx.root, 'connector'), retryMs: 10, logger: { error() {} },
+    queue: async (...args) => { queued.push(args[1][4]); return { stdout: 'Queued message ring for thread doorbell.' }; },
+  });
+  const running = channel.start(); running.catch(() => {}); t.after(async () => { channel.stop(); await running.catch(() => {}); });
+  await waitFor(() => channel.state === 'attached');
+  const status = id => ctx.hub.store.mailbox.get(id).notification_status;
+
+  const first = (await send(ctx, sender, recipient, { client_message_id: 'm1', body: 'first finding' })).payload.message;
+  await waitFor(() => status(first.message_id) === 'accepted');
+  assert.equal(queued.length, 1);
+  assert.match(queued[0], /收件箱门铃/);
+  assert.match(queued[0], /你有 1 封未读来信/);
+  assert.doesNotMatch(queued[0], /first finding/, 'the doorbell carries no body');
+
+  const second = (await send(ctx, sender, recipient, { client_message_id: 'm2', body: 'second finding' })).payload.message;
+  const third = (await send(ctx, sender, recipient, { client_message_id: 'm3', body: 'third finding' })).payload.message;
+  await waitFor(() => status(second.message_id) === 'coalesced' && status(third.message_id) === 'coalesced');
+  assert.equal(queued.length, 1, 'no extra native turn while the bell is outstanding');
+  assert.equal((await folder(ctx, recipient, 'inbox', { unread: 'true' })).payload.messages.length, 3);
+  for (const id of [first.message_id, second.message_id, third.message_id]) assert.equal(status(id), 'checked');
+
+  const fourth = (await send(ctx, sender, recipient, { client_message_id: 'm4', body: 'fourth finding' })).payload.message;
+  await waitFor(() => status(fourth.message_id) === 'accepted');
+  assert.equal(queued.length, 2, 'looking at the inbox re-arms the bell');
+  assert.match(queued[1], /你有 4 封未读来信/);
+
+  const fifth = (await send(ctx, sender, recipient, { client_message_id: 'm5', body: 'fifth finding' })).payload.message;
+  await waitFor(() => status(fifth.message_id) === 'coalesced');
+  ctx.hub.mailRingIntervalMs = 0;
+  const sixth = (await send(ctx, sender, recipient, { client_message_id: 'm6', body: 'sixth finding' })).payload.message;
+  await waitFor(() => status(sixth.message_id) === 'accepted');
+  assert.equal(queued.length, 3, 'an old unanswered bell rings again after the interval');
+  await action(ctx, recipient, sixth.message_id, 'read');
+  assert.equal(status(fifth.message_id), 'checked');
+  assert.equal(ctx.hub.store.listCommands().length, 0);
+});

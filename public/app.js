@@ -842,7 +842,7 @@ async function openMail(messageId, generation = state.mailGeneration) {
   renderMailbox();
   const { message } = await api(`/api/v1/mail/${encodeURIComponent(messageId)}`);
   if (generation !== state.mailGeneration || state.mailSelected !== messageId) return;
-  const notices = { pending: '等待会话接通', offered: '通知待确认', accepted: '会话桥接已接收通知', unknown: '通知结果未知，邮件仍保存在收件箱', unsupported: '当前会话桥接需升级才能推送通知；邮件已入箱，可直接读取' };
+  const notices = { pending: '等待会话接通', offered: '通知待确认', accepted: '会话桥接已接收通知', unknown: '通知结果未知，邮件仍保存在收件箱', unsupported: '当前会话桥接需升级才能推送通知；邮件已入箱，可直接读取', coalesced: '并入了收件箱已在响的门铃，员工查看收件箱时一并看到', checked: '员工已在通知后查看过收件箱' };
   $('#mail-reader').innerHTML = `
     <span class="mail-eyebrow">${state.mailFolder === 'inbox' ? 'INBOX' : 'OUTBOX'}</span>
     <h2>${escapeHtml(message.subject || '无主题')}</h2>

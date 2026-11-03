@@ -154,7 +154,9 @@ export class Hub {
     commandInactivityTimeoutMs = 60 * 60 * 1000,
     watchdogIntervalMs = 30000,
     shutdownGraceMs = 2000,
+    mailRingIntervalMs = 15 * 60 * 1000,
   }) {
+    this.mailRingIntervalMs = mailRingIntervalMs;
     this.host = host;
     this.build = build ?? { version: null, commit: null, dirty: false };
     this.connectorBuilds = new Map();
@@ -1390,9 +1392,15 @@ export class Hub {
     const socket = worker && this.connectors.get(worker.connector_id);
     if (!worker || worker.retired_at || !worker.push_capable || !socket
       || !this.connectorFeatures.get(worker.connector_id)?.has('mailbox_v1')) return;
+    // One doorbell per inbox: while a ring is outstanding and recent, later
+    // mail only raises the unread count the agent will see when it looks.
+    if (this.store.mailbox.ringing(worker.worker_id, new Date(Date.now() - this.mailRingIntervalMs).toISOString())) {
+      if (this.store.mailbox.coalesce(message.message_id)) this.broadcast('mail.updated', { message_id: message.message_id });
+      return;
+    }
     const offered = this.store.mailbox.offer(message.message_id);
     if (!offered) return;
-    if (!this.send(socket, 'mail.offer', { message: offered })) {
+    if (!this.send(socket, 'mail.offer', { message: offered, unread_count: this.store.mailbox.unreadCount(worker.worker_id) })) {
       this.store.mailbox.notification(message.message_id, 'pending');
     }
   }
@@ -1509,12 +1517,14 @@ export class Hub {
     if (['mail.list', 'mail.get', 'mail.read', 'mail.notice'].includes(message.type)) {
       const worker = this.workerSession(connectorId, payload);
       if (message.type === 'mail.list') {
+        if ((payload.folder ?? 'inbox') === 'inbox') this.store.mailbox.checked(worker.worker_id);
         this.send(socket, 'mail.list', this.store.mailbox.list(worker.worker_id, {
           folder: payload.folder ?? 'inbox', limit: payload.limit ?? 50, before: payload.before ?? null, unread: payload.unread === true,
         }), message.id);
         return;
       }
       const mail = this.mailForWorker(requiredString(payload.message_id, 'message_id', { max: 100 }), worker.worker_id);
+      if (['mail.get', 'mail.read'].includes(message.type) && mail.recipient_worker_id === worker.worker_id) this.store.mailbox.checked(worker.worker_id);
       if (message.type === 'mail.get') {
         this.send(socket, 'mail.message', { message: mail }, message.id);
       } else if (message.type === 'mail.read') {

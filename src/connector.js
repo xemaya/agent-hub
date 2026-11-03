@@ -402,7 +402,7 @@ export class Connector {
         // Persist before handing a notification to a native session. A lost
         // transport acknowledgement never replays the model turn.
         await this.store.saveMailNotification(mail.message_id, { session_id: channel.sessionId, runtime: channel.runtime, status: 'offered' });
-        this.writeChannelEvent(channel, { type: 'mail', message: mail });
+        this.writeChannelEvent(channel, { type: 'mail', message: mail, unread_count: message.payload.unread_count ?? null });
       }
       return;
     }

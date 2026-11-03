@@ -9,7 +9,8 @@
   "people": { "ou_colleague_open_id": "Anya" },
 
   "role": "qa",
-  "ack": "收到，QA 在查，查完回在这个话题里。",
+  "ack_reaction": "OK",
+  "ack": null,
   "prompt_hint": "按 youxian-qa/AGENTS.md「群里 @ 的跟进」处理。",
 
   "groups": {

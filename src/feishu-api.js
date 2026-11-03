@@ -2,8 +2,21 @@
 // The bridge is the only process that holds the bot's credentials: Workers
 // never talk to Feishu, they describe what should go out and the bridge sends it.
 
+import { createHash } from 'node:crypto';
+
 const TOKEN_EXPIRED = new Set([99991661, 99991663, 99991668]);
 const TOKEN_MARGIN_MS = 5 * 60 * 1000;
+const UUID_LIMIT = 50; // Feishu rejects a longer message uuid with 99992402 "field validation failed"
+
+// A message uuid Feishu accepts: the caller's key as it is when it fits, otherwise its
+// head plus a hash of the whole, so the same key always maps to the same uuid.
+export function idempotencyKey(key) {
+  if (!key) return undefined;
+  const text = String(key);
+  if (text.length <= UUID_LIMIT) return text;
+  const digest = createHash('sha256').update(text).digest('hex').slice(0, 16);
+  return `${text.slice(0, UUID_LIMIT - digest.length - 1)}-${digest}`;
+}
 
 export class FeishuError extends Error {
   constructor(message, { code = null, status = null } = {}) {
@@ -118,19 +131,30 @@ export class FeishuApi {
 
   // `uuid` is Feishu's idempotency key: the same uuid within 7 days sends once.
   async replyText(messageId, text, { uuid, inThread = true } = {}) {
+    const key = idempotencyKey(uuid);
     const data = await this.call('POST', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
-      body: { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: inThread, ...(uuid ? { uuid } : {}) },
+      body: { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: inThread, ...(key ? { uuid: key } : {}) },
     });
     return data.message_id ?? null;
+  }
+
+  // An emoji reaction on a message (emoji_type such as "OK", "THUMBSUP", "DONE"). Not
+  // idempotent on Feishu's side: callers remember what they reacted to.
+  async react(messageId, emojiType) {
+    const data = await this.call('POST', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+      body: { reaction_type: { emoji_type: emojiType } },
+    });
+    return data.reaction_id ?? null;
   }
 
   // Sends a text message; the result also carries the chat it landed in, which is how
   // the bot learns its own DM chat with a person.
   async send(receiveId, text, { uuid } = {}) {
     const type = receiveId.startsWith('oc_') ? 'chat_id' : receiveId.startsWith('ou_') ? 'open_id' : receiveId.startsWith('on_') ? 'union_id' : 'user_id';
+    const key = idempotencyKey(uuid);
     const data = await this.call('POST', '/open-apis/im/v1/messages', {
       query: { receive_id_type: type },
-      body: { receive_id: receiveId, msg_type: 'text', content: JSON.stringify({ text }), ...(uuid ? { uuid } : {}) },
+      body: { receive_id: receiveId, msg_type: 'text', content: JSON.stringify({ text }), ...(key ? { uuid: key } : {}) },
     });
     return { message_id: data.message_id ?? null, chat_id: data.chat_id ?? null };
   }

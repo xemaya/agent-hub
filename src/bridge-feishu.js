@@ -80,6 +80,9 @@ export function loadConfig(raw) {
     bot_per_hour: 6, // loop guard: at most this many messages from one listed bot per hour …
     bot_thread_per_hour: 3, // … and this many bot messages per thread per hour; beyond that they are dropped and logged
     loose_ttl_days: 7,
+    thread_scan_interval_s: 300, // how often each group's recent roots are re-listed to discover threads others opened
+    thread_scan_hours: 48, // how far back that listing looks
+    thread_max_per_chat: 20, // the most recently active discovered threads polled per group
     auto_approve_to_owner: true,
     ...raw,
   };
@@ -130,6 +133,8 @@ export class FeishuBridge {
       this.state.threadKeys ??= {}; // state files from before these maps existed
       this.state.eventFailures ??= {};
       this.state.botTurns ??= {};
+      this.state.knownThreads ??= {};
+      this.state.threadScanAt ??= 0;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       this.state = null;
@@ -156,6 +161,8 @@ export class FeishuBridge {
       threads: {}, // thread id → the @ message that opened it; dropped when the Hub says the task is over
       threadKeys: {}, // thread id → the Hub thread_key when it is not feishu:<thread id> (a thread opened later by the seat's reply)
       looseThreads: {}, // ordinary-group threads (not listed with the chat) → when we started following
+      knownThreads: {}, // thread id → { chat, at }: threads others opened, polled so an @ inside them is seen
+      threadScanAt: 0,
       eventFailures: {}, // Hub event id → failed handling attempts; skipped at EVENT_GIVE_UP
       botTurns: {}, // "bot:<app_id>" / "thread:<thread_key>" → recent seconds a listed bot's message was accepted (loop guard)
       approvals: {}, // owner DM message id → attention id waiting for 「发」
@@ -742,8 +749,41 @@ export class FeishuBridge {
       }
     }
 
-    // Ordinary-group threads are followed one by one, for a bounded time.
+    // Threads others opened: in an ordinary group the chat listing shows a thread's root
+    // (with its thread_id once it has replies) but never the replies, so an @ inside such
+    // a thread is invisible unless that thread is polled. Every thread_scan_interval_s the
+    // recent roots of each group are re-listed and their threads noted.
     const ttl = this.config.loose_ttl_days * 86400;
+    if (nowS - (this.state.threadScanAt ?? 0) >= this.config.thread_scan_interval_s) {
+      let scanOk = true;
+      for (const chatId of Object.keys(chats)) {
+        try {
+          for (const row of await this.feishu.chatMessagesSince(chatId, nowS - this.config.thread_scan_hours * 3600)) {
+            if (!row.thread_id) continue;
+            const known = this.state.knownThreads[row.thread_id];
+            this.state.knownThreads[row.thread_id] = { chat: chatId, at: Math.max(known?.at ?? 0, seconds(Number(row.create_time))) };
+          }
+        } catch (error) {
+          fail(`${chatId}-threads`, error);
+          scanOk = false;
+        }
+      }
+      if (scanOk) this.state.threadScanAt = nowS;
+      // Keep the most recently active few per group, and nothing older than the TTL.
+      // A thread with a live task of ours is polled regardless and is not counted.
+      const byChat = {};
+      for (const [threadId, info] of Object.entries(this.state.knownThreads)) {
+        if (this.state.threads[threadId]) continue;
+        if (nowS - info.at > ttl || !chats[info.chat]) delete this.state.knownThreads[threadId];
+        else (byChat[info.chat] ??= []).push([threadId, info.at]);
+      }
+      for (const list of Object.values(byChat)) {
+        for (const [threadId] of list.sort((a, b) => b[1] - a[1]).slice(this.config.thread_max_per_chat)) delete this.state.knownThreads[threadId];
+      }
+    }
+
+    // Threads are polled one by one: the ones our own work opened (looseThreads, for a
+    // bounded time) and the discovered ones.
     for (const [threadId, since] of Object.entries(this.state.looseThreads)) {
       if (nowS - since > ttl) {
         delete this.state.looseThreads[threadId];
@@ -753,10 +793,12 @@ export class FeishuBridge {
     }
     const threadStart = (this.state.threadCursor ?? nowS) - OVERLAP_S;
     let threadsOk = true;
-    for (const threadId of Object.keys(this.state.looseThreads)) {
+    for (const threadId of new Set([...Object.keys(this.state.looseThreads), ...Object.keys(this.state.knownThreads)])) {
       try {
         const rows = (await this.feishu.threadMessages(threadId)).filter((row) => Number(row.create_time) / 1000 >= threadStart).reverse();
         for (const message of rows) await this.process({ ...message, thread_id: threadId }, groupRoute);
+        const known = this.state.knownThreads[threadId];
+        if (known && rows.length) known.at = Math.max(known.at, ...rows.map((row) => seconds(Number(row.create_time))));
       } catch (error) {
         fail(threadId, error);
         threadsOk = false;
@@ -806,6 +848,7 @@ export class FeishuBridge {
       chats: Object.keys(this.state?.cursor ?? {}).length,
       threads: this.state?.threads ?? {},
       looseThreads: Object.keys(this.state?.looseThreads ?? {}).length,
+      knownThreads: Object.keys(this.state?.knownThreads ?? {}).length,
       pendingApprovals: Object.values(this.state?.approvals ?? {}),
       pendingQuestions: Object.values(this.state?.questions ?? {}),
       pendingConfirms: Object.keys(this.state?.confirms ?? {}).length,

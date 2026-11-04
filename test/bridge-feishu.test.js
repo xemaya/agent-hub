@@ -729,3 +729,46 @@ test('Only bots listed in `bots` can @ the seat; the loop guard caps their turns
   await bridge.tick();
   assert.equal(bridge.state.handled[later.message_id].state, 'followup');
 });
+
+test('An @ inside a thread someone else opened in an ordinary group is found by the thread scan', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t, { config: { groups: { [ORDINARY]: { name: '数字员工迭代', policy: 'auto' } }, thread_scan_interval_s: 300 } });
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  // A colleague's root message gets replies: Feishu then shows the thread on the root, but
+  // the replies themselves never appear in the chat listing.
+  const root = feishu.post(ORDINARY, '看板上的任务谁在做？');
+  root.thread_id = 'omt_theirs';
+  feishu.clock += 2000;
+  feishu.post(ORDINARY, '我在做', { threadId: 'omt_theirs', listed: false });
+  await bridge.tick();
+  assert.equal(context.hub.store.listTasks().length, 0);
+  assert.ok(bridge.state.knownThreads.omt_theirs, 'the first tick scans and notes the thread');
+
+  feishu.clock += 2000;
+  const at = feishu.post(ORDINARY, '@_user_1 这条你复测一下', { mentions: [BOT], threadId: 'omt_theirs', listed: false });
+  await bridge.tick();
+  assert.equal(context.hub.store.listTasks().length, 1, 'the @ inside the thread opened a task');
+  assert.ok(liveTask(context, 'feishu:omt_theirs'));
+  assert.deepEqual(feishu.reactions, [{ message_id: at.message_id, emoji: 'OK' }]);
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(first.input, /话题 omt_theirs/);
+  assert.match(first.input, /看板上的任务谁在做？/, 'the thread excerpt includes the root');
+
+  // Later replies in that thread are follow-ups of the same task.
+  feishu.clock += 2000;
+  feishu.post(ORDINARY, '补充：是昨天上线的那条', { threadId: 'omt_theirs', listed: false });
+  await bridge.tick();
+  await waitFor(() => driver.of('qa-a').find((c) => /补充：是昨天上线的那条/.test(c.input)));
+  assert.equal(context.hub.store.listTasks().length, 1);
+
+  // Old threads age out of the scan; the cap keeps only the most recent per group.
+  for (let i = 0; i < 25; i += 1) {
+    const r = feishu.post(ORDINARY, `话题 ${i}`);
+    r.thread_id = `omt_many_${i}`;
+    feishu.clock += 1000;
+  }
+  feishu.clock += 301 * 1000;
+  await bridge.tick();
+  assert.ok(Object.keys(bridge.state.knownThreads).length <= 21);
+  assert.equal(bridge.state.knownThreads.omt_many_0, undefined, 'the oldest idle thread fell off the cap');
+  assert.ok(bridge.state.knownThreads.omt_theirs, 'a thread with our live task stays polled');
+});

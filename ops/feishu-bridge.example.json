@@ -23,5 +23,8 @@
   },
   "default_policy": { "internal": "auto", "external": "confirm" },
   "loose_ttl_days": 7,
+  "thread_scan_interval_s": 300,
+  "thread_scan_hours": 48,
+  "thread_max_per_chat": 20,
   "auto_approve_to_owner": true
 }

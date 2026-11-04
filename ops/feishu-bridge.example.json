@@ -6,7 +6,10 @@
   "state_file": "feishu-bridge-state.json",
 
   "owner": { "name": "黄海斌", "union_id": "on_owner_union_id" },
-  "people": { "ou_colleague_open_id": "Anya" },
+  "people": { "ou_colleague_open_id": "Anya", "ou_pico_open_id": "PICO" },
+  "bots": { "cli_pico_app_id": "PICO" },
+  "bot_per_hour": 6,
+  "bot_thread_per_hour": 3,
 
   "role": "qa",
   "ack_reaction": "OK",

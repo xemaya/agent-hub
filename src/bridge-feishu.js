@@ -76,6 +76,9 @@ export function loadConfig(raw) {
     groups: {},
     default_policy: { internal: 'auto', external: 'confirm' },
     people: {},
+    bots: {}, // app_id → name: other bots whose @ and thread messages count as work; any other bot is ignored
+    bot_per_hour: 6, // loop guard: at most this many messages from one listed bot per hour …
+    bot_thread_per_hour: 3, // … and this many bot messages per thread per hour; beyond that they are dropped and logged
     loose_ttl_days: 7,
     auto_approve_to_owner: true,
     ...raw,
@@ -88,6 +91,9 @@ export function loadConfig(raw) {
   // identity and learns the owner DM chat from its first message to the owner.
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
   if (config.ack_reaction !== null && typeof config.ack_reaction !== 'string') throw new Error('feishu bridge config: ack_reaction must be an emoji_type string or null');
+  for (const [id, name] of Object.entries(config.bots)) {
+    if (!/^cli_/.test(id) || typeof name !== 'string' || !name) throw new Error(`bots: ${id} must map an app_id (cli_…) to a name`);
+  }
   for (const [chat, group] of Object.entries(config.groups)) {
     if (group.policy && !['auto', 'confirm', 'ignore'].includes(group.policy)) throw new Error(`group ${chat}: policy must be auto, confirm or ignore`);
     if (group.reply && !['auto', 'confirm'].includes(group.reply)) throw new Error(`group ${chat}: reply must be auto or confirm`);
@@ -123,6 +129,7 @@ export class FeishuBridge {
       this.state = JSON.parse(await readFile(this.stateFile, 'utf8'));
       this.state.threadKeys ??= {}; // state files from before these maps existed
       this.state.eventFailures ??= {};
+      this.state.botTurns ??= {};
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       this.state = null;
@@ -150,6 +157,7 @@ export class FeishuBridge {
       threadKeys: {}, // thread id → the Hub thread_key when it is not feishu:<thread id> (a thread opened later by the seat's reply)
       looseThreads: {}, // ordinary-group threads (not listed with the chat) → when we started following
       eventFailures: {}, // Hub event id → failed handling attempts; skipped at EVENT_GIVE_UP
+      botTurns: {}, // "bot:<app_id>" / "thread:<thread_key>" → recent seconds a listed bot's message was accepted (loop guard)
       approvals: {}, // owner DM message id → attention id waiting for 「发」
       questions: {}, // owner DM message id → attention id waiting for an answer
       confirms: {}, // owner DM message id → the @ in a confirm-policy group waiting for 「查」
@@ -202,8 +210,42 @@ export class FeishuBridge {
 
   // ---- Feishu helpers ----------------------------------------------------
 
+  // An @ counts when a person sent it, or a bot named in `bots`. Our own messages and
+  // every other bot's are never work: two bots acknowledging each other would never stop.
   mentionsBot(message) {
-    return message.sender?.sender_type === 'user' && (message.mentions ?? []).some((mention) => mention.id === this.botId());
+    if (message.sender?.sender_type !== 'user' && !this.trustedBot(message)) return false;
+    return (message.mentions ?? []).some((mention) => mention.id === this.botId());
+  }
+
+  trustedBot(message) {
+    const id = message.sender?.id;
+    if (message.sender?.sender_type !== 'app' || !id || id === this.config.app_id) return null;
+    return this.config.bots?.[id] ?? null;
+  }
+
+  // Who sent a message, as the seat is told: a person by name, a listed bot by name, any
+  // other bot as 机器人.
+  senderName(message) {
+    if (message.sender?.sender_type === 'app') return this.config.bots?.[message.sender.id] ?? '机器人';
+    return this.personName(message.sender?.id) ?? '群成员';
+  }
+
+  // Loop guard for listed bots: a bot gets at most bot_per_hour accepted messages, and a
+  // thread at most bot_thread_per_hour bot messages. Returns null for a person, otherwise
+  // { bot, exceeded } and records the turn when it was accepted.
+  botBudget(message, threadKey) {
+    const bot = this.trustedBot(message);
+    if (!bot) return null;
+    const now = seconds(this.now());
+    const recent = (key) => (this.state.botTurns[key] ?? []).filter((at) => at > now - 3600);
+    const botKey = `bot:${message.sender.id}`;
+    const threadKeyed = `thread:${threadKey}`;
+    const byBot = recent(botKey);
+    const byThread = recent(threadKeyed);
+    if (byBot.length >= this.config.bot_per_hour || byThread.length >= this.config.bot_thread_per_hour) return { bot, exceeded: true };
+    this.state.botTurns[botKey] = [...byBot, now];
+    this.state.botTurns[threadKeyed] = [...byThread, now];
+    return { bot, exceeded: false };
   }
 
   // A person writing in the bot's DM chat with the owner is the owner: that chat has
@@ -248,7 +290,7 @@ export class FeishuBridge {
     for (const row of rows) {
       const text = readableText(row);
       if (!text) continue;
-      const who = row.sender?.sender_type === 'app' ? '机器人' : this.personName(row.sender?.id) ?? '群成员';
+      const who = row.sender?.sender_type === 'app' && row.sender.id === this.config.app_id ? '机器人（我方）' : this.senderName(row);
       const line = `- [${beijing(row.create_time)}] ${who}：${clip(text, 400)}`;
       if (total + line.length > EXCERPT_LIMIT) {
         lines.push(`- …（还有更早的消息，话题 ${threadId}）`);
@@ -269,7 +311,12 @@ export class FeishuBridge {
     if (policy === 'ignore') return { state: 'ignored-group' };
     if (policy === 'confirm' && !message._confirmed) return this.askConfirm(message, chat);
     const where = this.chatName(chatId);
-    const who = this.personName(message.sender?.id) ?? '群成员';
+    const who = this.senderName(message);
+    const budget = this.botBudget(message, `feishu:${message.thread_id ?? mid}`);
+    if (budget?.exceeded) {
+      this.log(`bot ${budget.bot} over its hourly budget: ${mid} in ${where} dropped`);
+      return { state: 'bot-limited', bot: budget.bot };
+    }
     if (this.observe) {
       this.would(`acknowledge ${mid} in ${where} and open a ${this.config.role} task`);
       return { state: 'observed', thread: message.thread_id ?? null };
@@ -284,7 +331,8 @@ export class FeishuBridge {
     // opens one, and executeApproved starts following it under this task's key.
     const text = readableText(message);
     const prompt = [
-      `【群里的 @】飞书群「${where}」里 ${who} @ 了机器人（消息 ${mid}${threadId ? `，话题 ${threadId}` : ''}）。${acked}`,
+      `【群里的 @】飞书群「${where}」里 ${budget ? `机器人 ${who}` : who} @ 了机器人（消息 ${mid}${threadId ? `，话题 ${threadId}` : ''}）。${acked}`,
+      budget ? `发消息的是另一个机器人（${who}），不是真人：按同样的规则判断要不要回。机器人之间的往来一轮说完，不要为了礼貌、确认或致谢再回一条。` : '',
       `${threadId ? '话题' : '消息'}原文：\n${await this.excerpt(threadId, message)}`,
       `先判断这条 @ 要你做什么。只是通知、抄送或不需要回应的：不要回群，回报 done 并写明「只是通知，无需处理」。要你做事或回答的：按手册处理，要回群的内容不要自己发，用 agent_hub_report 回报 outcome "needs_approval"，action = {"channel":"feishu","kind":"reply","target":"${mid}","text":"<回复正文>","key":"<唯一键>","note":"回 ${who}：<一句话>"}，由渠道发到${threadId ? '这个话题' : '这条消息下的话题'}（有的群要先经${this.ownerName()}批准），结果会以新指令告诉你。`,
       `${threadId ? '这个话题' : '这条消息开出的话题'}后面的消息会作为同一任务的跟进直接发给你；对方说不用查、不用回，就停手结单。`,
@@ -340,10 +388,16 @@ export class FeishuBridge {
   async onThreadFollowup(message) {
     const text = readableText(message);
     if (!text) return { state: 'skipped' };
+    const threadKey = this.state.threadKeys[message.thread_id] ?? `feishu:${message.thread_id}`;
+    const budget = this.botBudget(message, threadKey);
+    if (budget?.exceeded) {
+      this.log(`bot ${budget.bot} over its hourly budget: ${message.message_id} in thread ${message.thread_id} dropped`);
+      return { state: 'bot-limited', bot: budget.bot };
+    }
     if (this.observe) return this.would(`forward thread message ${message.message_id} to the task of ${message.thread_id}`), { state: 'observed' };
-    const who = this.personName(message.sender?.id) ?? '群成员';
+    const who = budget ? `机器人 ${this.senderName(message)}` : this.senderName(message);
     const result = await this.hub.trigger({
-      trigger_key: `feishu:${message.message_id}`, thread_key: this.state.threadKeys[message.thread_id] ?? `feishu:${message.thread_id}`, source: 'feishu', actor: who, text, followup_only: true,
+      trigger_key: `feishu:${message.message_id}`, thread_key: threadKey, source: 'feishu', actor: who, text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
     });
     if (result.routed === 'followup' && this.config.ack_reaction) {
       await this.feishu.react(message.message_id, this.config.ack_reaction).catch((error) => this.log(`react on follow-up ${message.message_id} failed: ${error.message}`));
@@ -672,7 +726,7 @@ export class FeishuBridge {
     // @s the bot: people @ to address, not to open something new. Only an @ outside
     // any followed thread opens a task.
     const groupRoute = (message) => {
-      if (message.sender?.sender_type !== 'user') return null;
+      if (message.sender?.sender_type !== 'user' && !this.trustedBot(message)) return null;
       if (message.thread_id && this.state.threads[message.thread_id]) return (m) => this.onThreadFollowup(m);
       if (this.mentionsBot(message)) return (m) => this.onMention(m, chats[m.chat_id]);
       return null;

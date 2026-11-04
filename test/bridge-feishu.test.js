@@ -12,6 +12,8 @@ const OWNER_DM = 'oc_owner_dm';
 const FEEDBACK = 'oc_feedback'; // topic-mode group: thread replies appear in the chat listing
 const ORDINARY = 'oc_ordinary'; // ordinary group: thread replies do not
 const EXTERNAL = 'oc_external';
+const PICO = 'cli_pico'; // another bot, as a sender (app_id)
+const PICO_OPEN = 'ou_pico'; // the same bot when @'d
 
 // An in-memory Feishu: chats, messages (with threads), sends and replies with
 // uuid de-duplication, and a per-call failure switch.
@@ -39,7 +41,7 @@ class FakeFeishu {
       message_id: this.id(), chat_id: chatId, thread_id: threadId ?? (chatId === FEEDBACK ? this.id('omt') : null), listed, parent_id: parentId,
       create_time: String(at ?? this.clock), msg_type: 'text', deleted: false,
       sender: { id: from, id_type: 'open_id', sender_type: senderType },
-      mentions: mentions.map((id, index) => ({ key: `@_user_${index + 1}`, id, id_type: 'open_id', name: id === BOT ? 'QA机器人' : id })),
+      mentions: mentions.map((id, index) => ({ key: `@_user_${index + 1}`, id, id_type: 'open_id', name: id === BOT ? 'QA机器人' : id === PICO_OPEN ? 'PICO' : id })),
       body: { content: JSON.stringify({ text }) },
     };
     this.messages.push(message);
@@ -671,4 +673,59 @@ test('A Hub event whose handling keeps failing is skipped after a few ticks inst
   feishu.clock += 60_000;
   await bridge.tick();
   assert.match(feishu.dms().at(-1), /task_next/);
+});
+
+test('Only bots listed in `bots` can @ the seat; the loop guard caps their turns; our own messages are never work', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t, { config: { bots: { [PICO]: 'PICO' }, people: { ou_colleague: 'Anya', [PICO_OPEN]: 'PICO' }, bot_thread_per_hour: 2, bot_per_hour: 3 } });
+  driver.answers['qa-a'] = (command) => (/【群里的 @】/.test(command.input)
+    ? { text: '回了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '@PICO 收到。', key: 'pico-1' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+
+  // An unlisted bot and our own app are ignored outright.
+  feishu.post(FEEDBACK, '@_user_1 我是别的机器人', { from: 'cli_stranger', senderType: 'app', mentions: [BOT] });
+  feishu.post(FEEDBACK, '@_user_1 我是我自己', { from: 'cli_test', senderType: 'app', mentions: [BOT] });
+  await bridge.tick();
+  assert.equal(context.hub.store.listTasks().length, 0);
+  assert.deepEqual(feishu.reactions, []);
+
+  // A listed bot opens a task; the seat is told it is a bot; @PICO in the reply becomes a mention.
+  const at = feishu.post(FEEDBACK, '@_user_1 请回复一句收到', { from: PICO, senderType: 'app', mentions: [BOT] });
+  await bridge.tick();
+  assert.equal(context.hub.store.listTasks().length, 1);
+  assert.deepEqual(feishu.reactions, [{ message_id: at.message_id, emoji: 'OK' }]);
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(first.input, /机器人 PICO @ 了机器人/);
+  assert.match(first.input, /不是真人/);
+  await finished(context, first.command_id);
+  feishu.clock += 2000;
+  await bridge.tick();
+  feishu.clock += 2000;
+  await bridge.tick();
+  const sent = feishu.replies().find((r) => /收到。/.test(r.text));
+  assert.equal(sent.text, '<at user_id="ou_pico">PICO</at> 收到。');
+
+  // The bot answers in the thread: forwarded once more, then capped (2 per thread per hour).
+  feishu.clock += 2000;
+  feishu.post(FEEDBACK, '谢谢，再确认一下', { from: PICO, senderType: 'app', threadId: at.thread_id });
+  await bridge.tick();
+  const followup = await waitFor(() => driver.of('qa-a').find((c) => /再确认一下/.test(c.input)));
+  assert.match(followup.input, /来自机器人 PICO/);
+  feishu.clock += 2000;
+  const capped = feishu.post(FEEDBACK, '好的收到', { from: PICO, senderType: 'app', threadId: at.thread_id });
+  await bridge.tick();
+  assert.equal(bridge.state.handled[capped.message_id].state, 'bot-limited');
+  assert.equal(driver.of('qa-a').filter((c) => /好的收到/.test(c.input)).length, 0);
+
+  // A person in the same thread is not affected by the bot budget.
+  feishu.clock += 2000;
+  feishu.post(FEEDBACK, '人类追问', { threadId: at.thread_id });
+  await bridge.tick();
+  await waitFor(() => driver.of('qa-a').find((c) => /人类追问/.test(c.input)));
+
+  // An hour later the bot may speak again.
+  feishu.clock += 3600 * 1000;
+  const later = feishu.post(FEEDBACK, '一小时后', { from: PICO, senderType: 'app', threadId: at.thread_id });
+  await bridge.tick();
+  assert.equal(bridge.state.handled[later.message_id].state, 'followup');
 });

@@ -147,7 +147,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 | **审批型 Attention** | Hub：`agent_hub_report` 新 outcome `needs_approval`，带 `action: { channel, kind, target, text, key }` | 「对外动作要人批」从各仓的本机文件变成 Hub 上的一条记录：Dashboard 可见、跨机可见、接手的座位能看到「前任已提交草稿等审批」。回答 `approve` / `reject` / 其他文字；approve 后由对应渠道桥执行并把发出的消息 id 回写到 Attention，其他文字当修改意见转回负责的座位 |
 | **事件游标** `GET /api/v1/events?after=<id>` | Hub | 桥按游标拉事件做通知，重启不漏不重 |
 | **通知规则** | 桥的配置 | 只在需要人时说话：`attention.created`（提问 / 阻塞 / 待审批）、`handoff.exhausted`、派发时没座位或全忙、桥自身出错超过 N 分钟。任务 done、交接成功这类不通知 |
-| **gate 配置** | 桥的配置文件 | 每个群：`role`（派给哪个岗位）、`policy`（internal 群 `auto`：@ 自动开任务、回复自动发出并私信业主回执；external 群默认 `confirm`：先私信业主「查不查」，回复也要业主批；或 `ignore`）、`reply: confirm` 可单独要求某个 auto 群的回复过审、`ack_reaction`（@ 上回的表情，默认 OK）和可选的 `ack` 文案；私信：哪些人是业主、业主私信派给哪个岗位 |
+| **gate 配置** | 桥的配置文件 | 每个群：`role`（派给哪个岗位）、`policy`（internal 群 `auto`：@ 自动开任务、回复自动发出并私信业主回执；external 群默认 `confirm`：先私信业主「查不查」，回复也要业主批；或 `ignore`）、`reply: confirm` 可单独要求某个 auto 群的回复过审、`ack_reaction`（@ 上回的表情，默认 OK）和可选的 `ack` 文案；`bots`：允许哪些别的机器人 @ 我们（其余机器人一律不理），配合每小时的回环上限；私信：哪些人是业主、业主私信派给哪个岗位 |
 
 桥把话题原文（最近若干条，≤1,500 字 + 「还有 N 条」）直接写进 trigger 文本，追问照旧按 thread_key 直达。于是 **Worker 完全不需要飞书凭证**：读不用、写走审批。这是「对人可控」的硬保证，比白名单更靠得住。
 

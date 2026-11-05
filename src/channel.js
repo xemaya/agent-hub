@@ -212,8 +212,10 @@ export class ChannelServer {
       return;
     }
     if (event.type === 'mail') {
+      // Claude Code rejects the whole notification if any meta value is not a string.
       this.notify('notifications/claude/channel', { content: mailPrompt(event.message, event.unread_count),
-        meta: { message_id: event.message.message_id, kind: 'worker_mail', unread_count: event.unread_count ?? null } });
+        meta: { message_id: event.message.message_id, kind: 'worker_mail',
+          ...(event.unread_count != null ? { unread_count: String(event.unread_count) } : {}) } });
       fetch(`${this.connectorUrl}/local/v1/mail/${encodeURIComponent(event.message.message_id)}/notice`, {
         method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({ runtime: this.runtime, runtime_session_id: this.sessionId, status: 'accepted' }),

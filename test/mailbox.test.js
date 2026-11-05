@@ -183,6 +183,25 @@ test('Kimi and Claude mail delivery never requires a task report or creates a re
   await waitFor(() => ctx.hub.store.mailbox.get(next.message_id).notification_status === 'accepted');
   assert.match(text, /worker_mail/);
   assert.equal(ctx.hub.store.listCommands().length, 0);
+  const [notice] = text.trim().split('\n').map(line => JSON.parse(line)).filter(line => line.params?.meta?.kind === 'worker_mail');
+  assert.deepEqual(notice.params.meta, { message_id: next.message_id, kind: 'worker_mail', unread_count: '1' });
+});
+
+// Claude Code rejects a channel notification whose meta has a non-string value,
+// and the mail never reaches the session even though the bridge wrote it.
+test('Claude mail notifications carry only string meta values', async t => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
+  const output = new PassThrough(); let text = '';
+  output.on('data', chunk => { text += chunk.toString(); });
+  const channel = new ChannelServer({ connectorUrl: 'http://127.0.0.1:1', token: 'test', runtime: 'claude', sessionId: 'meta', output, logger: { error() {} } });
+  const message = { message_id: 'mail_meta', sender_name: 'sender', subject: 'hello' };
+  channel.handleEvent({ type: 'mail', message, unread_count: 3 });
+  channel.handleEvent({ type: 'mail', message, unread_count: 0 });
+  channel.handleEvent({ type: 'mail', message, unread_count: null });
+  channel.handleEvent({ type: 'mail', message });
+  const metas = text.trim().split('\n').map(line => JSON.parse(line).params.meta);
+  const base = { message_id: 'mail_meta', kind: 'worker_mail' };
+  assert.deepEqual(metas, [{ ...base, unread_count: '3' }, { ...base, unread_count: '0' }, base, base]);
 });
 
 test('CLI defaults to nonblocking mail and exposes inbox, outbox, read, receipt and independent reply', async t => {

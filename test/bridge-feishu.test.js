@@ -284,8 +284,17 @@ test('An @ in a topic group is acked in the thread and opens a Role task with th
   const followup = await waitFor(() => driver.of('qa-a')[1]);
   assert.match(followup.input, /【跟进】/);
   assert.match(followup.input, /这个不用查，只是通知/);
-  assert.deepEqual(feishu.reactions.at(-1), { message_id: again.message_id, emoji: 'OK' }, 'follow-ups get the reaction too');
+  assert.deepEqual(feishu.reactions.at(-1), { message_id: again.message_id, emoji: 'OK' }, 'an @ inside the thread gets the reaction too');
   assert.deepEqual(feishu.replies(), []);
+
+  // Someone else's message in the thread without an @ is still forwarded, but not stamped with the reaction.
+  feishu.clock += 2000;
+  const aside = feishu.post(FEEDBACK, '补充：是昨晚八点开始的', { threadId: at.thread_id });
+  await bridge.tick();
+  const forwarded = await waitFor(() => driver.of('qa-a')[2]);
+  assert.match(forwarded.input, /昨晚八点开始的/);
+  assert.equal(feishu.reactions.length, 2, 'no reaction on a thread message that did not @ the bot');
+  assert.notEqual(feishu.reactions.at(-1).message_id, aside.message_id);
 });
 
 test('With an ack sentence configured the bridge replies it, and the seat is told', async (t) => {
@@ -505,6 +514,7 @@ test('A question from a seat is DMed and the quoted reply answers it; a message 
   const ask = feishu.post(OWNER_DM, '看板上有几条待验证？', { from: OWNER });
   await bridge.tick();
   assert.ok(liveTask(context, `feishu-dm:${ask.message_id}`), 'an owner DM is a task of its own');
+  assert.deepEqual(feishu.reactions, [{ message_id: ask.message_id, emoji: 'OK' }], 'the owner DM gets the reaction');
   const first = await waitFor(() => driver.of('qa-a')[0]);
   assert.match(first.input, /"kind":"send","target":"ou_owner"/);
   await finished(context, first.command_id);

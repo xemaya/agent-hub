@@ -71,7 +71,7 @@ export function loadConfig(raw) {
     hub_url: 'http://127.0.0.1:8787',
     role: null,
     ack: null, // optional sentence replied in the thread on an @; off by default, the reaction is the ack
-    ack_reaction: DEFAULT_ACK_REACTION, // emoji_type reacted on an @ and on thread follow-ups; null for none
+    ack_reaction: DEFAULT_ACK_REACTION, // emoji_type reacted on an @ (also inside a followed thread) and on an owner DM that opens a task; never on other people's thread messages; null for none
     prompt_hint: '',
     groups: {},
     default_policy: { internal: 'auto', external: 'confirm' },
@@ -406,7 +406,8 @@ export class FeishuBridge {
     const result = await this.hub.trigger({
       trigger_key: `feishu:${message.message_id}`, thread_key: threadKey, source: 'feishu', actor: who, text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
     });
-    if (result.routed === 'followup' && this.config.ack_reaction) {
+    // Only an @ gets the reaction: other people's messages in a followed thread are read, not stamped (owner 11-05).
+    if (result.routed === 'followup' && this.config.ack_reaction && this.mentionsBot(message)) {
       await this.feishu.react(message.message_id, this.config.ack_reaction).catch((error) => this.log(`react on follow-up ${message.message_id} failed: ${error.message}`));
     }
     return { state: result.routed ?? 'ignored', thread: message.thread_id };
@@ -450,6 +451,9 @@ export class FeishuBridge {
         this.config.prompt_hint,
       ].filter(Boolean).join('\n\n'),
     });
+    if (this.config.ack_reaction) {
+      await this.feishu.react(mid, this.config.ack_reaction).catch((error) => this.log(`react on DM ${mid} failed: ${error.message}`));
+    }
     if (result.waiting_for_seat) await this.dmOwner(`收到。${result.seats_busy ? SEATS_BUSY : NO_SEAT}`, `bridge-noseat-${mid}`);
     return { state: result.waiting_for_seat ? 'queued' : 'dispatched', task: result.task?.task_id ?? null };
   }

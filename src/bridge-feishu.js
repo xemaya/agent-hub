@@ -84,6 +84,12 @@ export function loadConfig(raw) {
     thread_scan_hours: 48, // how far back that listing looks
     thread_max_per_chat: 20, // the most recently active discovered threads polled per group
     auto_approve_to_owner: true,
+    // Several bridges (one per Feishu app) can serve one Hub. Approvals, questions and
+    // receipts are Hub-wide events, so each bridge must take only its share or the same
+    // reply goes out once per bot: own_role_only takes just `role`; other_roles names the
+    // Roles another bridge serves, which this one then skips.
+    own_role_only: false,
+    other_roles: [],
     ...raw,
   };
   if (!config.app_id) throw new Error('feishu bridge config needs app_id');
@@ -93,6 +99,8 @@ export function loadConfig(raw) {
   // bot_open_id and owner.dm_chat are optional: the bridge asks Feishu for its bot
   // identity and learns the owner DM chat from its first message to the owner.
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
+  if (!Array.isArray(config.other_roles) || config.other_roles.some((role) => typeof role !== 'string' || !role)) throw new Error('feishu bridge config: other_roles must be a list of Role keys');
+  if (config.other_roles.includes(config.role)) throw new Error('feishu bridge config: other_roles must not name this bridge\'s own role');
   if (config.ack_reaction !== null && typeof config.ack_reaction !== 'string') throw new Error('feishu bridge config: ack_reaction must be an emoji_type string or null');
   for (const [id, name] of Object.entries(config.bots)) {
     if (!/^cli_/.test(id) || typeof name !== 'string' || !name) throw new Error(`bots: ${id} must map an app_id (cli_…) to a name`);
@@ -544,15 +552,23 @@ export class FeishuBridge {
     }
   }
 
+  // Whether this bridge answers for work of `roleKey` (null = work outside any Role).
+  servesRole(roleKey) {
+    if (this.config.own_role_only) return roleKey === this.config.role;
+    return !this.config.other_roles.includes(roleKey);
+  }
+
   async onEvent(event) {
     const attentionId = event.payload?.attention_id;
     if (event.event_type === 'handoff.exhausted') {
+      if (!this.servesRole(event.payload?.role_key ?? null)) return;
       await this.dmOwner(`任务 ${event.task_id} 已经交接了 ${event.payload?.limit ?? 3} 次都没做完（岗位 ${event.payload?.role_key ?? ''}），Hub 停止自动交接，需要你看一下。`, `bridge-exhausted-${event.event_id}`);
       return;
     }
     if (!attentionId) return;
     const attention = await this.hub.attention(attentionId).catch(() => null);
     if (!attention) return;
+    if (!this.servesRole(attention.role_key ?? null)) return;
     if (event.event_type === 'attention.created') return this.notifyAttention(attention);
     if (event.event_type === 'attention.approved') return this.executeApproved(attention);
     if (event.event_type === 'attention.executed' && attention.action?.channel !== 'feishu') {

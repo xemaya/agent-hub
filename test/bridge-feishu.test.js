@@ -463,6 +463,52 @@ test('A draft reported as needs_approval reaches the owner, 「发」 sends it a
   assert.equal(feishu.replies().length, before);
 });
 
+test('Two bridges on one Hub: each takes only its own Role\'s approvals, so a reply is never sent twice', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t, { config: { ...REPLY_CONFIRM, other_roles: ['hb-agent'] } });
+  // A second app's bridge serving another Role, on the same Hub.
+  const otherFeishu = new FakeFeishu();
+  const other = new FeishuBridge({
+    config: loadConfig({ ...CONFIG, ...REPLY_CONFIRM, app_id: 'cli_other', role: 'hb-agent', own_role_only: true }),
+    feishu: new FeishuApi({ appId: 'cli_other', appSecret: 's', fetch: otherFeishu.fetch, now: () => otherFeishu.clock }),
+    hub: new HubAdmin({ baseUrl: context.hub.url, token: 'test-admin' }),
+    stateFile: path.join(context.root, 'bridge-other', 'state.json'), now: () => otherFeishu.clock, logger: { log() {}, error() {} },
+  });
+  await other.load();
+  await other.tick();
+  driver.answers['qa-a'] = (command) => (/【群里的 @】/.test(command.input)
+    ? { text: '草稿好了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'reply', target: /"target":"(om_\d+)"/.exec(command.input)[1], text: '查过了：是缓存，已修。', key: 'qa-two-bridges' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const at = feishu.post(FEEDBACK, '@_user_1 搜索有问题', { mentions: [BOT] });
+  await bridge.tick();
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  await finished(context, first.command_id);
+  const attention = await waitFor(() => context.hub.store.openAttentionForTask(liveTask(context, `feishu:${at.thread_id}`).task_id));
+  assert.equal(attention.role_key, 'qa');
+
+  otherFeishu.clock += 2000;
+  await other.tick();
+  assert.ok(!otherFeishu.dms().some((text) => /【待确认】/.test(text)), 'the other Role\'s bridge leaves the draft alone');
+  assert.deepEqual(other.state.approvals, {});
+
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.equal(feishu.dms().filter((text) => /【待确认】/.test(text)).length, 1, 'the owning bridge DMs the draft');
+
+  feishu.clock += 2000;
+  feishu.post(OWNER_DM, '发', { from: OWNER });
+  await bridge.tick();
+  otherFeishu.clock += 2000;
+  await other.tick();
+  assert.equal(feishu.replies().filter((r) => r.text === '查过了：是缓存，已修。').length, 1);
+  assert.equal(otherFeishu.replies().length, 0, 'the other bot sends nothing');
+});
+
+test('other_roles cannot name the bridge\'s own role', () => {
+  assert.throws(() => loadConfig({ ...CONFIG, other_roles: ['qa'] }), /must not name this bridge's own role/);
+  assert.throws(() => loadConfig({ ...CONFIG, other_roles: 'hb-agent' }), /must be a list/);
+});
+
 test('Feedback instead of 「发」 goes back to the seat; several pending decisions need a quote', async (t) => {
   const { context, driver, feishu, bridge } = await setup(t, { config: REPLY_CONFIRM });
   const drafts = [];

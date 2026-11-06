@@ -168,6 +168,9 @@ function attentionView(row) {
     worker_name: row.worker_name ?? null,
     task_title: row.task_title ?? null,
     task_number: row.task_number == null ? null : Number(row.task_number),
+    // The Role the work belongs to (the task's, else the seat's): a channel bridge
+    // serving one Role leaves another Role's approvals and questions alone.
+    role_key: row.task_role_key ?? row.worker_role_key ?? null,
     orchestration_id: row.orchestration_id ?? null,
     step_key: row.step_key ?? null,
     outcome: row.outcome,
@@ -245,7 +248,8 @@ function chatMessageView(row) {
 }
 
 const ATTENTION_SELECT = `
-  SELECT a.*, w.name AS worker_name, t.title AS task_title, t.task_number AS task_number
+  SELECT a.*, w.name AS worker_name, t.title AS task_title, t.task_number AS task_number,
+    t.role_key AS task_role_key, w.role_key AS worker_role_key
   FROM attentions AS a
   LEFT JOIN workers AS w ON w.worker_id = a.worker_id
   LEFT JOIN tasks AS t ON t.task_id = a.task_id

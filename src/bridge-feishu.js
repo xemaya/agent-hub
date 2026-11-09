@@ -400,7 +400,7 @@ export class FeishuBridge {
     return { state: 'awaiting-confirm', dm };
   }
 
-  async onThreadFollowup(message) {
+  async onThreadFollowup(message, chat) {
     const text = readableText(message);
     if (!text) return { state: 'skipped' };
     const threadKey = this.state.threadKeys[message.thread_id] ?? `feishu:${message.thread_id}`;
@@ -412,11 +412,21 @@ export class FeishuBridge {
     if (this.observe) return this.would(`forward thread message ${message.message_id} to the task of ${message.thread_id}`), { state: 'observed' };
     const who = budget ? `机器人 ${this.senderName(message)}` : this.senderName(message);
     const result = await this.hub.trigger({
-      trigger_key: `feishu:${message.message_id}`, thread_key: threadKey, source: 'feishu', actor: who, text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
+      // Keyed apart from a fresh @ (`feishu:<mid>`): the Hub answers a repeated trigger_key with the
+      // earlier outcome, which would turn the fallback below into another `ignored`.
+      trigger_key: `feishu:${message.message_id}:followup`, thread_key: threadKey, source: 'feishu', actor: who, text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
     });
     // Only an @ gets the reaction: other people's messages in a followed thread are read, not stamped (owner 11-05).
     if (result.routed === 'followup' && this.config.ack_reaction && this.mentionsBot(message)) {
       await this.feishu.react(message.message_id, this.config.ack_reaction).catch((error) => this.log(`react on follow-up ${message.message_id} failed: ${error.message}`));
+    }
+    // The thread's task is over (Hub: ignored). An @ here is a new request in the same thread, not a
+    // stray echo: open a task for it (same thread_key, so later messages follow it). Found 11-08 when
+    // Zenas's second @ in a thread the seat had just closed was dropped.
+    if (result.routed !== 'followup' && this.mentionsBot(message)) {
+      // Forget the old task's key only; the thread stays polled, and the new task's key is the thread's own.
+      delete this.state.threadKeys[message.thread_id];
+      return this.onMention(message, chat);
     }
     return { state: result.routed ?? 'ignored', thread: message.thread_id };
   }
@@ -754,7 +764,7 @@ export class FeishuBridge {
     // any followed thread opens a task.
     const groupRoute = (message) => {
       if (message.sender?.sender_type !== 'user' && !this.trustedBot(message)) return null;
-      if (message.thread_id && this.state.threads[message.thread_id]) return (m) => this.onThreadFollowup(m);
+      if (message.thread_id && this.state.threads[message.thread_id]) return (m) => this.onThreadFollowup(m, chats[m.chat_id]);
       if (this.mentionsBot(message)) return (m) => this.onMention(m, chats[m.chat_id]);
       return null;
     };

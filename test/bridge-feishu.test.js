@@ -347,9 +347,24 @@ test('An @ in an ordinary group has no thread until the seat replies; that threa
   assert.match(followup.input, /【跟进】/);
   assert.equal(context.hub.store.listTasks().length, 1, 'the follow-up went to the existing task');
 
-  // Once the task is done the thread is dropped.
+  // Once the task is done, an @ in that thread is a new request, not a leftover: it opens a
+  // second task under the same thread (11-08: Zenas's「已经修正，再查下」right after the seat closed).
   await finished(context, followup.command_id);
-  await context.admin(`/api/v1/tasks/${liveTask(context, `feishu:${at.message_id}`).task_id}`, { method: 'PATCH', body: { status: 'done' } });
+  const firstTask = liveTask(context, `feishu:${at.message_id}`).task_id;
+  await context.admin(`/api/v1/tasks/${firstTask}`, { method: 'PATCH', body: { status: 'done' } });
+  feishu.clock += 2000;
+  const again = feishu.post(ORDINARY, '@_user_1 已经修正，再查下最近半小时', { mentions: [BOT], threadId: at.thread_id, listed: false });
+  await bridge.tick();
+  const reopened = await waitFor(() => driver.of('qa-a').find((c) => /再查下最近半小时/.test(c.input)));
+  assert.match(reopened.input, /【群里的 @】/);
+  assert.equal(context.hub.store.listTasks().length, 2, 'a second task in the same thread');
+  assert.deepEqual(feishu.reactions.at(-1), { message_id: again.message_id, emoji: 'OK' });
+  assert.equal(bridge.state.threads[at.thread_id], again.message_id, 'the thread is followed again under the new task');
+
+  // A plain message after the second task is done drops the thread.
+  await finished(context, reopened.command_id);
+  const secondTask = context.hub.store.listTasks().find((task) => task.task_id !== firstTask).task_id;
+  await context.admin(`/api/v1/tasks/${secondTask}`, { method: 'PATCH', body: { status: 'done' } });
   feishu.clock += 2000;
   feishu.post(ORDINARY, '谢谢', { threadId: at.thread_id, listed: false });
   await bridge.tick();

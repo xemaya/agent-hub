@@ -434,3 +434,53 @@ test('A symlinked --cwd is the same directory as the real path the Channel repor
   assert.equal(second.payload.warnings, undefined);
   assert.equal(second.payload.worker.cwd, root);
 });
+
+test('Work waiting past the takeover delay is reported once to the Role\'s alert Role; later stalls follow up in the same alert task', async (t) => {
+  const { context, driver } = await setup(t, { takeoverAfterMs: 60000 });
+  const set = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { alert_role: 'ops' } });
+  assert.equal(set.response.status, 200, JSON.stringify(set.payload));
+  assert.equal(set.payload.role.alert_role, 'ops');
+  assert.ok(context.hub.store.getRole('ops'), 'the alert Role is created on reference');
+  const self = await context.admin('/api/v1/roles/qa', { method: 'PUT', body: { alert_role: 'qa' } });
+  assert.equal(self.response.status, 400, 'a Role cannot alert itself');
+  await context.registerWorker({ name: 'ops-a', role: 'ops' });
+
+  // Nobody on qa: the work waits in its handoff. Before the delay passes nothing is raised.
+  const first = (await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: '登录页报错了', title: '登录报错' })).payload;
+  assert.equal(first.waiting_for_seat, true);
+  await context.hub.roles.tick();
+  assert.equal(driver.of('ops-a').length, 0, 'no alert before the takeover delay');
+
+  const clock = Date.now() + 61000;
+  context.hub.roles.now = () => clock;
+  await context.hub.roles.tick();
+  await waitFor(() => driver.of('ops-a').length === 1);
+  const alert = driver.of('ops-a')[0];
+  assert.match(alert.input, /【岗位告警】岗位「QA」（qa）的任务/);
+  assert.match(alert.input, /登录报错/);
+  assert.match(alert.input, /岗位上没有登记任何会话/);
+  const alertTask = context.hub.store.getCommand(alert.command_id).task_id;
+  assert.equal(context.hub.store.getTask(alertTask).role_key, 'ops');
+  assert.equal(context.hub.store.getTask(alertTask).thread_key, 'hub-alert:qa');
+  assert.ok(context.hub.store.getHandoff(first.handoff_id).alerted_at, 'the handoff remembers it was reported');
+  await finished(context, alert.command_id);
+
+  await context.hub.roles.tick();
+  assert.equal(driver.of('ops-a').length, 1, 'the same stall is not reported twice');
+
+  // A second stalled task while the alert task is still open is a follow-up, not a new alert task.
+  const second = (await trigger(context, { trigger_key: 'm2', thread_key: 'feishu:t2', role: 'qa', text: '搜索也报错', title: '搜索报错' })).payload;
+  assert.equal(second.waiting_for_seat, true);
+  context.hub.roles.now = () => clock + 61000;
+  await context.hub.roles.tick();
+  await waitFor(() => driver.of('ops-a').length === 2);
+  assert.match(driver.of('ops-a')[1].input, /【跟进】/);
+  assert.match(driver.of('ops-a')[1].input, /搜索报错/);
+  assert.equal(context.hub.store.getCommand(driver.of('ops-a')[1].command_id).task_id, alertTask);
+  assert.equal(context.hub.store.listTasks().filter((task) => task.role_key === 'ops').length, 1);
+
+  // The qa handoffs themselves are untouched: a qa seat still takes them.
+  await context.registerWorker({ name: 'qa-a', role: 'qa', runtime_session_id: 'qa-window' });
+  await waitFor(() => context.hub.store.getHandoff(first.handoff_id).status === 'dispatched');
+  assert.equal(events(context, 'role.alerted').length, 2);
+});

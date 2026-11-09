@@ -200,6 +200,7 @@ export class Hub {
       dispatch: (command) => this.dispatch(command),
       broadcast: (type, payload) => this.broadcast(type, payload),
       cancel: (commandId, options) => this.cancelCommand(commandId, options),
+      alert: (payload) => this.receiveTrigger(null, payload),
       logger: this.logger,
     });
     this.server = createServer((request, response) => {
@@ -1018,12 +1019,22 @@ export class Hub {
         sendJson(response, 400, { error: 'takeover_after_ms must be an integer between 0 and 7 days' });
         return;
       }
+      let alertRole;
+      if (body.alert_role !== undefined) {
+        alertRole = body.alert_role === null || body.alert_role === '' ? null : this.roles.validKey(body.alert_role);
+        if (alertRole === roleKey) {
+          sendJson(response, 400, { error: 'alert_role must be a different Role' });
+          return;
+        }
+        if (alertRole) this.roles.ensure(alertRole);
+      }
       const role = this.store.upsertRole({
         roleKey,
         name: body.name === undefined ? undefined : requiredString(body.name, 'name', { max: 60 }),
         description: body.description === undefined ? undefined : optionalString(body.description).slice(0, 2000),
         takeoverAfterMs: takeover,
         workdir: body.workdir === undefined ? undefined : optionalString(body.workdir ?? '').slice(0, 4096),
+        alertRole,
       });
       this.emit('role.updated', { type: 'admin', id: 'admin' }, { payload: { role_key: role.role_key } });
       this.scheduleCoordinator();

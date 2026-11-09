@@ -90,6 +90,10 @@ export function loadConfig(raw) {
     // Roles another bridge serves, which this one then skips.
     own_role_only: false,
     other_roles: [],
+    // A Hub Role told when this bridge process starts with state already on disk, i.e. it
+    // was restarted: by a deploy, or by something that killed it (the Hub box has OOM-killed
+    // a bridge before). null = tell nobody.
+    alert_role: null,
     ...raw,
   };
   if (!config.app_id) throw new Error('feishu bridge config needs app_id');
@@ -101,6 +105,7 @@ export function loadConfig(raw) {
   if (!config.role) throw new Error('feishu bridge config needs role (which Hub Role takes the work)');
   if (!Array.isArray(config.other_roles) || config.other_roles.some((role) => typeof role !== 'string' || !role)) throw new Error('feishu bridge config: other_roles must be a list of Role keys');
   if (config.other_roles.includes(config.role)) throw new Error('feishu bridge config: other_roles must not name this bridge\'s own role');
+  if (config.alert_role !== null && (typeof config.alert_role !== 'string' || !config.alert_role)) throw new Error('feishu bridge config: alert_role must be a Role key or null');
   if (config.ack_reaction !== null && typeof config.ack_reaction !== 'string') throw new Error('feishu bridge config: ack_reaction must be an emoji_type string or null');
   for (const [id, name] of Object.entries(config.bots)) {
     if (!/^cli_/.test(id) || typeof name !== 'string' || !name) throw new Error(`bots: ${id} must map an app_id (cli_…) to a name`);
@@ -122,6 +127,8 @@ export class FeishuBridge {
     this.now = now;
     this.logger = logger;
     this.state = null;
+    this.startedAt = now();
+    this.announced = false; // the restart alert went out (or was not needed)
     this.names = { ...Object.fromEntries(Object.entries(config.groups).filter(([, group]) => group.name).map(([chat, group]) => [chat, group.name])) };
   }
 
@@ -562,6 +569,29 @@ export class FeishuBridge {
     }
   }
 
+  // A process start with state on disk is a restart. The alert Role hears about it once per
+  // start, with the gap since the last good tick, so a deploy reads as a few seconds and a
+  // kill as the minutes nobody was watching the groups.
+  async announceRestart(nowS) {
+    if (!this.config.alert_role) return null;
+    const lastOk = this.state.lastOkAt ?? null;
+    const gap = lastOk ? Math.max(0, nowS - lastOk) : null;
+    const text = [
+      `【桥告警】岗位「${this.config.role}」的飞书桥进程刚启动，但磁盘上已有状态，说明这是一次重启${gap == null ? '' : `；距上次成功轮询 ${gap < 120 ? `${gap} 秒` : `${Math.round(gap / 60)} 分钟`}`}。`,
+      '刚部署过就是正常的。否则进程是被杀的（Hub 机器内存很小，OOM 杀过桥），请在 Hub 机器上看 journalctl -u agent-hub-bridge-feishu*.service 和 dmesg，确认原因，并检查停机期间群里有没有漏掉的 @。',
+      `启动时间：${new Date(this.startedAt).toISOString()}`,
+    ].join('\n\n');
+    return this.hub.trigger({
+      trigger_key: `bridge-restart:${this.config.role}:${this.startedAt}`,
+      thread_key: `bridge-alert:${this.config.role}`,
+      source: 'feishu-bridge',
+      actor: 'Feishu bridge',
+      role: this.config.alert_role,
+      title: `桥告警：${this.config.role} 的飞书桥重启了`,
+      text,
+    });
+  }
+
   // Whether this bridge answers for work of `roleKey` (null = work outside any Role).
   servesRole(roleKey) {
     if (this.config.own_role_only) return roleKey === this.config.role;
@@ -729,6 +759,7 @@ export class FeishuBridge {
       const start = await this.hub.eventsAfter(null, NOTIFY_EVENTS).catch(() => null);
       this.state.eventCursor = start?.cursor ?? null;
       this.state.lastOkAt = nowS;
+      this.announced = true; // a first run is a start, not a restart
       await this.save();
       this.log('cursors set at now; next tick starts handling new messages');
       return 0;
@@ -741,6 +772,14 @@ export class FeishuBridge {
 
     // A state file from before the config lost bot_open_id / dm_chat still needs them.
     await this.discover(nowS).catch((error) => fail('discover', error));
+    if (!this.announced) {
+      try {
+        await this.announceRestart(nowS);
+        this.announced = true;
+      } catch (error) {
+        fail('restart-alert', error);
+      }
+    }
     await this.pumpEvents().catch((error) => fail('hub-events', error));
 
     // Groups the bot is in right now; a new one starts at now, a left one is forgotten.

@@ -196,6 +196,7 @@ function roleView(row) {
     description: row.description,
     takeover_after_ms: Number(row.takeover_after_ms),
     workdir: row.workdir ?? null,
+    alert_role: row.alert_role ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -219,6 +220,7 @@ function handoffView(row) {
     not_before: row.not_before,
     created_at: row.created_at,
     resolved_at: row.resolved_at ?? null,
+    alerted_at: row.alerted_at ?? null,
   };
 }
 
@@ -561,8 +563,12 @@ export class HubStore {
         WHERE last_activity_at IS NULL;
       UPDATE workers SET mode = 'external', push_capable = 0 WHERE mode <> 'external';
     `);
+    // Schema 18: a Role may name another Role that is told when its work stalls.
+    if (!roleColumns.has('alert_role')) this.db.exec('ALTER TABLE roles ADD COLUMN alert_role TEXT');
+    const handoffColumns = new Set(this.db.prepare('PRAGMA table_info(handoffs)').all().map((column) => column.name));
+    if (!handoffColumns.has('alerted_at')) this.db.exec('ALTER TABLE handoffs ADD COLUMN alerted_at TEXT');
     this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 17');
+    this.db.exec('PRAGMA user_version = 18');
   }
 
   close() {
@@ -1045,20 +1051,22 @@ export class HubStore {
     return this.db.prepare('SELECT * FROM roles ORDER BY role_key').all().map(roleView);
   }
 
-  upsertRole({ roleKey, name, description, takeoverAfterMs, workdir }) {
+  upsertRole({ roleKey, name, description, takeoverAfterMs, workdir, alertRole }) {
     const timestamp = now();
     const current = this.getRole(roleKey);
     this.db.prepare(`
-      INSERT INTO roles (role_key, name, description, takeover_after_ms, workdir, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO roles (role_key, name, description, takeover_after_ms, workdir, alert_role, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(role_key) DO UPDATE SET name = excluded.name, description = excluded.description,
-        takeover_after_ms = excluded.takeover_after_ms, workdir = excluded.workdir, updated_at = excluded.updated_at
+        takeover_after_ms = excluded.takeover_after_ms, workdir = excluded.workdir, alert_role = excluded.alert_role,
+        updated_at = excluded.updated_at
     `).run(
       roleKey,
       name ?? current?.name ?? roleKey,
       description ?? current?.description ?? '',
       takeoverAfterMs ?? current?.takeover_after_ms ?? 3 * 60 * 1000,
       workdir === undefined ? current?.workdir ?? null : workdir || null,
+      alertRole === undefined ? current?.alert_role ?? null : alertRole || null,
       timestamp,
       timestamp,
     );
@@ -1145,6 +1153,12 @@ export class HubStore {
       UPDATE handoffs SET input = ?, from_command_id = COALESCE(?, from_command_id),
         not_before = MIN(not_before, ?) WHERE handoff_id = ? AND status = 'open'
     `).run(merged, fromCommandId ?? null, notBefore ?? current.not_before, handoffId);
+    return this.getHandoff(handoffId);
+  }
+
+  // The stall alert for a handoff goes out once; the mark survives restarts.
+  markHandoffAlerted(handoffId) {
+    this.db.prepare('UPDATE handoffs SET alerted_at = ? WHERE handoff_id = ? AND alerted_at IS NULL').run(now(), handoffId);
     return this.getHandoff(handoffId);
   }
 

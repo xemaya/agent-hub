@@ -332,6 +332,7 @@ Connector 和原生桥接均声明 `mailbox_v1` 后可推送通知。通知状�
   - 恢复提示：先核对现场（git status / log、已经发出的消息或草稿、外部系统），不重复已经发生的对外动作，拿不准就用 needs_input 回报；
   - 最后是 `本次要处理：` 加上工作本身。
   再次交接时只传递 `本次要处理：` 之后的部分，交接包不会层层嵌套。读取指针按 6.7 的规则成为接手者的凭据。
+- **岗位告警**（schema 18：`roles.alert_role`、`handoffs.alerted_at`，`role set qa --alert-role harness-ops`，`none` 清除）。岗位可以指定另一个岗位做它的监控入口：一条交接在 open 状态等了超过 `takeover_after_ms` 还没座位接（没人、都不可用、都在忙），Hub 定时检查时给 `alert_role` 建一个任务（`thread_key` = `hub-alert:<岗位>`，trigger 走 `receiveTrigger`），说明是哪个任务、等了多久、座位各自为什么不可用，并写明「席位恢复后 Hub 自动派出，不要代做」；每条交接只报一次（`alerted_at`），告警任务还开着时后续告警是它的跟进。`handoff.exhausted` 也报给 `alert_role`。岗位不能指定自己；`alert_role` 自己没有 `alert_role` 时链条到此为止，所以不会循环。事件 `role.alerted`。飞书桥的 `alert_role` 配置则在桥进程带着已有状态启动（即重启）时给同一个岗位发一条（`thread_key` = `bridge-alert:<桥的岗位>`），带上距上次成功轮询的时长，用来发现 OOM 之类的进程被杀。
 - **不做的事**：不维护无状态的 agent loop（Runtime 不归我们管），不自动重跑非岗位任务，不在 Session 之间迁移对话记忆。没有加入岗位的 Worker 和任务，行为与之前完全一样。
 - **登记与列表**：重新登记只更新写明的内容：没传 `--capabilities` 时保留原能力，`--metadata` 按字段合并，岗位不变。`worker list` 里 `presence` 是 Connector 的状态，`session_online` 才是这个 Session 的 Channel 是否接通。`session start --resume` 没传 `--cwd` 时，回到这个 Session 上次运行的目录。本机命令不写 `--data-dir` 时，依次找环境变量、当前目录下的 `.runtime/connector`、`~/.agent-hub/connector`。
 - Dashboard：员工卡片显示所属岗位；「等你处理」顶部列出等座位的交接，并说明是在等原 Session 恢复，还是岗位上没有在线的 Session。
@@ -612,7 +613,7 @@ GET    /api/v1/coordinator/chat
 POST   /api/v1/coordinator/chat
 DELETE /api/v1/coordinator/chat
 GET    /api/v1/roles
-PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms?, workdir? }
+PUT    /api/v1/roles/:role_key            { name?, description?, takeover_after_ms?, workdir?, alert_role? }
 PUT    /api/v1/workers/:id/role           { role: KEY | null }
 GET    /api/v1/handoffs[?status=open|dispatched|cancelled|all&role=KEY]
 GET    /api/v1/attentions[?status=open|answered|dismissed|approved|executed|failed|all]

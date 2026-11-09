@@ -50,12 +50,13 @@ export function cwdMatches(required, actual) {
 }
 
 export class Roles {
-  constructor({ store, emit, dispatch, broadcast = () => {}, cancel, now = () => Date.now(), logger = console }) {
+  constructor({ store, emit, dispatch, broadcast = () => {}, cancel, alert = null, now = () => Date.now(), logger = console }) {
     this.store = store;
     this.emit = emit;
     this.dispatch = dispatch;
     this.broadcast = broadcast;
     this.cancel = cancel;
+    this.alert = alert; // (trigger payload) => Hub.receiveTrigger: how a stalled Role reaches its alert Role
     this.now = now;
     this.logger = logger;
     this.ticking = false;
@@ -292,6 +293,11 @@ export class Roles {
     if (task.assignee_worker_id !== command.worker_id) return false;
     if (this.store.countHandoffs(task.task_id, 'session_lost') >= MAX_SESSION_LOST_HANDOFFS) {
       this.emit('handoff.exhausted', { type: 'hub', id: 'roles' }, { task_id: task.task_id, command_id: command.command_id, payload: { role_key: task.role_key, limit: MAX_SESSION_LOST_HANDOFFS } });
+      this.raise(task.role_key, `handoff-exhausted:${command.command_id}`, [
+        `【岗位告警】岗位「${this.store.getRole(task.role_key)?.name ?? task.role_key}」（${task.role_key}）的任务${taskLabel(task)}已经交接了 ${MAX_SESSION_LOST_HANDOFFS} 次都没做完，Hub 停止自动交接，任务停在原地。`,
+        '每次接手的会话都在执行中断开了，很可能是这个任务本身把会话搞崩。请看最后一次执行的记录，判断是任务的问题还是席位的问题；需要人决定的用 needs_input 回报。',
+        `任务：${task.task_id}${task.thread_key ? `　话题：${task.thread_key}` : ''}　最后一条命令：${command.command_id}`,
+      ].join('\n\n'));
       return false;
     }
     const role = this.ensure(task.role_key);
@@ -335,8 +341,59 @@ export class Roles {
         }
       }
       this.pump();
+      this.alertStalled();
     } finally {
       this.ticking = false;
+    }
+  }
+
+  // Work that has waited for a seat past the Role's takeover delay is reported
+  // once to the Role's alert Role (`roles.alert_role`), as a Task on that Role
+  // keyed by the stalled Role, so further stalls while it is open are follow-ups.
+  alertStalled() {
+    for (const handoff of this.store.listHandoffs({ status: 'open' })) {
+      if (handoff.alerted_at) continue;
+      const role = this.store.getRole(handoff.role_key);
+      if (!role?.alert_role || role.alert_role === role.role_key) continue;
+      const since = Math.max(Date.parse(handoff.created_at) || 0, Date.parse(handoff.not_before) || 0);
+      if (this.now() - since < role.takeover_after_ms) continue;
+      const task = this.store.getTask(handoff.task_id);
+      if (!task) continue;
+      const seats = this.store.listRoleWorkers(role.role_key);
+      const state = seats.some((worker) => this.available(worker))
+        ? '岗位上的会话都在忙，没有空出来接'
+        : seats.length
+          ? `岗位上有 ${seats.length} 个座位，但都不可用（${seats.map((worker) => `${worker.name}：${this.seatProblem(worker) ?? (worker.presence !== 'online' ? '机器离线' : !worker.push_capable ? '会话未接通' : '不可用')}`).join('；')}）`
+          : '岗位上没有登记任何会话';
+      const text = [
+        `【岗位告警】岗位「${role.name}」（${role.role_key}）的任务${taskLabel(task)}有工作等了 ${minutes(this.now() - since)} 分钟还没有座位接手（交接 ${handoff.handoff_id}，原因 ${handoff.reason}）。${state}。`,
+        '请检查这个岗位的席位：会话是否在线、是否用 --push 接通、目录是否符合岗位要求、是否卡在上一条命令。席位恢复后 Hub 会自动把排队的工作派出去，不需要你代做；要人决定的用 needs_input 回报，确认已有人处理就回报 done。',
+        `任务：${task.task_id}${task.thread_key ? `　话题：${task.thread_key}` : ''}`,
+      ].join('\n\n');
+      this.store.markHandoffAlerted(handoff.handoff_id);
+      this.raise(role.role_key, `handoff-stalled:${handoff.handoff_id}`, text);
+    }
+  }
+
+  // One alert thread per stalled Role: a live alert Task takes later alerts as follow-ups.
+  raise(roleKey, key, text) {
+    const role = this.store.getRole(roleKey);
+    if (!this.alert || !role?.alert_role || role.alert_role === roleKey) return null;
+    try {
+      const result = this.alert({
+        trigger_key: `hub-alert:${key}`,
+        thread_key: `hub-alert:${roleKey}`,
+        source: 'hub',
+        actor: 'Agent Hub',
+        role: role.alert_role,
+        title: `岗位告警：${role.name} 的工作没人接`,
+        text,
+      });
+      this.emit('role.alerted', { type: 'hub', id: 'roles' }, { task_id: result?.task?.task_id ?? null, payload: { role_key: roleKey, alert_role: role.alert_role, key, routed: result?.routed ?? null } });
+      return result;
+    } catch (error) {
+      this.logger.error?.(`role alert for ${roleKey} failed: ${error.message}`);
+      return null;
     }
   }
 }

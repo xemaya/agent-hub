@@ -74,7 +74,7 @@ L4 具体 agent            岗位 + 仓库（工作目录、AGENTS.md / skills�
 
 | 项 | 要定什么 | youxian-qa 现状 |
 | --- | --- | --- |
-| **岗位** | `role_key`、`workdir`、`takeover_after_ms`、容量策略（最少几个座位、谁开） | `qa`，`youxian-qa`，3 分钟，手动开窗口 |
+| **岗位** | `role_key`、`workdir`、`takeover_after_ms`、`alert_role`（工作没人接时通知哪个岗位）、容量策略（最少几个座位、谁开） | `qa`，`youxian-qa`，3 分钟，告警给 `harness-ops`，手动开窗口 |
 | **执行身份** | runtime、权限白名单（dontAsk + 显式 allow）、读写边界（哪些系统只读） | Claude 交互 Session；`.claude/settings.json` 白名单；线上只读，staging 可写 |
 | **流程知识** | 仓里的 AGENTS.md / skills：收到什么指令按什么流程做、证据标准、回报格式 | AGENTS.md「群里 @ 的跟进」「项目测试」+ 4 个 skills |
 | **源适配器** | 每个事件源：gate（谁、哪个群、是否 @）、`trigger_key` / `thread_key` 规范、确认回执怎么发、追问怎么跟 | `projecttest watch`：所有群 @、业主私信；`feishu:<话题 id>` / `feishu-dm:<消息 id>` |

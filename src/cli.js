@@ -55,6 +55,7 @@ Usage:
   agent-hub trigger --trigger-key KEY --thread-key KEY --text TEXT [--source NAME]
                     [--worker-id ID | --role KEY] [--title TITLE] [--actor NAME] [--followup-only]
   agent-hub role list | set KEY [--name NAME] [--description TEXT] [--takeover-after-ms MS] [--workdir DIR|none]
+                             [--alert-role KEY|none]   (Role told when this Role's work waits past the takeover delay)
   agent-hub role assign WORKER_ID --role KEY | unassign WORKER_ID
   agent-hub handoff list [--status open|dispatched|cancelled|all]
   agent-hub attention list|answer|dismiss|approve [ATTENTION_ID] [--answer TEXT]
@@ -831,6 +832,7 @@ export async function run(argv) {
           ...(flags.description !== undefined ? { description: flags.description } : {}),
           ...(flags['takeover-after-ms'] !== undefined ? { takeover_after_ms: Number(flags['takeover-after-ms']) } : {}),
           ...(flags.workdir !== undefined ? { workdir: flags.workdir === 'none' ? null : flags.workdir } : {}),
+          ...(flags['alert-role'] !== undefined ? { alert_role: flags['alert-role'] === 'none' ? null : flags['alert-role'] } : {}),
         },
       }));
       return;
@@ -842,7 +844,7 @@ export async function run(argv) {
       }));
       return;
     }
-    throw new Error('Usage: agent-hub role list | set KEY [--name N] [--takeover-after-ms MS] | assign WORKER_ID --role KEY | unassign WORKER_ID');
+    throw new Error('Usage: agent-hub role list | set KEY [--name N] [--takeover-after-ms MS] [--workdir DIR|none] [--alert-role KEY|none] | assign WORKER_ID --role KEY | unassign WORKER_ID');
   }
   if (command === 'handoff') {
     print(await adminRequest(flags, `/api/v1/handoffs?status=${encodeURIComponent(flags.status ?? 'open')}`));

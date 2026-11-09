@@ -843,3 +843,30 @@ test('An @ inside a thread someone else opened in an ordinary group is found by 
   assert.equal(bridge.state.knownThreads.omt_many_0, undefined, 'the oldest idle thread fell off the cap');
   assert.ok(bridge.state.knownThreads.omt_theirs, 'a thread with our live task stays polled');
 });
+
+test('With alert_role set, a bridge that starts over existing state tells that Role it was restarted; a first run and a bridge without alert_role say nothing', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t, { config: { alert_role: 'ops' } });
+  await context.registerWorker({ name: 'ops-a', role: 'ops', runtime_session_id: 'ops-window' });
+  assert.throws(() => loadConfig({ ...CONFIG, alert_role: '' }), /alert_role/);
+  await bridge.tick();
+  assert.equal(driver.of('ops-a').length, 0, 'the process that created the state is a start, not a restart');
+
+  feishu.clock += 10 * 60 * 1000;
+  const again = new FeishuBridge({ config: bridge.config, feishu: bridge.feishu, hub: bridge.hub, stateFile: bridge.stateFile, now: () => feishu.clock, logger: { log() {}, error() {} } });
+  await again.load();
+  await again.tick();
+  await waitFor(() => driver.of('ops-a').length === 1);
+  const alert = driver.of('ops-a')[0];
+  assert.match(alert.input, /【桥告警】岗位「qa」的飞书桥进程刚启动/);
+  assert.match(alert.input, /距上次成功轮询 10 分钟/);
+  const task = context.hub.store.getTask(context.hub.store.getCommand(alert.command_id).task_id);
+  assert.equal(task.role_key, 'ops');
+  assert.equal(task.thread_key, 'bridge-alert:qa');
+  await again.tick();
+  assert.equal(driver.of('ops-a').length, 1, 'one alert per process start');
+
+  const quiet = new FeishuBridge({ config: loadConfig({ ...CONFIG }), feishu: bridge.feishu, hub: bridge.hub, stateFile: bridge.stateFile, now: () => feishu.clock, logger: { log() {}, error() {} } });
+  await quiet.load();
+  await quiet.tick();
+  assert.equal(driver.of('ops-a').length, 1, 'no alert_role, no alert');
+});

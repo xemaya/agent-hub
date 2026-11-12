@@ -592,6 +592,39 @@ test('Without dm_from_anyone other people\'s DMs in pushed events are ignored, a
   assert.equal(bridge.status().channelCursor, 2, 'the events were consumed');
 });
 
+test('A DM chat named in dm_chats is polled: the person\'s messages open a Role task and the reply goes back to them', async (t) => {
+  const { context, driver, feishu, bridge } = await setup(t);
+  // Anya wrote before the chat was configured; `since` reaches back to it.
+  feishu.chats.push({ chat_id: 'oc_dm_anya', name: '', external: false });
+  const first = feishu.post('oc_dm_anya', 'T32 修了吗', { from: 'ou_colleague' });
+  feishu.clock += 5000;
+  bridge.config = loadConfig({ ...CONFIG, dm_chats: { oc_dm_anya: { name: 'Anya', open_id: 'ou_colleague', since: Math.floor(Number(first.create_time) / 1000) - 1 } } });
+  driver.answers['qa-a'] = (command) => (/【私信】/.test(command.input)
+    ? { text: '查完了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'send', target: /"target":"(oc_[^"]+)"/.exec(command.input)[1], text: '状态：已修复。', key: 'dm-anya-polled', note: '回 Anya：已修复' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  await bridge.tick();
+  assert.deepEqual(feishu.reactions.filter((r) => r.message_id === first.message_id).map((r) => r.emoji), ['OK']);
+  const task = liveTask(context, 'feishu-dm:oc_dm_anya');
+  assert.ok(task);
+  assert.match(task.title, /^Anya私信：T32 修了吗/);
+  const command = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(command.input, /【私信】Anya 在飞书私信里对机器人说/);
+  await finished(context, command.command_id);
+  const attention = await waitFor(() => context.hub.store.openAttentionForTask(task.task_id));
+  feishu.clock += 2000;
+  await bridge.tick();
+  await waitFor(() => context.hub.store.getAttention(attention.attention_id).status === 'executed' ? true : null);
+  const sent = feishu.sent.find((s) => s.kind === 'send' && s.target === 'oc_dm_anya');
+  assert.ok(sent, 'replied into the DM without approval');
+  // The bot's own reply in that chat is not work; Anya's next message follows the task.
+  feishu.clock += 2000;
+  const next = feishu.post('oc_dm_anya', '谢谢', { from: 'ou_colleague' });
+  await bridge.tick();
+  assert.equal(bridge.state.handled[next.message_id].routed, 'followup');
+  assert.ok(!bridge.state.handled[sent.message_id], 'the bot\'s reply was not processed');
+});
+
 test('dm_from_anyone needs events', () => {
   assert.throws(() => loadConfig({ ...CONFIG, dm_from_anyone: true }), /needs events/);
 });

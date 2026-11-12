@@ -108,6 +108,12 @@ export function loadConfig(raw) {
     // 事件订阅 via the Hub's public URL: { verification_token_file, encrypt_key_file }, files
     // beside this config holding what the developer console shows. null: no pushed events.
     events: null,
+    // DM chats polled like groups: chat_id → { name, open_id?, since? }. Feishu lists no DM
+    // chats, so the bot learns one by writing to the person once (the send result carries the
+    // chat_id); from then on their messages there are the Role's work like an @, replies go
+    // back without approval. `since` (epoch seconds) lets the first poll include what was
+    // already said; default is from now.
+    dm_chats: {},
     ...raw,
   };
   if (!config.app_id) throw new Error('feishu bridge config needs app_id');
@@ -126,6 +132,11 @@ export function loadConfig(raw) {
     throw new Error('feishu bridge config: events must be null or { verification_token_file, encrypt_key_file? }');
   }
   if (config.dm_from_anyone && !config.events) throw new Error('feishu bridge config: dm_from_anyone needs events (DMs from others arrive only as pushed events)');
+  if (!config.dm_chats || typeof config.dm_chats !== 'object' || Array.isArray(config.dm_chats)) throw new Error('feishu bridge config: dm_chats must be an object of chat_id → { name }');
+  for (const [chat, dm] of Object.entries(config.dm_chats)) {
+    if (!/^oc_/.test(chat) || !dm || typeof dm.name !== 'string' || !dm.name) throw new Error(`dm_chats: ${chat} must map a chat_id (oc_…) to { name }`);
+    if (dm.since !== undefined && (typeof dm.since !== 'number' || dm.since <= 0)) throw new Error(`dm_chats: ${chat}.since must be epoch seconds`);
+  }
   for (const [id, name] of Object.entries(config.bots)) {
     if (!/^cli_/.test(id) || typeof name !== 'string' || !name) throw new Error(`bots: ${id} must map an app_id (cli_…) to a name`);
   }
@@ -640,7 +651,7 @@ export class FeishuBridge {
     const mid = message.message_id;
     const text = readableText(message);
     if (!text) return { state: 'skipped' };
-    const who = this.personName(message.sender.id) ?? '同事';
+    const who = this.personName(message.sender.id) ?? this.config.dm_chats?.[message.chat_id]?.name ?? '同事';
     if (this.observe) return this.would(`acknowledge DM ${mid} from ${who} and open a ${this.config.role} task`), { state: 'observed' };
     const acked = await this.acknowledge(mid);
     this.state.dmChats ??= {};
@@ -777,7 +788,7 @@ export class FeishuBridge {
     const chatId = await this.actionChat(action);
     if (!chatId) return null;
     const dm = this.state?.dmChats?.[chatId];
-    if (dm) return this.config.dm_from_anyone ? `a reply in the DM with ${dm.who}` : null;
+    if (dm) return `a reply in the DM with ${dm.who}`;
     const group = this.config.groups[chatId];
     const chat = this.knownChats?.[chatId];
     if (!group && !chat) return null;
@@ -1009,6 +1020,21 @@ export class FeishuBridge {
         this.state.cursor[this.ownerDm()] = nowS;
       } catch (error) {
         fail('owner-dm', error);
+      }
+    }
+
+    // Other people's DM chats named in the config: polled like the owner's, each message from
+    // them is the Role's work (the bot's own replies and the owner are not).
+    for (const [chatId, dm] of Object.entries(this.config.dm_chats)) {
+      if (chatId === this.ownerDm()) continue;
+      if (!(chatId in this.state.cursor)) this.follow(chatId, dm.since ?? nowS);
+      try {
+        for (const message of await this.feishu.chatMessagesSince(chatId, this.state.cursor[chatId] - OVERLAP_S)) {
+          await this.process({ ...message, chat_id: chatId, chat_type: 'p2p' }, (m) => (m.sender?.sender_type === 'user' && !this.isOwner(m.sender?.id) ? (x) => this.onStrangerDm(x) : null));
+        }
+        this.state.cursor[chatId] = nowS;
+      } catch (error) {
+        fail(`dm:${chatId}`, error);
       }
     }
 

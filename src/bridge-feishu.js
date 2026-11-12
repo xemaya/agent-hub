@@ -14,6 +14,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { FeishuApi, messageText, readableText } from './feishu-api.js';
+import { FeishuEventSocket } from './feishu-events.js';
 
 const APPROVE = /^(发|发吧|发了|发出去|可以发|批准|同意|ok|OK)[。.!！\s]*$/;
 const CONFIRM = /^(查|去查|查吧|发|好|可以|批准|同意)[。.!！\s]*$/;
@@ -105,8 +106,10 @@ export function loadConfig(raw) {
     // as pushed events (`events` below). true: each is the Role's work like an @, replies go
     // back without the owner's approval (the owner gets the receipt); false: unseen.
     dm_from_anyone: false,
-    // 事件订阅 via the Hub's public URL: { verification_token_file, encrypt_key_file }, files
-    // beside this config holding what the developer console shows. null: no pushed events.
+    // 事件订阅, two ways: { mode: 'longconn' } keeps Feishu's WebSocket open from this process
+    // (console: 使用长连接接收事件; nothing else to configure), or { mode: 'webhook',
+    // verification_token_file, encrypt_key_file? } for pushes to the Hub's public URL (files
+    // beside this config hold what the console shows). null: no pushed events.
     events: null,
     // DM chats polled like groups: chat_id → { name, open_id?, since? }. Feishu lists no DM
     // chats, so the bot learns one by writing to the person once (the send result carries the
@@ -128,8 +131,13 @@ export function loadConfig(raw) {
   if (config.alert_role !== null && (typeof config.alert_role !== 'string' || !config.alert_role)) throw new Error('feishu bridge config: alert_role must be a Role key or null');
   if (config.ack_reaction !== null && typeof config.ack_reaction !== 'string') throw new Error('feishu bridge config: ack_reaction must be an emoji_type string or null');
   if (typeof config.dm_from_anyone !== 'boolean') throw new Error('feishu bridge config: dm_from_anyone must be true or false');
-  if (config.events !== null && (typeof config.events !== 'object' || typeof config.events.verification_token_file !== 'string' || !config.events.verification_token_file)) {
-    throw new Error('feishu bridge config: events must be null or { verification_token_file, encrypt_key_file? }');
+  if (config.events !== null) {
+    if (typeof config.events !== 'object') throw new Error('feishu bridge config: events must be null, { mode: "longconn" } or { mode: "webhook", verification_token_file }');
+    config.events.mode ??= config.events.verification_token_file ? 'webhook' : 'longconn';
+    if (!['longconn', 'webhook'].includes(config.events.mode)) throw new Error('feishu bridge config: events.mode must be longconn or webhook');
+    if (config.events.mode === 'webhook' && (typeof config.events.verification_token_file !== 'string' || !config.events.verification_token_file)) {
+      throw new Error('feishu bridge config: events.mode webhook needs verification_token_file');
+    }
   }
   if (config.dm_from_anyone && !config.events) throw new Error('feishu bridge config: dm_from_anyone needs events (DMs from others arrive only as pushed events)');
   if (!config.dm_chats || typeof config.dm_chats !== 'object' || Array.isArray(config.dm_chats)) throw new Error('feishu bridge config: dm_chats must be an object of chat_id → { name }');
@@ -154,6 +162,7 @@ export class FeishuBridge {
     this.hub = hub;
     this.webhook = webhook; // { verificationToken, encryptKey } from the `events` secret files; registered with the Hub on the first tick
     this.webhookRegistered = false;
+    this.socket = null; // FeishuEventSocket when events.mode is longconn (set by create() or a test)
     this.stateFile = stateFile;
     this.observe = observe;
     this.now = now;
@@ -168,6 +177,9 @@ export class FeishuBridge {
     const feishu = new FeishuApi({ appId: config.app_id, appSecret, fetch: fetchImpl });
     const hub = new HubAdmin({ baseUrl: config.hub_url, token: adminToken, fetch: fetchImpl });
     const bridge = new FeishuBridge({ config, feishu, hub, stateFile, observe, logger, webhook });
+    if (config.events?.mode === 'longconn') {
+      bridge.socket = new FeishuEventSocket({ appId: config.app_id, appSecret, fetch: fetchImpl, logger, onEvent: (payload) => bridge.handleFeishuEvent(payload) });
+    }
     await bridge.load();
     return bridge;
   }
@@ -627,9 +639,22 @@ export class FeishuBridge {
     }
   }
 
+  // The long connection: Feishu's events arrive here as they happen, outside the tick.
+  async startEvents() {
+    if (!this.socket || this.observe) return;
+    await this.socket.start();
+  }
+
+  stopEvents() { this.socket?.stop(); }
+
   async onChannelEvent(event) {
-    const payload = event.payload ?? {};
-    if ((payload.header?.event_type ?? event.event_type) !== 'im.message.receive_v1') return;
+    return this.handleFeishuEvent(event.payload ?? {}, event.event_type);
+  }
+
+  // One Feishu event (schema 2.0 header + event), from the Hub's webhook store or the long connection.
+  async handleFeishuEvent(payload, fallbackType = null) {
+    if ((payload.header?.event_type ?? fallbackType) !== 'im.message.receive_v1') return;
+    if (!this.state) return; // before the first tick there is nothing to compare against; the poll will see it
     const message = messageFromEvent(payload.event);
     if (!message || message.chat_type !== 'p2p') return; // groups are polled; the event is only the DM path
     if (message.sender.sender_type !== 'user') return;
@@ -1079,6 +1104,7 @@ export class FeishuBridge {
       eventCursor: this.state?.eventCursor ?? null,
       channelCursor: this.state?.channelCursor ?? null,
       dmChats: Object.keys(this.state?.dmChats ?? {}).length,
+      events: this.socket ? this.socket.status() : (this.webhook ? 'webhook' : null),
     };
   }
 }

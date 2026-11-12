@@ -696,7 +696,7 @@ async function bridgeCommand(positionals, flags) {
   // Pushed events (事件订阅): the Verification Token and optional Encrypt Key from the developer
   // console sit in 0600 files beside the config, like the app secret.
   let webhook = null;
-  if (config.events) {
+  if (config.events?.mode === 'webhook') {
     const readSecretFile = async (file) => (await readFile(path.resolve(path.dirname(configPath), file), 'utf8')).trim();
     webhook = {
       verificationToken: await readSecretFile(config.events.verification_token_file),
@@ -715,6 +715,7 @@ async function bridgeCommand(positionals, flags) {
   }
   const interval = milliseconds(flags['interval-ms'], 60000);
   let stopped = false;
+  let wake = null; // SIGTERM ends the sleep at once instead of after the full interval (systemd waited up to 90 s)
   const loop = (async () => {
     while (!stopped) {
       try {
@@ -722,11 +723,14 @@ async function bridgeCommand(positionals, flags) {
       } catch (error) {
         console.error(`${new Date().toISOString()} bridge tick crashed: ${error.message}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, interval));
+      if (stopped) break;
+      await new Promise((resolve) => { wake = resolve; setTimeout(resolve, interval); });
+      wake = null;
     }
   })();
+  await bridge.startEvents(); // the long connection, when configured; it runs beside the tick loop
   console.log(`Feishu bridge for role ${config.role} running${flags.observe === true ? ' in observe mode (no acks, triggers, DMs or sends)' : ''}; state ${stateFile}`);
-  await waitForSignal(async () => { stopped = true; await loop; });
+  await waitForSignal(async () => { stopped = true; bridge.stopEvents(); wake?.(); await loop; });
 }
 
 async function historyCommand(positionals, flags) {

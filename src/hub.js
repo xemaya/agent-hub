@@ -583,44 +583,34 @@ export class Hub {
   // Stored events are pulled by the app's bridge; a repeated event_id (Feishu retries when
   // the answer is slow) is kept once. Answers 200 fast: Feishu gives up after 3 seconds.
   async receiveFeishuWebhook(appId, request, response) {
+    // Every push is logged with its outcome: Feishu's console shows only that it pushed, and a
+    // rejected push (wrong token, unexpected encryption) would otherwise vanish silently.
+    const answer = (status, body, note) => {
+      this.logger.log?.(`feishu webhook ${appId}: ${status} ${note}`);
+      sendJson(response, status, body);
+    };
     const registered = this.store.getChannelWebhook('feishu', appId);
-    if (!registered) {
-      sendJson(response, 404, { error: 'No bridge registered for this app' });
-      return;
-    }
+    if (!registered) return answer(404, { error: 'No bridge registered for this app' }, 'no bridge registered');
     let body = await readJsonBody(request, { limit: 256 * 1024 });
     if (typeof body.encrypt === 'string') {
-      if (!registered.encrypt_key) {
-        sendJson(response, 400, { error: 'Encrypted event but no Encrypt Key registered' });
-        return;
-      }
+      if (!registered.encrypt_key) return answer(400, { error: 'Encrypted event but no Encrypt Key registered' }, 'encrypted push but no Encrypt Key registered (clear the Encrypt Key in the console or register it)');
       try {
         body = decryptFeishuEvent(body.encrypt, registered.encrypt_key);
       } catch {
-        sendJson(response, 400, { error: 'Event could not be decrypted' });
-        return;
+        return answer(400, { error: 'Event could not be decrypted' }, 'decrypt failed (Encrypt Key mismatch?)');
       }
     }
     const token = body.header?.token ?? body.token;
     if (!tokensEqual(typeof token === 'string' ? hashToken(token) : '', registered.token_hash)) {
-      sendJson(response, 401, { error: 'Verification token does not match' });
-      return;
+      return answer(401, { error: 'Verification token does not match' }, `verification token mismatch (type ${body.type ?? body.header?.event_type ?? '?'})`);
     }
-    if (body.type === 'url_verification') {
-      sendJson(response, 200, { challenge: String(body.challenge ?? '') });
-      return;
-    }
-    if (body.header?.app_id && body.header.app_id !== appId) {
-      sendJson(response, 400, { error: 'Event is for another app' });
-      return;
-    }
+    if (body.type === 'url_verification') return answer(200, { challenge: String(body.challenge ?? '') }, 'url_verification answered');
+    if (body.header?.app_id && body.header.app_id !== appId) return answer(400, { error: 'Event is for another app' }, `event for another app ${body.header.app_id}`);
     const eventId = body.header?.event_id ?? body.uuid ?? null;
-    if (!eventId) {
-      sendJson(response, 400, { error: 'Event has no id' });
-      return;
-    }
-    const stored = this.store.addChannelEvent({ channel: 'feishu', appId, eventId: String(eventId), eventType: body.header?.event_type ?? body.event?.type ?? null, payload: body });
-    sendJson(response, 200, { ok: true, stored: Boolean(stored) });
+    if (!eventId) return answer(400, { error: 'Event has no id' }, 'event without id');
+    const eventType = body.header?.event_type ?? body.event?.type ?? null;
+    const stored = this.store.addChannelEvent({ channel: 'feishu', appId, eventId: String(eventId), eventType, payload: body });
+    return answer(200, { ok: true, stored: Boolean(stored) }, `${eventType} ${eventId} ${stored ? 'stored' : 'repeat'}`);
   }
 
   // An event from an external conversation (a Feishu topic, a PR thread). The

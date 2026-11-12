@@ -653,20 +653,25 @@ export class FeishuBridge {
 
   // One Feishu event (schema 2.0 header + event), from the Hub's webhook store or the long connection.
   async handleFeishuEvent(payload, fallbackType = null) {
-    if ((payload.header?.event_type ?? fallbackType) !== 'im.message.receive_v1') return;
-    if (!this.state) return; // before the first tick there is nothing to compare against; the poll will see it
-    const message = messageFromEvent(payload.event);
-    if (!message || message.chat_type !== 'p2p') return; // groups are polled; the event is only the DM path
-    if (message.sender.sender_type !== 'user') return;
+    const type = payload.header?.event_type ?? fallbackType;
+    if (this.state) this.state.lastFeishuEventAt = new Date(this.now()).toISOString();
+    const message = type === 'im.message.receive_v1' ? messageFromEvent(payload.event) : null;
+    // One line per event, so "did Feishu deliver it?" is answerable from the journal.
+    const skip = (why) => this.log(`feishu event ${type ?? '?'}${message ? ` ${message.message_id} ${message.chat_type} ${message.chat_id}` : ''}: ${why}`);
+    if (type !== 'im.message.receive_v1') return skip('not a message');
+    if (!this.state) return skip('before first tick'); // the poll will see it
+    if (!message) return skip('no message');
+    if (message.chat_type !== 'p2p') return skip('group, polled'); // groups are polled; the event is only the DM path
+    if (message.sender.sender_type !== 'user') return skip('from a bot');
     if (this.fromOwner(message) || message.chat_id === this.ownerDm()) {
       // The owner's DM is polled. Learn the chat if the hello never told us.
       if (!this.ownerDm() && this.isOwner(message.sender.id)) {
         this.state.ownerDm = message.chat_id;
         this.state.cursor[message.chat_id] = seconds(Number(message.create_time)) - 1;
       }
-      return;
+      return skip('owner DM, polled');
     }
-    if (!this.config.dm_from_anyone) return;
+    if (!this.config.dm_from_anyone) return skip('dm_from_anyone off');
     await this.process(message, () => (m) => this.onStrangerDm(m));
   }
 

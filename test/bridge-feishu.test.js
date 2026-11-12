@@ -140,7 +140,7 @@ const CONFIG = {
   prompt_hint: '按 AGENTS.md「群里 @ 的跟进」处理。',
 };
 
-async function setup(t, { observe = false, config = {} } = {}) {
+async function setup(t, { observe = false, config = {}, webhook = null } = {}) {
   const context = await createTestContext(t, { hub: { watchdogIntervalMs: 60 * 60 * 1000 } });
   const driver = seatDriver();
   driver.store = context.hub.store;
@@ -151,7 +151,7 @@ async function setup(t, { observe = false, config = {} } = {}) {
   const hub = new HubAdmin({ baseUrl: context.hub.url, token: 'test-admin' });
   const bridge = new FeishuBridge({
     config: loadConfig({ ...CONFIG, ...config }), feishu: api, hub,
-    stateFile: path.join(context.root, 'bridge', 'state.json'), observe, now: () => feishu.clock, logger: { log() {}, error() {} },
+    stateFile: path.join(context.root, 'bridge', 'state.json'), observe, now: () => feishu.clock, logger: { log() {}, error() {} }, webhook,
   });
   await bridge.load();
   assert.equal(await bridge.tick(), 0, 'first tick only sets cursors');
@@ -517,6 +517,83 @@ test('Two bridges on one Hub: each takes only its own Role\'s approvals, so a re
   await other.tick();
   assert.equal(feishu.replies().filter((r) => r.text === '查过了：是缓存，已修。').length, 1);
   assert.equal(otherFeishu.replies().length, 0, 'the other bot sends nothing');
+});
+
+test('A DM from someone else, pushed by Feishu to the Hub, opens a Role task; the reply goes back to that DM without approval', async (t) => {
+  // Feishu never lists DM chats, so without pushed events Anya's DM to the bot went unseen (11-11).
+  const { context, driver, feishu, bridge } = await setup(t, {
+    config: { dm_from_anyone: true, events: { verification_token_file: 'token' } },
+    webhook: { verificationToken: 'vt-test' },
+  });
+  driver.answers['qa-a'] = (command) => (/【私信】/.test(command.input)
+    ? { text: '查完了', outcome: 'needs_approval', action: { channel: 'feishu', kind: 'send', target: /"target":"(oc_[^"]+)"/.exec(command.input)[1], text: '状态：已修复。', key: 'dm-anya-1', note: '回 Anya：已修复' } }
+    : 'done:qa-a');
+  await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  await bridge.tick(); // registers the webhook with the Hub
+  const push = async (event, { token = 'vt-test', id } = {}) => fetch(`${context.hub.url}/hooks/feishu/cli_test`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ schema: '2.0', header: { event_id: id, token, create_time: String(feishu.clock), event_type: 'im.message.receive_v1', tenant_key: 't', app_id: 'cli_test' }, event }),
+  });
+  const dmEvent = (text, { from = 'ou_colleague', chat = 'oc_dm_anya', chatType = 'p2p', mid } = {}) => ({
+    sender: { sender_id: { open_id: from, union_id: `on_${from}`, user_id: 'u' }, sender_type: 'user', tenant_key: 't' },
+    message: { message_id: mid, chat_id: chat, chat_type: chatType, message_type: 'text', content: JSON.stringify({ text }), create_time: String(feishu.clock), mentions: [] },
+  });
+  feishu.messages.push({ message_id: 'om_dm1', chat_id: 'oc_dm_anya', listed: false, create_time: String(feishu.clock), msg_type: 'text', sender: { id: 'ou_colleague', sender_type: 'user' }, body: { content: '{"text":"T32 修了吗"}' } });
+  assert.equal((await push(dmEvent('T32 修了吗', { mid: 'om_dm1' }), { id: 'evt_1' })).status, 200);
+  assert.equal((await push(dmEvent('看错了', { mid: 'om_dm1' }), { id: 'evt_1' })).status, 200, 'a retried event is accepted and kept once');
+  assert.equal((await push(dmEvent('群消息', { chat: FEEDBACK, chatType: 'group', mid: 'om_g1' }), { id: 'evt_2' })).status, 200);
+  assert.equal((await push(dmEvent('假的', { mid: 'om_dm2' }), { id: 'evt_3', token: 'wrong' })).status, 401);
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.deepEqual(feishu.reactions.filter((r) => r.message_id === 'om_dm1').map((r) => r.emoji), ['OK'], 'the DM is acked once');
+  const task = liveTask(context, 'feishu-dm:oc_dm_anya');
+  assert.ok(task, 'the DM chat is the thread of a qa task');
+  assert.equal(task.role_key, 'qa');
+  assert.match(task.title, /^Anya私信：T32 修了吗/);
+  assert.equal(liveTask(context, `feishu:${FEEDBACK}`), null, 'group traffic in events is left to polling');
+  const first = await waitFor(() => driver.of('qa-a')[0]);
+  assert.match(first.input, /【私信】Anya 在飞书私信里对机器人说（消息 om_dm1）：「T32 修了吗」/);
+  assert.match(first.input, /"kind":"send","target":"oc_dm_anya"/);
+  await finished(context, first.command_id);
+  const attention = await waitFor(() => context.hub.store.openAttentionForTask(task.task_id));
+  feishu.clock += 2000;
+  await bridge.tick();
+  await waitFor(() => context.hub.store.getAttention(attention.attention_id).status === 'executed' ? true : null);
+  const sent = feishu.sent.find((s) => s.kind === 'send' && s.target === 'oc_dm_anya');
+  assert.ok(sent, 'the reply went to the DM chat without an approval round');
+  assert.equal(sent.text, '状态：已修复。');
+  assert.match(feishu.dms().at(-1), /已发出（回 Anya：已修复）：消息 om_\d+/);
+  assert.equal(bridge.status().dmChats, 1);
+  assert.equal(bridge.status().channelCursor, 2);
+
+  // What Anya says next in the DM follows the same task.
+  feishu.clock += 2000;
+  feishu.messages.push({ message_id: 'om_dm3', chat_id: 'oc_dm_anya', listed: false, create_time: String(feishu.clock), msg_type: 'text', sender: { id: 'ou_colleague', sender_type: 'user' }, body: { content: '{"text":"谢谢"}' } });
+  assert.equal((await push(dmEvent('谢谢', { mid: 'om_dm3' }), { id: 'evt_4' })).status, 200);
+  await bridge.tick();
+  assert.equal(bridge.state.handled.om_dm3.routed, 'followup');
+  assert.equal(bridge.state.handled.om_dm3.task, task.task_id);
+});
+
+test('Without dm_from_anyone other people\'s DMs in pushed events are ignored, and the owner\'s DM stays polled', async (t) => {
+  const { context, feishu, bridge } = await setup(t, { config: { events: { verification_token_file: 'token' } }, webhook: { verificationToken: 'vt-test' } });
+  await bridge.tick();
+  const push = (event, id) => fetch(`${context.hub.url}/hooks/feishu/cli_test`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ schema: '2.0', header: { event_id: id, token: 'vt-test', event_type: 'im.message.receive_v1', app_id: 'cli_test' }, event }),
+  });
+  await push({ sender: { sender_id: { open_id: 'ou_colleague' }, sender_type: 'user' }, message: { message_id: 'om_x1', chat_id: 'oc_dm_anya', chat_type: 'p2p', message_type: 'text', content: '{"text":"在吗"}', create_time: String(feishu.clock) } }, 'evt_1');
+  await push({ sender: { sender_id: { open_id: OWNER }, sender_type: 'user' }, message: { message_id: 'om_x2', chat_id: OWNER_DM, chat_type: 'p2p', message_type: 'text', content: '{"text":"自己人"}', create_time: String(feishu.clock) } }, 'evt_2');
+  feishu.clock += 2000;
+  await bridge.tick();
+  assert.equal(feishu.reactions.length, 0);
+  assert.equal(liveTask(context, 'feishu-dm:oc_dm_anya'), null);
+  assert.equal(liveTask(context, `feishu-dm:om_x2`), null, 'the owner event alone opens nothing; polling owns that chat');
+  assert.equal(bridge.status().channelCursor, 2, 'the events were consumed');
+});
+
+test('dm_from_anyone needs events', () => {
+  assert.throws(() => loadConfig({ ...CONFIG, dm_from_anyone: true }), /needs events/);
 });
 
 test('other_roles cannot name the bridge\'s own role', () => {

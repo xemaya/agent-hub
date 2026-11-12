@@ -567,8 +567,30 @@ export class HubStore {
     if (!roleColumns.has('alert_role')) this.db.exec('ALTER TABLE roles ADD COLUMN alert_role TEXT');
     const handoffColumns = new Set(this.db.prepare('PRAGMA table_info(handoffs)').all().map((column) => column.name));
     if (!handoffColumns.has('alerted_at')) this.db.exec('ALTER TABLE handoffs ADD COLUMN alerted_at TEXT');
+    // Schema 19: a channel platform (Feishu) pushes events to the Hub's public URL; the
+    // bridge for that app registers how to verify them and pulls them in order.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS channel_webhooks (
+        channel TEXT NOT NULL,
+        app_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        encrypt_key TEXT,
+        registered_at TEXT NOT NULL,
+        PRIMARY KEY (channel, app_id)
+      );
+      CREATE TABLE IF NOT EXISTS channel_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel TEXT NOT NULL,
+        app_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        event_type TEXT,
+        payload TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_events_id ON channel_events(channel, app_id, event_id);
+    `);
     this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 18');
+    this.db.exec('PRAGMA user_version = 19');
   }
 
   close() {
@@ -1236,17 +1258,59 @@ export class HubStore {
       .all(commandId).map(chatMessageView);
   }
 
-  liveTaskByThread(threadKey) {
+  // With a roleKey only that Role's live Task follows the thread: two bridges (qa, hb-agent)
+  // follow the same Feishu topic, and 11-10 an @ to the QA bot became a follow-up of the
+  // hb-agent's live Task because it was simply the newest one on the thread.
+  liveTaskByThread(threadKey, roleKey = null) {
     const row = this.db.prepare(`
       SELECT task_id FROM tasks
       WHERE thread_key = ? AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')
+        AND (? IS NULL OR role_key = ?)
       ORDER BY created_at DESC, rowid DESC LIMIT 1
-    `).get(threadKey);
+    `).get(threadKey, roleKey, roleKey);
     return row ? this.getTask(row.task_id) : null;
   }
 
   getTrigger(triggerKey) {
     return this.db.prepare('SELECT * FROM triggers WHERE trigger_key = ?').get(triggerKey) ?? null;
+  }
+
+  // ---- channel webhooks: platform events pushed to the Hub, pulled by a bridge ----
+
+  registerChannelWebhook({ channel, appId, tokenHash, encryptKey = null }) {
+    this.db.prepare(`
+      INSERT INTO channel_webhooks (channel, app_id, token_hash, encrypt_key, registered_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(channel, app_id) DO UPDATE SET token_hash = excluded.token_hash, encrypt_key = excluded.encrypt_key, registered_at = excluded.registered_at
+    `).run(channel, appId, tokenHash, encryptKey, now());
+    return this.getChannelWebhook(channel, appId);
+  }
+
+  getChannelWebhook(channel, appId) {
+    return this.db.prepare('SELECT * FROM channel_webhooks WHERE channel = ? AND app_id = ?').get(channel, appId) ?? null;
+  }
+
+  // Stores one pushed event; the same event_id (platforms retry) is kept once. Returns the
+  // row or null for a repeat. Events older than keepDays go as new ones come in.
+  addChannelEvent({ channel, appId, eventId, eventType = null, payload, keepDays = 7 }) {
+    // Checked before inserting: an ignored conflict would still spend a seq number, and the
+    // bridge's cursor reads better without gaps.
+    if (this.db.prepare('SELECT 1 FROM channel_events WHERE channel = ? AND app_id = ? AND event_id = ?').get(channel, appId, eventId)) return null;
+    const inserted = this.db.prepare(`
+      INSERT OR IGNORE INTO channel_events (channel, app_id, event_id, event_type, payload, received_at) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(channel, appId, eventId, eventType, stringifyJson(payload), now());
+    if (!inserted.changes) return null;
+    this.db.prepare('DELETE FROM channel_events WHERE received_at < ?').run(new Date(Date.now() - keepDays * 86400000).toISOString());
+    return this.db.prepare('SELECT * FROM channel_events WHERE seq = ?').get(inserted.lastInsertRowid);
+  }
+
+  listChannelEventsAfter(channel, appId, afterSeq, { limit = 200 } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM channel_events WHERE channel = ? AND app_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?
+    `).all(channel, appId, afterSeq, limit).map((row) => ({ ...row, payload: parseJson(row.payload) }));
+  }
+
+  latestChannelEventSeq(channel, appId) {
+    return this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM channel_events WHERE channel = ? AND app_id = ?').get(channel, appId).seq;
   }
 
   recordTrigger({ triggerKey, threadKey, source, routed, taskId = null, commandId = null, attentionId = null }) {

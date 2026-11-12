@@ -56,6 +56,13 @@ export class HubAdmin {
   }
 
   trigger(body) { return this.request('/api/v1/triggers', { method: 'POST', body }); }
+  registerWebhook(appId, { verificationToken, encryptKey = null }) {
+    return this.request(`/api/v1/channel-webhooks/feishu/${encodeURIComponent(appId)}`, { method: 'PUT', body: { verification_token: verificationToken, encrypt_key: encryptKey } });
+  }
+  channelEventsAfter(appId, cursor) {
+    const query = new URLSearchParams({ channel: 'feishu', app_id: appId, after: cursor === null || cursor === undefined ? '' : String(cursor), limit: '200' });
+    return this.request(`/api/v1/channel-events?${query}`);
+  }
   eventsAfter(cursor, types) {
     const query = new URLSearchParams({ after: cursor ?? '', limit: '200', ...(types ? { types: types.join(',') } : {}) });
     return this.request(`/api/v1/events?${query}`);
@@ -94,6 +101,13 @@ export function loadConfig(raw) {
     // was restarted: by a deploy, or by something that killed it (the Hub box has OOM-killed
     // a bridge before). null = tell nobody.
     alert_role: null,
+    // Other people's DMs to the bot. Feishu lists no DM chats, so they reach the bridge only
+    // as pushed events (`events` below). true: each is the Role's work like an @, replies go
+    // back without the owner's approval (the owner gets the receipt); false: unseen.
+    dm_from_anyone: false,
+    // 事件订阅 via the Hub's public URL: { verification_token_file, encrypt_key_file }, files
+    // beside this config holding what the developer console shows. null: no pushed events.
+    events: null,
     ...raw,
   };
   if (!config.app_id) throw new Error('feishu bridge config needs app_id');
@@ -107,6 +121,11 @@ export function loadConfig(raw) {
   if (config.other_roles.includes(config.role)) throw new Error('feishu bridge config: other_roles must not name this bridge\'s own role');
   if (config.alert_role !== null && (typeof config.alert_role !== 'string' || !config.alert_role)) throw new Error('feishu bridge config: alert_role must be a Role key or null');
   if (config.ack_reaction !== null && typeof config.ack_reaction !== 'string') throw new Error('feishu bridge config: ack_reaction must be an emoji_type string or null');
+  if (typeof config.dm_from_anyone !== 'boolean') throw new Error('feishu bridge config: dm_from_anyone must be true or false');
+  if (config.events !== null && (typeof config.events !== 'object' || typeof config.events.verification_token_file !== 'string' || !config.events.verification_token_file)) {
+    throw new Error('feishu bridge config: events must be null or { verification_token_file, encrypt_key_file? }');
+  }
+  if (config.dm_from_anyone && !config.events) throw new Error('feishu bridge config: dm_from_anyone needs events (DMs from others arrive only as pushed events)');
   for (const [id, name] of Object.entries(config.bots)) {
     if (!/^cli_/.test(id) || typeof name !== 'string' || !name) throw new Error(`bots: ${id} must map an app_id (cli_…) to a name`);
   }
@@ -118,10 +137,12 @@ export function loadConfig(raw) {
 }
 
 export class FeishuBridge {
-  constructor({ config, feishu, hub, stateFile, observe = false, now = () => Date.now(), logger = console }) {
+  constructor({ config, feishu, hub, stateFile, observe = false, now = () => Date.now(), logger = console, webhook = null }) {
     this.config = config;
     this.feishu = feishu;
     this.hub = hub;
+    this.webhook = webhook; // { verificationToken, encryptKey } from the `events` secret files; registered with the Hub on the first tick
+    this.webhookRegistered = false;
     this.stateFile = stateFile;
     this.observe = observe;
     this.now = now;
@@ -132,10 +153,10 @@ export class FeishuBridge {
     this.names = { ...Object.fromEntries(Object.entries(config.groups).filter(([, group]) => group.name).map(([chat, group]) => [chat, group.name])) };
   }
 
-  static async create({ config, stateFile, observe = false, fetch: fetchImpl = globalThis.fetch, logger = console, appSecret, adminToken }) {
+  static async create({ config, stateFile, observe = false, fetch: fetchImpl = globalThis.fetch, logger = console, appSecret, adminToken, webhook = null }) {
     const feishu = new FeishuApi({ appId: config.app_id, appSecret, fetch: fetchImpl });
     const hub = new HubAdmin({ baseUrl: config.hub_url, token: adminToken, fetch: fetchImpl });
-    const bridge = new FeishuBridge({ config, feishu, hub, stateFile, observe, logger });
+    const bridge = new FeishuBridge({ config, feishu, hub, stateFile, observe, logger, webhook });
     await bridge.load();
     return bridge;
   }
@@ -150,6 +171,9 @@ export class FeishuBridge {
       this.state.botTurns ??= {};
       this.state.knownThreads ??= {};
       this.state.threadScanAt ??= 0;
+      this.state.channelCursor ??= null;
+      this.state.channelFailures ??= {};
+      this.state.dmChats ??= {};
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       this.state = null;
@@ -179,6 +203,9 @@ export class FeishuBridge {
       knownThreads: {}, // thread id → { chat, at }: threads others opened, polled so an @ inside them is seen
       threadScanAt: 0,
       eventFailures: {}, // Hub event id → failed handling attempts; skipped at EVENT_GIVE_UP
+      channelCursor: null, // seq of the last Feishu event pulled from the Hub (pushed events, see config.events)
+      channelFailures: {}, // Feishu event seq → failed handling attempts; skipped at EVENT_GIVE_UP
+      dmChats: {}, // DM chat id → { who, open_id, at }: other people's DM chats seen through pushed events; their replies go out without approval
       botTurns: {}, // "bot:<app_id>" / "thread:<thread_key>" → recent seconds a listed bot's message was accepted (loop guard)
       approvals: {}, // owner DM message id → attention id waiting for 「发」
       questions: {}, // owner DM message id → attention id waiting for an answer
@@ -420,8 +447,11 @@ export class FeishuBridge {
     const who = budget ? `机器人 ${this.senderName(message)}` : this.senderName(message);
     const result = await this.hub.trigger({
       // Keyed apart from a fresh @ (`feishu:<mid>`): the Hub answers a repeated trigger_key with the
-      // earlier outcome, which would turn the fallback below into another `ignored`.
-      trigger_key: `feishu:${message.message_id}:followup`, thread_key: threadKey, source: 'feishu', actor: who, text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
+      // earlier outcome, which would turn the fallback below into another `ignored`. Keyed per Role
+      // too, and sent with the Role: two bridges follow the same topic, and each forwards only to
+      // its own Role's live Task (11-10 an @ to the QA bot went to the hb-agent's Task instead).
+      trigger_key: `feishu:${message.message_id}:followup:${this.config.role}`, thread_key: threadKey, source: 'feishu', actor: who, role: this.config.role,
+      text: budget ? `（来自机器人 ${budget.bot}，机器人之间的往来一轮说完）\n${text}` : text, followup_only: true,
     });
     // Only an @ gets the reaction: other people's messages in a followed thread are read, not stamped (owner 11-05).
     if (result.routed === 'followup' && this.config.ack_reaction && this.mentionsBot(message)) {
@@ -542,6 +572,100 @@ export class FeishuBridge {
     }
   }
 
+  // ---- inbound: events Feishu pushes to the Hub (other people's DMs) --------
+
+  // Feishu lists only the groups a bot is in, never its DM chats, so a DM from anyone but
+  // the owner (whose chat the bridge learned by writing first) is invisible to polling. With
+  // 事件订阅 pointed at the Hub's public URL, im.message.receive_v1 arrives for every message;
+  // the bridge takes the DMs from it and leaves group traffic to the polling it already does.
+  async ensureWebhookRegistered() {
+    if (!this.webhook || this.webhookRegistered) return;
+    const registered = await this.hub.registerWebhook(this.config.app_id, this.webhook);
+    this.webhookRegistered = true;
+    this.log(`Feishu events accepted at ${registered.path}${registered.encrypted ? ' (encrypted)' : ''}`);
+  }
+
+  async pumpChannelEvents() {
+    if (!this.webhook) return;
+    await this.ensureWebhookRegistered();
+    let payload;
+    try {
+      payload = await this.hub.channelEventsAfter(this.config.app_id, this.state.channelCursor);
+    } catch (error) {
+      if (error.statusCode === 404) this.webhookRegistered = false; // the Hub lost the registration (fresh data dir): re-register next tick
+      throw error;
+    }
+    for (const event of payload.events ?? []) {
+      try {
+        await this.onChannelEvent(event);
+      } catch (error) {
+        this.state.channelFailures ??= {};
+        const attempts = (this.state.channelFailures[event.seq] ?? 0) + 1;
+        this.state.channelFailures[event.seq] = attempts;
+        await this.save();
+        if (attempts < EVENT_GIVE_UP) throw error;
+        this.logger.error?.(`${new Date(this.now()).toISOString()} Feishu event ${event.event_id} (${event.event_type}) skipped after ${attempts} failed attempts: ${error.message}`);
+      }
+      delete this.state.channelFailures?.[event.seq];
+      this.state.channelCursor = event.seq;
+      await this.save();
+    }
+    if (this.state.channelCursor === null && payload.cursor !== undefined) {
+      this.state.channelCursor = payload.cursor; // first run: start at the present, never replay history
+      await this.save();
+    }
+  }
+
+  async onChannelEvent(event) {
+    const payload = event.payload ?? {};
+    if ((payload.header?.event_type ?? event.event_type) !== 'im.message.receive_v1') return;
+    const message = messageFromEvent(payload.event);
+    if (!message || message.chat_type !== 'p2p') return; // groups are polled; the event is only the DM path
+    if (message.sender.sender_type !== 'user') return;
+    if (this.fromOwner(message) || message.chat_id === this.ownerDm()) {
+      // The owner's DM is polled. Learn the chat if the hello never told us.
+      if (!this.ownerDm() && this.isOwner(message.sender.id)) {
+        this.state.ownerDm = message.chat_id;
+        this.state.cursor[message.chat_id] = seconds(Number(message.create_time)) - 1;
+      }
+      return;
+    }
+    if (!this.config.dm_from_anyone) return;
+    await this.process(message, () => (m) => this.onStrangerDm(m));
+  }
+
+  // A DM from someone other than the owner: the Role's work, as an @ in a group is. The DM
+  // chat is the thread, so what they say next while the task is live follows it.
+  async onStrangerDm(message) {
+    const mid = message.message_id;
+    const text = readableText(message);
+    if (!text) return { state: 'skipped' };
+    const who = this.personName(message.sender.id) ?? '同事';
+    if (this.observe) return this.would(`acknowledge DM ${mid} from ${who} and open a ${this.config.role} task`), { state: 'observed' };
+    const acked = await this.acknowledge(mid);
+    this.state.dmChats ??= {};
+    this.state.dmChats[message.chat_id] = { who, open_id: message.sender.id, at: seconds(this.now()) };
+    const prompt = [
+      `【私信】${who} 在飞书私信里对机器人说（消息 ${mid}）：「${text}」。${acked}`,
+      `${who} 不是${this.ownerName()}：按群里 @ 的规则办。先判断要你做什么。只是通知、抄送或不需要回应的：不要回，回报 done 并写明「只是通知，无需处理」。要你做事或回答的：按手册处理，要回给${who}的内容不要自己发，用 agent_hub_report 回报 outcome "needs_approval"，action = {"channel":"feishu","kind":"send","target":"${message.chat_id}","text":"<回复正文>","key":"<唯一键>","note":"回 ${who}：<一句话>"}，由渠道发到这个私聊（不用${this.ownerName()}批准，发出后${this.ownerName()}会收到回执），结果会以新指令告诉你。`,
+      `${who} 后面在这个私聊里说的话会作为同一任务的跟进直接发给你；对方说不用查、不用回，就停手结单。`,
+      this.config.prompt_hint,
+    ].filter(Boolean).join('\n\n');
+    const result = await this.hub.trigger({
+      trigger_key: `feishu:${mid}`,
+      thread_key: `feishu-dm:${message.chat_id}`,
+      source: 'feishu-dm',
+      actor: who,
+      role: this.config.role,
+      title: `${who}私信：${text.slice(0, 30)}`,
+      text: prompt,
+    });
+    if (result.waiting_for_seat) {
+      await this.dmOwner(`${who} 私信了机器人（消息 ${mid}），已表示收到。${result.seats_busy ? SEATS_BUSY : NO_SEAT}`, `bridge-noseat-${mid}`);
+    }
+    return { state: result.waiting_for_seat ? 'queued' : 'dispatched', routed: result.routed, task: result.task?.task_id ?? null, chat: message.chat_id, dm: who };
+  }
+
   // ---- outbound: Hub events → the owner, approved actions → Feishu ---------
 
   async pumpEvents() {
@@ -652,6 +776,8 @@ export class FeishuBridge {
     if (action.kind === 'send' && this.isOwner(action.target)) return this.config.auto_approve_to_owner ? 'a message to the owner' : null;
     const chatId = await this.actionChat(action);
     if (!chatId) return null;
+    const dm = this.state?.dmChats?.[chatId];
+    if (dm) return this.config.dm_from_anyone ? `a reply in the DM with ${dm.who}` : null;
     const group = this.config.groups[chatId];
     const chat = this.knownChats?.[chatId];
     if (!group && !chat) return null;
@@ -886,6 +1012,9 @@ export class FeishuBridge {
       }
     }
 
+    // Other people's DMs arrive as events Feishu pushed to the Hub.
+    await this.pumpChannelEvents().catch((error) => fail('feishu-events', error));
+
     // Decisions just made in DMs produce events; act on them now, not a tick later.
     await this.pumpEvents().catch((error) => fail('hub-events-2', error));
 
@@ -922,8 +1051,32 @@ export class FeishuBridge {
       pendingQuestions: Object.values(this.state?.questions ?? {}),
       pendingConfirms: Object.keys(this.state?.confirms ?? {}).length,
       eventCursor: this.state?.eventCursor ?? null,
+      channelCursor: this.state?.channelCursor ?? null,
+      dmChats: Object.keys(this.state?.dmChats ?? {}).length,
     };
   }
+}
+
+// The message inside an im.message.receive_v1 event, in the shape the listing API gives
+// (what every reader here expects): body.content, msg_type, sender.id, mentions[].id.
+export function messageFromEvent(event) {
+  const message = event?.message;
+  const sender = event?.sender;
+  if (!message?.message_id || !message.chat_id) return null;
+  return {
+    message_id: message.message_id,
+    chat_id: message.chat_id,
+    chat_type: message.chat_type ?? null,
+    thread_id: message.thread_id ?? null,
+    parent_id: message.parent_id || null,
+    root_id: message.root_id || null,
+    create_time: String(message.create_time ?? Date.now()),
+    msg_type: message.message_type,
+    deleted: false,
+    body: { content: message.content ?? '{}' },
+    mentions: (message.mentions ?? []).map((mention) => ({ key: mention.key, id: mention.id?.open_id ?? mention.id ?? null, id_type: 'open_id', name: mention.name ?? '' })),
+    sender: { id: sender?.sender_id?.open_id ?? sender?.sender_id?.user_id ?? null, id_type: 'open_id', sender_type: sender?.sender_type ?? 'user' },
+  };
 }
 
 export { messageText };

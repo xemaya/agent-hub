@@ -693,7 +693,18 @@ async function bridgeCommand(positionals, flags) {
     if (!adminToken) throw new Error(`${config.admin_token_file} has no adminToken`);
   }
   const stateFile = path.resolve(path.dirname(configPath), config.state_file ?? 'feishu-bridge-state.json');
-  const bridge = await FeishuBridge.create({ config, stateFile, observe: flags.observe === true, appSecret, adminToken });
+  // Pushed events (事件订阅): the Verification Token and optional Encrypt Key from the developer
+  // console sit in 0600 files beside the config, like the app secret.
+  let webhook = null;
+  if (config.events) {
+    const readSecretFile = async (file) => (await readFile(path.resolve(path.dirname(configPath), file), 'utf8')).trim();
+    webhook = {
+      verificationToken: await readSecretFile(config.events.verification_token_file),
+      encryptKey: config.events.encrypt_key_file ? await readSecretFile(config.events.encrypt_key_file) : null,
+    };
+    if (!webhook.verificationToken) throw new Error(`${config.events.verification_token_file} is empty`);
+  }
+  const bridge = await FeishuBridge.create({ config, stateFile, observe: flags.observe === true, appSecret, adminToken, webhook });
   if (flags.status === true) {
     print(bridge.status());
     return;

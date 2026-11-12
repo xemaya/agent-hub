@@ -131,6 +131,39 @@ test('Follow-ups stay with the busy seat that holds the task', async (t) => {
   assert.equal(followup.waiting_for_seat, undefined);
 });
 
+test('A trigger addressed to a Role follows only that Role\'s live Task on the thread', async (t) => {
+  // 11-10: the QA bot was @-ed in a topic where the hb-agent held the newest live Task; the Hub
+  // made it a follow-up of that Task and QA never saw the retest request.
+  const { context, hold } = await setup(t);
+  const qa = await context.registerWorker({ name: 'qa-a', role: 'qa' });
+  const hb = await context.registerWorker({ name: 'hb-a', role: 'hb-agent' });
+  hold('qa-a');
+  hold('hb-a');
+  const qaTask = (await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'qa first' })).payload;
+  const hbTask = (await trigger(context, { trigger_key: 'm2', thread_key: 'feishu:t1', role: 'hb-agent', text: 'hb first' })).payload;
+  assert.equal(qaTask.routed, 'created');
+  assert.equal(hbTask.routed, 'created', 'another Role opens its own Task on the same thread');
+  assert.notEqual(hbTask.task.task_id, qaTask.task.task_id);
+
+  const forQa = (await trigger(context, { trigger_key: 'm3', thread_key: 'feishu:t1', role: 'qa', text: 'qa more', followup_only: true })).payload;
+  assert.equal(forQa.routed, 'followup');
+  assert.equal(forQa.task.task_id, qaTask.task.task_id);
+  assert.equal(context.hub.store.getCommand(forQa.command_id).worker_id, qa.worker_id);
+
+  const forHb = (await trigger(context, { trigger_key: 'm4', thread_key: 'feishu:t1', role: 'hb-agent', text: 'hb more', followup_only: true })).payload;
+  assert.equal(forHb.task.task_id, hbTask.task.task_id);
+  assert.equal(context.hub.store.getCommand(forHb.command_id).worker_id, hb.worker_id);
+
+  // Without a Role the newest live Task on the thread still takes it (alerts, role-less connectors).
+  const anyone = (await trigger(context, { trigger_key: 'm5', thread_key: 'feishu:t1', text: 'plain', followup_only: true })).payload;
+  assert.equal(anyone.routed, 'followup');
+  assert.equal(anyone.task.task_id, hbTask.task.task_id);
+
+  // A Role with no live Task on the thread gets `ignored` for a follow-up, so the bridge can open a fresh Task.
+  const none = (await trigger(context, { trigger_key: 'm6', thread_key: 'feishu:t1', role: 'dev', text: 'dev?', followup_only: true })).payload;
+  assert.equal(none.routed, 'ignored');
+});
+
 test('seats_busy stays false when nobody is on the Role', async (t) => {
   const { context } = await setup(t);
   const { payload } = await trigger(context, { trigger_key: 'm1', thread_key: 'feishu:t1', role: 'qa', text: 'anyone?' });

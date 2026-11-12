@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createDecipheriv, createHash } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -102,6 +103,18 @@ function protocolError(message, statusCode = 400, code = 'connector_request_fail
   error.statusCode = statusCode;
   error.code = code;
   return error;
+}
+
+// Feishu event encryption: AES-256-CBC with SHA-256(Encrypt Key) as the key; the base64
+// ciphertext starts with the 16-byte IV. The plaintext is the event JSON.
+export function decryptFeishuEvent(encrypted, encryptKey) {
+  const key = createHash('sha256').update(encryptKey, 'utf8').digest();
+  const bytes = Buffer.from(encrypted, 'base64');
+  const decipher = createDecipheriv('aes-256-cbc', key, bytes.subarray(0, 16));
+  const plain = Buffer.concat([decipher.update(bytes.subarray(16)), decipher.final()]).toString('utf8');
+  const value = JSON.parse(plain);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('decrypted event is not an object');
+  return value;
 }
 
 function requiredString(value, field, { max = 10000 } = {}) {
@@ -564,6 +577,52 @@ export class Hub {
     return attention;
   }
 
+  // Feishu pushes an event (事件订阅 v2) or the one-time URL check. The body is either the
+  // JSON itself or `{ encrypt }`: AES-256-CBC, key = SHA-256 of the registered Encrypt Key,
+  // the first 16 bytes the IV. The verification token inside must match the registration.
+  // Stored events are pulled by the app's bridge; a repeated event_id (Feishu retries when
+  // the answer is slow) is kept once. Answers 200 fast: Feishu gives up after 3 seconds.
+  async receiveFeishuWebhook(appId, request, response) {
+    const registered = this.store.getChannelWebhook('feishu', appId);
+    if (!registered) {
+      sendJson(response, 404, { error: 'No bridge registered for this app' });
+      return;
+    }
+    let body = await readJsonBody(request, { limit: 256 * 1024 });
+    if (typeof body.encrypt === 'string') {
+      if (!registered.encrypt_key) {
+        sendJson(response, 400, { error: 'Encrypted event but no Encrypt Key registered' });
+        return;
+      }
+      try {
+        body = decryptFeishuEvent(body.encrypt, registered.encrypt_key);
+      } catch {
+        sendJson(response, 400, { error: 'Event could not be decrypted' });
+        return;
+      }
+    }
+    const token = body.header?.token ?? body.token;
+    if (!tokensEqual(typeof token === 'string' ? hashToken(token) : '', registered.token_hash)) {
+      sendJson(response, 401, { error: 'Verification token does not match' });
+      return;
+    }
+    if (body.type === 'url_verification') {
+      sendJson(response, 200, { challenge: String(body.challenge ?? '') });
+      return;
+    }
+    if (body.header?.app_id && body.header.app_id !== appId) {
+      sendJson(response, 400, { error: 'Event is for another app' });
+      return;
+    }
+    const eventId = body.header?.event_id ?? body.uuid ?? null;
+    if (!eventId) {
+      sendJson(response, 400, { error: 'Event has no id' });
+      return;
+    }
+    const stored = this.store.addChannelEvent({ channel: 'feishu', appId, eventId: String(eventId), eventType: body.header?.event_type ?? body.event?.type ?? null, payload: body });
+    sendJson(response, 200, { ok: true, stored: Boolean(stored) });
+  }
+
   // An event from an external conversation (a Feishu topic, a PR thread). The
   // thread_key is the subscription: while a live Task follows the thread, its
   // later messages go straight to the Task's assignee (or answer its open
@@ -580,7 +639,10 @@ export class Hub {
     if (previous) {
       return { routed: previous.routed, duplicate: true, task: previous.task_id ? this.store.getTask(previous.task_id) : null, command_id: previous.command_id };
     }
-    const task = this.store.liveTaskByThread(threadKey);
+    // Addressed to a Role: only that Role's live Task on the thread takes it as a follow-up;
+    // another Role's Task on the same topic does not (two bridges can follow one topic).
+    const roleKey = payload.role === undefined || payload.role === null || payload.role === '' ? null : requiredString(payload.role, 'role', { max: 100 });
+    const task = this.store.liveTaskByThread(threadKey, roleKey);
     let routed = 'ignored';
     let command = null;
     let attention = null;
@@ -883,11 +945,47 @@ export class Hub {
       sendJson(response, 201, { connector, token });
       return;
     }
+    // A channel platform pushes events here (Feishu 事件订阅 → 请求地址). No bearer token: the
+    // platform cannot send one, so the body's verification token (registered by the app's
+    // bridge) is the credential, and the body may be encrypted with the registered key.
+    const hook = /^\/hooks\/feishu\/(cli_[A-Za-z0-9]+)$/.exec(pathname);
+    if (request.method === 'POST' && hook) {
+      await this.receiveFeishuWebhook(hook[1], request, response);
+      return;
+    }
     if (!pathname.startsWith('/api/v1/')) {
       sendJson(response, 404, { error: 'Not found' });
       return;
     }
     this.requireAdmin(request);
+    // A bridge registers how the Hub verifies the platform's pushes for its app …
+    const webhookRoute = /^\/api\/v1\/channel-webhooks\/feishu\/(cli_[A-Za-z0-9]+)$/.exec(pathname);
+    if (request.method === 'PUT' && webhookRoute) {
+      const body = await readJsonBody(request);
+      const token = requiredString(body.verification_token, 'verification_token', { max: 200 });
+      const encryptKey = optionalString(body.encrypt_key) || null;
+      const registered = this.store.registerChannelWebhook({ channel: 'feishu', appId: webhookRoute[1], tokenHash: hashToken(token), encryptKey });
+      sendJson(response, 200, { channel: 'feishu', app_id: registered.app_id, path: `/hooks/feishu/${registered.app_id}`, encrypted: Boolean(encryptKey), registered_at: registered.registered_at });
+      return;
+    }
+    // … and pulls the stored events in order. Without `after` only the current position comes back.
+    if (request.method === 'GET' && pathname === '/api/v1/channel-events') {
+      const channel = requiredString(url.searchParams.get('channel'), 'channel', { max: 40 });
+      const appId = requiredString(url.searchParams.get('app_id'), 'app_id', { max: 100 });
+      if (!this.store.getChannelWebhook(channel, appId)) {
+        sendJson(response, 404, { error: 'No webhook registered for this app; register it first', code: 'webhook_not_registered' });
+        return;
+      }
+      const after = url.searchParams.get('after');
+      if (after === null || after === '') {
+        sendJson(response, 200, { events: [], cursor: this.store.latestChannelEventSeq(channel, appId) });
+        return;
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 200, 1), 1000);
+      const events = this.store.listChannelEventsAfter(channel, appId, Number(after) || 0, { limit });
+      sendJson(response, 200, { events, cursor: events.at(-1)?.seq ?? Number(after) });
+      return;
+    }
     if (request.method === 'GET' && pathname === '/api/v1/mail') {
       const workerId = requiredString(url.searchParams.get('worker_id'), 'worker_id', { max: 100 });
       if (!this.store.getWorker(workerId)) throw protocolError('Worker not found', 404);

@@ -73,6 +73,7 @@ Environment:
   AGENT_HUB_AUTO_UPDATE         Set to 0 to stop the Connector from fast-forwarding itself
   AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS  Coordinator timeout (default 900000)
   AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS      Other command timeout (default 3600000)
+  AGENT_HUB_PRESENCE_EVENT_RETENTION_MS        Keep online/offline and Channel events this long (default 1209600000, 14 days; 0 keeps them)
 `;
 
 const BOOLEAN_FLAGS = new Set(['local', 'wait', 'orchestrate', 'yes', 'no-auto-update', 'push', 'desktop', 'native-tui', 'unread', 'followup-only', 'observe']);
@@ -223,6 +224,7 @@ async function startHub(flags) {
     dataDir: flags['data-dir'] ?? '.runtime/hub',
     coordinatorInactivityTimeoutMs: milliseconds(process.env.AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS, 15 * 60 * 1000),
     commandInactivityTimeoutMs: milliseconds(process.env.AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS, 60 * 60 * 1000),
+    presenceEventRetentionMs: milliseconds(process.env.AGENT_HUB_PRESENCE_EVENT_RETENTION_MS, 14 * 24 * 60 * 60 * 1000),
   });
   await hub.listen();
   console.log(`Agent Hub ${shortCommit(hub.build.commit)}${hub.build.dirty ? ' (modified)' : ''} listening on ${hub.url}`);

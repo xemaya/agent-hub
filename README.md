@@ -244,6 +244,8 @@ agent-hub command cancel COMMAND_ID \
 
 运行中的 Command 以 `last_activity_at` 做无活动看门狗，ACK、开始执行和输出会刷新时间，机器心跳不冒充 Agent 进展。默认协调者命令 15 分钟、其他命令 60 分钟无活动后以 `inactivity_timeout` 和结果未知收尾；排队或等待人工接入不算正在执行超时。重启后仍按数据库时间判断。可通过 `AGENT_HUB_COORDINATOR_INACTIVITY_TIMEOUT_MS` 和 `AGENT_HUB_COMMAND_INACTIVITY_TIMEOUT_MS` 调整，设为 0 禁用对应看门狗。
 
+事件表里的在线状态事件（`connector.online/offline`、`worker.channel_attached/detached`）默认只保留 14 天，Hub 每小时清理一次；可通过 `AGENT_HUB_PRESENCE_EVENT_RETENTION_MS` 调整，设为 0 表示全部保留。Connector 重连后重新上报的 Channel 状态如果没有变化，不再写事件。
+
 ### 指定中央大脑
 
 先在一个可见交互 Session 中登记并接通目标 Worker，再由管理员在中控点击“指定/更换”，或执行：

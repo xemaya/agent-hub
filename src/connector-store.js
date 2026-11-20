@@ -3,6 +3,8 @@ import path from 'node:path';
 import { createToken } from './ids.js';
 
 const timestamp = () => new Date().toISOString();
+const DAY_MS = 24 * 60 * 60 * 1000;
+const TERMINAL = new Set(['succeeded', 'failed']);
 
 export class ConnectorStore {
   constructor(dataDir, state) {
@@ -45,6 +47,8 @@ export class ConnectorStore {
     ));
     state.commands ??= [];
     state.mailNotifications ??= {};
+    // Notices written before saved_at existed age from the first load that sees them.
+    for (const notice of Object.values(state.mailNotifications)) notice.saved_at ??= timestamp();
     const store = new ConnectorStore(dataDir, state);
     await store.save();
     return store;
@@ -153,8 +157,41 @@ export class ConnectorStore {
 
   async saveMailNotification(messageId, notice) {
     this.state.mailNotifications ??= {};
-    this.state.mailNotifications[messageId] = structuredClone(notice);
+    this.state.mailNotifications[messageId] = { ...structuredClone(notice), saved_at: timestamp() };
     await this.save();
+  }
+
+  // The Hub has the final state of this command, or no longer has the command at all,
+  // so it will never dispatch it again and the local record can eventually go.
+  async markCommandSynced(commandId) {
+    const command = this.state.commands.find((item) => item.command_id === commandId);
+    if (!command || !TERMINAL.has(command.status) || command.hub_synced_at) return false;
+    command.hub_synced_at = timestamp();
+    await this.save();
+    return true;
+  }
+
+  // Every command stays in connector.json, with its directory and task snapshot, and the
+  // whole file is rewritten on each change. Drop finished commands the Hub has confirmed
+  // once they are a week old, and mail notices after a month. An unconfirmed command is
+  // kept however old: a Hub that still has it queued would otherwise run it again.
+  async prune({ now = Date.now(), commandMaxAgeMs = 7 * DAY_MS, mailMaxAgeMs = 30 * DAY_MS } = {}) {
+    const commandCutoff = new Date(now - commandMaxAgeMs).toISOString();
+    const mailCutoff = new Date(now - mailMaxAgeMs).toISOString();
+    const before = this.state.commands.length;
+    this.state.commands = this.state.commands.filter((command) => !(
+      TERMINAL.has(command.status) && command.hub_synced_at && (command.finished_at ?? command.updated_at ?? '') < commandCutoff
+    ));
+    let mail = 0;
+    for (const [messageId, notice] of Object.entries(this.state.mailNotifications)) {
+      if ((notice.saved_at ?? '') < mailCutoff) {
+        delete this.state.mailNotifications[messageId];
+        mail += 1;
+      }
+    }
+    const commands = before - this.state.commands.length;
+    if (commands || mail) await this.save();
+    return { commands, mail };
   }
 
   nextAcceptedCommand(workerId) {

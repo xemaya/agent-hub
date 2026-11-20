@@ -17,6 +17,10 @@ function view(row) {
 export class MailStore {
   constructor(db) {
     this.db = db;
+  }
+
+  // Part of the schema-19 baseline; HubStore's legacy upgrade calls it.
+  static createSchema(db) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS worker_mail (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,

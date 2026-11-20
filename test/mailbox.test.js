@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { SCHEMA_VERSION } from '../src/db.js';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -111,7 +112,7 @@ test('Mailbox pagination and unread filtering survive Hub and Connector restarts
   assert.equal(next.messages.length, 2);
   assert.ok(next.messages.every(message => !page.messages.some(other => other.message_id === message.message_id)));
   assert.equal((await folder(ctx, recipient, 'inbox', { unread: 'true' })).payload.messages.length, 4);
-  assert.equal(ctx.hub.store.db.prepare('PRAGMA user_version').get().user_version, 19);
+  assert.equal(ctx.hub.store.db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
 });
 
 test('Mail crosses Connectors with a verified sender and rejects a foreign Session identity', async t => {
@@ -274,7 +275,7 @@ test('Schema 11 upgrades retain legacy waiting commands without converting or re
   assert.equal(legacy.payload.command.status, 'waiting_manual');
   ctx.hub.store.db.exec('DROP TABLE worker_mail; PRAGMA user_version=11');
   await ctx.restartHub();
-  assert.equal(ctx.hub.store.db.prepare('PRAGMA user_version').get().user_version, 19);
+  assert.equal(ctx.hub.store.db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
   assert.equal(ctx.hub.store.getCommand(id).status, 'waiting_manual');
   assert.equal(ctx.hub.store.mailbox.list(recipient.worker_id).messages.length, 0);
   assert.equal(ctx.driver.executions.length, 0);

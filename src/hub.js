@@ -166,6 +166,7 @@ export class Hub {
     coordinatorInactivityTimeoutMs = 15 * 60 * 1000,
     commandInactivityTimeoutMs = 60 * 60 * 1000,
     watchdogIntervalMs = 30000,
+    presenceEventRetentionMs = 14 * 24 * 60 * 60 * 1000,
     shutdownGraceMs = 2000,
     mailRingIntervalMs = 15 * 60 * 1000,
   }) {
@@ -178,6 +179,8 @@ export class Hub {
     this.logger = logger;
     this.coordinatorInactivityTimeoutMs = coordinatorInactivityTimeoutMs;
     this.commandInactivityTimeoutMs = commandInactivityTimeoutMs;
+    this.presenceEventRetentionMs = presenceEventRetentionMs;
+    this.presenceEventsPrunedAt = 0;
     this.expiringInactiveCommands = false;
     this.store = new HubStore(path.join(dataDir, 'hub.db'));
     this.credentials = credentials;
@@ -236,6 +239,7 @@ export class Hub {
     this.inactivityWatchdog = setInterval(() => {
       this.expireInactiveCommands().catch(error => this.logger.error?.(error));
       this.tickWatchdog();
+      this.prunePresenceEvents();
       if (!this.closing) this.roles.tick().catch(error => this.logger.error?.(error));
     }, watchdogIntervalMs);
     this.inactivityWatchdog.unref();
@@ -254,6 +258,18 @@ export class Hub {
         this.handleWebSocket(webSocket, kind);
       });
     });
+  }
+
+  // Runs from the watchdog tick at most once an hour; a retention of 0 keeps everything.
+  prunePresenceEvents(nowMs = Date.now()) {
+    if (!this.presenceEventRetentionMs || this.closing || nowMs - this.presenceEventsPrunedAt < 60 * 60 * 1000) return 0;
+    this.presenceEventsPrunedAt = nowMs;
+    try {
+      return this.store.deletePresenceEventsBefore(new Date(nowMs - this.presenceEventRetentionMs).toISOString());
+    } catch (error) {
+      this.logger.error?.(error);
+      return 0;
+    }
   }
 
   static async create(options) {
@@ -1181,7 +1197,10 @@ export class Hub {
         const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 200, 1), 1000);
         const events = this.store.listEventsAfter(url.searchParams.get('after') || null, { limit, types });
         if (!events) sendJson(response, 404, { error: 'Unknown event cursor; start again without `after` to get the current position' });
-        else sendJson(response, 200, { events, cursor: events.at(-1)?.event_id ?? (url.searchParams.get('after') || this.store.latestEventId()) });
+        // A short page means every later event was scanned, so the cursor moves to the
+        // present even when the type filter matched nothing. A cursor that stayed on an
+        // old filtered-out event could later be removed by event retention.
+        else sendJson(response, 200, { events, cursor: events.length < limit ? (this.store.latestEventId() ?? (url.searchParams.get('after') || null)) : events.at(-1).event_id });
         return;
       }
       sendJson(response, 200, { events: this.store.listEvents() });
@@ -1833,13 +1852,18 @@ export class Hub {
       return;
     }
     if (message.type === 'worker.channel') {
-      const worker = this.store.setWorkerChannel(connectorId, requiredString(payload.worker_id, 'worker_id'), payload.attached === true,
+      const workerId = requiredString(payload.worker_id, 'worker_id');
+      const wasAttached = this.store.getWorkerForConnector(workerId, connectorId)?.push_capable;
+      const worker = this.store.setWorkerChannel(connectorId, workerId, payload.attached === true,
         optionalString(payload.session_cwd).slice(0, 4096) || null);
       if (!worker) throw new Error('Interactive Channel requires a Worker of this Connector');
-      this.emit(payload.attached === true ? 'worker.channel_attached' : 'worker.channel_detached', { type: 'worker', id: worker.worker_id }, {
-        connector_id: connectorId,
-        worker_id: worker.worker_id,
-      });
+      // A Connector re-reports every Channel after each reconnect; only a change is an event.
+      if (wasAttached !== worker.push_capable) {
+        this.emit(worker.push_capable ? 'worker.channel_attached' : 'worker.channel_detached', { type: 'worker', id: worker.worker_id }, {
+          connector_id: connectorId,
+          worker_id: worker.worker_id,
+        });
+      }
       this.broadcast('worker.updated', { worker: this.presentWorker(worker) });
       if (worker.push_capable) this.replay(connectorId);
       if (worker.push_capable && Array.isArray(payload.features) && payload.features.includes('mailbox_v1')) this.store.mailbox.retryUnsupported(worker.worker_id);
@@ -1947,7 +1971,7 @@ export class Hub {
     if (message.type === 'command.sync') {
       const command = this.authorizedCommand(payload.command_id, connectorId);
       if (!command) {
-        this.send(socket, 'command.synced', { command: null }, message.id);
+        this.send(socket, 'command.synced', { command: null, command_id: payload.command_id ?? null }, message.id);
         return;
       }
       let updated = command;

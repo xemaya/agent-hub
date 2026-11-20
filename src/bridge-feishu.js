@@ -728,8 +728,11 @@ export class FeishuBridge {
       this.state.eventCursor = event.event_id;
       await this.save();
     }
-    if (!this.state.eventCursor && payload.cursor) {
-      this.state.eventCursor = payload.cursor; // first run: start at the present, never replay history
+    // On a first run this starts at the present and never replays history. Later it
+    // moves the cursor past events the type filter skipped, so it never rests on an
+    // old event that the Hub's event retention may delete.
+    if (payload.cursor && payload.cursor !== this.state.eventCursor) {
+      this.state.eventCursor = payload.cursor;
       await this.save();
     }
   }

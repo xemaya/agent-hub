@@ -6,6 +6,21 @@ import { MailStore } from './mail-store.js';
 const now = () => new Date().toISOString();
 const OUTPUT_LIMIT = 256 * 1024;
 
+// Schema versions. A database below LEGACY_SCHEMA_VERSION is brought to it once by
+// upgradeLegacySchema(), the column-probing code every release ran at startup up to
+// schema 19. After that each migration runs exactly once, in its own transaction, and
+// moves PRAGMA user_version to its number in the same transaction, so a crash leaves
+// the database at the previous version. Append new entries; never edit a released one.
+// An entry that rebuilds a table sets rebuildsTable: foreign keys are turned off around
+// it (SQLite ignores that pragma inside a transaction) and checked before commit.
+export const PRESENCE_EVENT_TYPES = Object.freeze(['worker.channel_attached', 'worker.channel_detached', 'connector.online', 'connector.offline']);
+
+export const LEGACY_SCHEMA_VERSION = 19;
+export const MIGRATIONS = Object.freeze([
+  // { version: 20, up(db) { db.exec('...'); } },
+]);
+export const SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? LEGACY_SCHEMA_VERSION;
+
 function connectorView(row) {
   if (!row) return null;
   return {
@@ -273,9 +288,51 @@ const COMMAND_SELECT = `
 `;
 
 export class HubStore {
-  constructor(filename) {
+  // `migrations` exists for tests; production always uses MIGRATIONS.
+  constructor(filename, { migrations = MIGRATIONS } = {}) {
     this.db = new DatabaseSync(filename);
     this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+    this.migrate(migrations);
+    this.mailbox = new MailStore(this.db);
+  }
+
+  schemaVersion() {
+    return Number(this.db.prepare('PRAGMA user_version').get().user_version);
+  }
+
+  migrate(migrations) {
+    const latest = migrations.at(-1)?.version ?? LEGACY_SCHEMA_VERSION;
+    const version = this.schemaVersion();
+    if (version > latest) {
+      throw new Error(`hub.db is at schema ${version}, newer than this agent-hub (schema ${latest}); update agent-hub before starting it`);
+    }
+    if (version < LEGACY_SCHEMA_VERSION) {
+      this.transaction(() => {
+        this.createLegacySchema();
+        this.upgradeLegacySchema();
+        this.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION}`);
+      });
+    }
+    for (const migration of migrations) {
+      if (migration.version <= this.schemaVersion()) continue;
+      if (migration.rebuildsTable) this.db.exec('PRAGMA foreign_keys = OFF');
+      try {
+        this.transaction(() => {
+          migration.up(this.db);
+          if (migration.rebuildsTable && this.db.prepare('PRAGMA foreign_key_check').all().length) {
+            throw new Error(`Schema ${migration.version} left rows that break foreign keys`);
+          }
+          this.db.exec(`PRAGMA user_version = ${Number(migration.version)}`);
+        });
+      } finally {
+        if (migration.rebuildsTable) this.db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  }
+
+  // The tables as the first releases created them. Later columns are added by
+  // upgradeLegacySchema(), so a new database and an upgraded one take the same path.
+  createLegacySchema() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS connectors (
         connector_id TEXT PRIMARY KEY,
@@ -457,10 +514,11 @@ export class HubStore {
       CREATE INDEX IF NOT EXISTS idx_coordinator_orchestrations_status ON coordinator_orchestrations(status);
       CREATE INDEX IF NOT EXISTS idx_coordinator_chat_created ON coordinator_chat_messages(created_at);
     `);
-    this.migrate();
   }
 
-  migrate() {
+  // Up to schema 19 each release probed columns at startup and added what was missing.
+  // It now runs once, inside migrate()'s transaction, for databases below schema 19.
+  upgradeLegacySchema() {
     const columns = new Set(this.db.prepare('PRAGMA table_info(coordinator_orchestrations)').all().map((column) => column.name));
     const additions = {
       auto_start: 'INTEGER NOT NULL DEFAULT 1',
@@ -589,8 +647,7 @@ export class HubStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_events_id ON channel_events(channel, app_id, event_id);
     `);
-    this.mailbox = new MailStore(this.db);
-    this.db.exec('PRAGMA user_version = 19');
+    MailStore.createSchema(this.db);
   }
 
   close() {
@@ -1631,6 +1688,14 @@ export class HubStore {
     const kinds = types?.length ? `AND event_type IN (${types.map(() => '?').join(', ')})` : '';
     return this.db.prepare(`SELECT * FROM events WHERE rowid > ? ${kinds} ORDER BY rowid ASC LIMIT ?`)
       .all(since, ...(types ?? []), limit).map(eventView);
+  }
+
+  // Presence events record a Connector or Channel coming and going. They are most of the
+  // event table and nothing reads old ones, so the Hub keeps them for a limited time.
+  deletePresenceEventsBefore(cutoff) {
+    const types = PRESENCE_EVENT_TYPES.map(() => '?').join(', ');
+    return Number(this.db.prepare(`DELETE FROM events WHERE event_type IN (${types}) AND created_at < ?`)
+      .run(...PRESENCE_EVENT_TYPES, cutoff).changes);
   }
 
   latestEventId() {

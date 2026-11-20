@@ -412,6 +412,11 @@ export class Connector {
     }
     if (message.type === 'command.synced' && ['succeeded', 'failed'].includes(message.payload?.command?.status)) {
       await this.applyTerminalCommand(message.payload.command);
+      await this.store.markCommandSynced(message.payload.command.command_id);
+      return;
+    }
+    if (message.type === 'command.synced' && message.payload?.command === null && message.payload.command_id) {
+      await this.store.markCommandSynced(message.payload.command_id);
       return;
     }
     if (message.type === 'worker.unregistered') {
@@ -616,6 +621,8 @@ export class Connector {
   }
 
   async syncAndPump() {
+    // Each reconnect re-syncs every local command, so prune the confirmed old ones first.
+    await this.store.prune().catch((error) => this.logger.error?.(`Connector state not pruned: ${error.message}`));
     for (const command of this.store.listCommands()) {
       const payload = {
         command_id: command.command_id,
@@ -630,8 +637,10 @@ export class Connector {
         const { command: authoritative } = await this.request('command.sync', payload);
         if (!authoritative) {
           await this.cancelCommand(command.command_id, { code: 'hub_command_missing', message: 'Command is no longer available on Hub; outcome is unknown' });
+          await this.store.markCommandSynced(command.command_id);
         } else if (['succeeded', 'failed'].includes(authoritative.status)) {
           await this.applyTerminalCommand(authoritative);
+          await this.store.markCommandSynced(command.command_id);
         }
       } else {
         this.send('command.sync', payload);

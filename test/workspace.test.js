@@ -529,3 +529,29 @@ test('已有会话凭工作区名字加入：不用报到单，座位按类型�
   const inbox = await ctx.rpc('ws.inbox', CX);
   assert.ok(inbox.messages.some((message) => /上午查的结论/.test(message.body)));
 });
+
+test('业主删工作区：进行中的不能删，收工后连消息、记事本、文件一起删掉', async (t) => {
+  const ctx = await context(t);
+  const { ticket, workspaceId } = await startTeam(ctx);
+  await ctx.rpc('ws.join', CC, { ticket });
+  const params = new URLSearchParams({ runtime: CC.runtime, session_id: CC.session_id, name: 'a.txt', size: '5' });
+  const upload = await fetch(`${ctx.connector.localUrl}/local/v1/workspaces/files?${params}`, {
+    method: 'POST', headers: { authorization: `Bearer ${ctx.connector.store.credentials.localToken}` }, body: 'hello',
+  });
+  const { file } = await upload.json();
+  await ctx.rpc('ws.note', CC, { kind: 'fact', text: '记一笔' });
+
+  const early = await ctx.admin(`/api/v1/workspaces/${workspaceId}`, { method: 'DELETE' });
+  assert.equal(early.response.status, 409);
+  await ctx.rpc('ws.close', LEADER, {});
+  const deleted = await ctx.admin(`/api/v1/workspaces/${workspaceId}`, { method: 'DELETE' });
+  assert.equal(deleted.response.status, 200);
+  assert.equal(deleted.payload.files, 1);
+  assert.equal((await ctx.admin(`/api/v1/workspaces/${workspaceId}`)).response.status, 404);
+  assert.ok(!(await ctx.admin('/api/v1/workspaces')).payload.workspaces.some((item) => item.workspace_id === workspaceId));
+  await assert.rejects(stat(path.join(ctx.hub.workspaces.filesDir, file.file_id)), { code: 'ENOENT' });
+  const store = ctx.hub.workspaces.store;
+  assert.equal(store.getMemberBySeat(workspaceId, 'cc-1'), null);
+  // The same sessions can start over.
+  assert.ok((await ctx.rpc('ws.create', LEADER, { name: 'search-v2', seats: [] })).workspace);
+});

@@ -1123,6 +1123,17 @@ export class WorkspaceHub {
       sendJson(response, value ? 200 : 404, value ?? { error: 'Workspace not found' });
       return true;
     }
+    // Only a closed workspace can be deleted: messages, notes, files and seats all go.
+    if (request.method === 'DELETE' && detail) {
+      const workspace = this.store.getWorkspace(decodeURIComponent(detail[1]));
+      if (!workspace) throw wsError('Workspace not found', 404);
+      if (workspace.status === 'active') throw wsError('进行中的工作区不能删，先收工', 409);
+      const files = this.store.deleteWorkspace(workspace.workspace_id);
+      for (const fileId of files) await rm(path.join(this.filesDir, fileId), { force: true });
+      this.changed(workspace.workspace_id);
+      sendJson(response, 200, { deleted: workspace.workspace_id, files: files.length });
+      return true;
+    }
     const messages = /^\/api\/v1\/workspaces\/([^/]+)\/messages$/.exec(pathname);
     if (request.method === 'POST' && messages) {
       const workspace = this.store.getWorkspace(decodeURIComponent(messages[1]));

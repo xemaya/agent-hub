@@ -384,6 +384,17 @@ export class WorkspaceStore {
     return this.getWorkspace(workspaceId);
   }
 
+  // Removes a workspace and everything in it; returns the file ids whose bodies the caller deletes.
+  deleteWorkspace(workspaceId) {
+    return this.transaction(() => {
+      const files = this.db.prepare('SELECT file_id FROM ws_files WHERE workspace_id = ?').all(workspaceId).map((row) => row.file_id);
+      for (const table of ['ws_messages', 'ws_notes', 'ws_files', 'ws_members', 'ws_workspaces']) {
+        this.db.prepare(`DELETE FROM ${table} WHERE workspace_id = ?`).run(workspaceId);
+      }
+      return files;
+    });
+  }
+
   touchWorkspace(workspaceId) {
     this.db.prepare('UPDATE ws_workspaces SET updated_at = ? WHERE workspace_id = ?').run(now(), workspaceId);
   }

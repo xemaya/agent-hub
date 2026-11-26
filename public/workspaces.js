@@ -157,7 +157,9 @@ function skeleton(detail) {
         el('h1', {}, workspace.title),
         workspace.goal ? el('p', { class: 'ws-goal' }, workspace.goal) : null,
         el('div', { class: 'ws-meta', id: 'ws-meta' })),
-      active ? el('button', { class: 'button', type: 'button', onclick: () => closeWorkspace(workspace) }, '收工') : null),
+      active
+        ? el('button', { class: 'button', type: 'button', onclick: () => closeWorkspace(workspace) }, '收工')
+        : el('button', { class: 'button button-ghost', type: 'button', onclick: () => deleteWorkspace(workspace) }, '删除')),
     el('div', { class: 'ws-section-title' }, '团队'),
     el('div', { class: 'ws-team', id: 'ws-team' }),
     el('div', { class: 'ws-columns' },
@@ -230,6 +232,17 @@ async function closeWorkspace(workspace) {
   if (summary === null) return;
   try {
     await api(`/api/v1/workspaces/${encodeURIComponent(workspace.workspace_id)}/close`, { method: 'POST', body: { summary } });
+    await refresh();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function deleteWorkspace(workspace) {
+  if (!confirm(`删除「${workspace.title}」？群聊、记事本、文件都会删掉，不能恢复。队员的会话不受影响。`)) return;
+  try {
+    await api(`/api/v1/workspaces/${encodeURIComponent(workspace.workspace_id)}`, { method: 'DELETE' });
+    state.selected = null;
     await refresh();
   } catch (error) {
     alert(error.message);

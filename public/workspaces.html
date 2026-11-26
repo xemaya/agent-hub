@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Hub · 工作区</title>
+  <link rel="stylesheet" href="/style.css?v=15">
+  <style>
+    .ws-shell { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); min-height: calc(100vh - 68px); }
+    .ws-index { border-right: 1px solid var(--line); background: var(--paper-light); }
+    .ws-index h2 { margin: 0; padding: 22px 20px 12px; font: 11px var(--mono); letter-spacing: .16em; color: var(--muted); }
+    .ws-item { width: 100%; display: grid; gap: 6px; padding: 16px 20px; text-align: left; color: var(--ink); background: transparent; border: 0; border-top: 1px solid var(--line); border-left: 3px solid transparent; font: inherit; cursor: pointer; }
+    .ws-item:hover { background: var(--paper); }
+    .ws-item.selected { background: var(--paper); border-left-color: var(--signal); }
+    .ws-item.closed { color: var(--muted); }
+    .ws-item strong { font: 16px/1.4 var(--display); overflow-wrap: anywhere; }
+    .ws-item small { font: 10px var(--mono); color: var(--muted); }
+    .ws-empty { padding: 20px; color: var(--muted); line-height: 1.8; font-size: 13px; }
+    .ws-main { min-width: 0; padding: 28px clamp(18px, 3vw, 44px) 60px; }
+    .ws-head { display: flex; justify-content: space-between; gap: 20px; align-items: start; flex-wrap: wrap; }
+    .ws-eyebrow { color: var(--muted); font: 11px var(--mono); letter-spacing: .12em; }
+    .ws-head h1 { margin: 6px 0 8px; font: 30px/1.3 var(--display); overflow-wrap: anywhere; }
+    .ws-goal { margin: 0; max-width: 900px; line-height: 1.8; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .ws-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font: 11px var(--mono); }
+    .ws-section-title { margin: 30px 0 12px; font: 11px var(--mono); letter-spacing: .16em; color: var(--muted); }
+    .ws-team { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+    .ws-card { padding: 16px; border: 1px solid var(--line); background: var(--paper-light); display: grid; gap: 8px; min-width: 0; }
+    .ws-card.leader { border-color: var(--ink); }
+    .ws-card-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .ws-card-top strong { font: 700 16px var(--body); overflow-wrap: anywhere; }
+    .ws-runtime { font: 11px var(--mono); color: var(--blue); }
+    .ws-job { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+    .ws-machine { font: 11px var(--mono); color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    .ws-dot { width: 7px; height: 7px; background: #8c938d; display: inline-block; }
+    .ws-dot.on { background: var(--green); }
+    .ws-chip { display: inline-block; padding: 2px 7px; font: 700 11px var(--mono); border: 1px solid currentColor; }
+    .ws-chip.joined { color: var(--green); }
+    .ws-chip.requested, .ws-chip.launching, .ws-chip.launched { color: var(--amber); }
+    .ws-chip.failed { color: #ae2d1d; }
+    .ws-chip.left { color: var(--muted); }
+    .ws-detail { font-size: 12px; line-height: 1.6; color: var(--muted); overflow-wrap: anywhere; }
+    .ws-detail.bad { color: #ae2d1d; }
+    .ws-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); gap: 24px; }
+    .ws-feed { border: 1px solid var(--line); background: var(--paper-light); max-height: 620px; overflow: auto; }
+    .ws-msg { padding: 12px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 5px; }
+    .ws-msg:last-child { border-bottom: 0; }
+    .ws-msg-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
+    .ws-msg-head b { font-weight: 700; }
+    .ws-msg-head time { margin-left: auto; color: var(--muted); font: 10px var(--mono); }
+    .ws-tag { font: 700 10px var(--mono); padding: 1px 6px; background: var(--paper-deep); }
+    .ws-tag.handoff { background: var(--signal); color: var(--paper-light); }
+    .ws-tag.owner { background: var(--ink); color: var(--paper-light); }
+    .ws-tag.system { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+    .ws-tag.private { background: var(--blue); color: var(--paper-light); }
+    .ws-msg.system .ws-body { color: var(--muted); }
+    .ws-body { margin: 0; font: 13px/1.75 var(--body); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .ws-composer { display: grid; gap: 8px; margin-top: 10px; }
+    .ws-composer textarea { width: 100%; min-height: 72px; padding: 12px; border: 1px solid var(--ink); background: var(--paper-light); font: 14px/1.6 var(--body); resize: vertical; }
+    .ws-composer-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .ws-composer-row input { flex: 1; min-width: 160px; padding: 9px 10px; border: 1px solid var(--line); background: var(--paper-light); font: 12px var(--body); }
+    .ws-side { display: grid; gap: 6px; align-content: start; }
+    .ws-box { border: 1px solid var(--line); background: var(--paper-light); padding: 14px 16px; }
+    .ws-box pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.75 var(--body); }
+    .ws-note { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+    .ws-note:last-child { border-bottom: 0; }
+    .ws-note small, .ws-file small { color: var(--muted); font: 10px var(--mono); }
+    .ws-file { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .ws-file:last-child { border-bottom: 0; }
+    .ws-file button { flex-shrink: 0; }
+    .ws-muted { color: var(--muted); font-size: 12px; }
+    .ws-doors { display: flex; gap: 8px; flex-wrap: wrap; }
+    .ws-door { font: 11px var(--mono); padding: 4px 8px; border: 1px solid var(--line); background: var(--paper-light); }
+    .ws-door.off { color: var(--muted); border-style: dashed; }
+    .topbar a.button { color: var(--paper); border-color: #6b746d; text-decoration: none; display: inline-flex; align-items: center; }
+    @media (max-width: 900px) { .ws-shell, .ws-columns { grid-template-columns: 1fr; } .ws-index { border-right: 0; border-bottom: 1px solid var(--line); } }
+  </style>
+</head>
+<body>
+  <section id="auth-view" class="auth-shell" hidden>
+    <div class="auth-manifest">
+      <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <h1>AGENT<br>HUB</h1>
+    </div>
+    <form id="auth-form" class="auth-form">
+      <h2>工作区</h2>
+      <label for="admin-token">Admin Token</label>
+      <input id="admin-token" name="token" type="password" autocomplete="current-password" required autofocus>
+      <button class="button button-primary" type="submit">连接</button>
+      <p id="auth-error" class="form-error" role="alert"></p>
+      <p class="security-note">凭证仅保存在当前标签页的 sessionStorage，和中央工作台共用。</p>
+    </form>
+  </section>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark small" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <strong>AGENT HUB · 工作区</strong>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection" class="connection offline"><i></i>未连接</span>
+        <a class="button button-ghost" href="/">中央工作台</a>
+        <button id="logout" class="button button-ghost" type="button">断开</button>
+      </div>
+    </header>
+    <div class="ws-shell">
+      <aside class="ws-index" aria-label="工作区列表">
+        <h2>WORKSPACES</h2>
+        <div id="ws-list"></div>
+        <h2>门房</h2>
+        <div id="ws-doors" class="ws-doors" style="padding: 0 20px 20px"></div>
+      </aside>
+      <main id="ws-main" class="ws-main" aria-live="polite"></main>
+    </div>
+  </div>
+  <script type="module" src="/workspaces.js?v=1"></script>
+</body>
+</html>

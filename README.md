@@ -209,6 +209,10 @@ agent-hub message receipt MESSAGE_ID --data-dir "$HOME/.agent-hub/connector"
 旧版 `message send --prompt ... --wait`、`message wait COMMAND_ID` 仅兼容历史的命令请求/回复；新通信默认使用邮箱。任务命令原有 `desktop check/report`、`agent_hub_report` 仍按任务投递要求执行；邮件不调用它们。
 
 
+## 工作区：一组 agent 一起做一件事
+
+在任意一个 agent 里说「开工，要 2 个 cc、1 个反重力、1 个 codex」，它当队长，用 `agent-hub ws start` 开工作区；各机器的门房把会话拉起来，新会话凭报到单进来，在同一条群聊里交棒、共用简报、记事本和文件区。业主在中控的「工作区」页面（`/workspaces`）看全队状态。成员不是 Worker，和下面的任务、邮箱互不影响。用法、每台机器怎么开门房、收信机制见 [`docs/workspace.md`](docs/workspace.md)；给 agent 的用法装在 `agent-hub ws install-skill`。
+
 ## 任务与中央大脑
 
 只有**在线、未注销且交互 Channel 已接通**的 Worker 才能被 @、接收直接命令、担任中央大脑或参与自动编排。未接通员工的新命令保持 `waiting_manual`，不会转入后台执行。

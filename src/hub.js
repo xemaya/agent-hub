@@ -8,6 +8,7 @@ import { HubStore } from './db.js';
 import { Coordinator, resultPointer } from './coordinator.js';
 import { Watchdog, WATCHDOG_KIND } from './watchdog.js';
 import { Roles } from './roles.js';
+import { WorkspaceHub } from './workspace-hub.js';
 import { bearerToken, hashToken, tokensEqual } from './auth.js';
 import { loadHubCredentials } from './credentials.js';
 import { createId, createToken } from './ids.js';
@@ -21,6 +22,8 @@ const STATIC_FILES = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/markdown.js', ['markdown.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
+  ['/workspaces', ['workspaces.html', 'text/html; charset=utf-8']],
+  ['/workspaces.js', ['workspaces.js', 'text/javascript; charset=utf-8']],
 ]);
 const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked', 'needs_approval']);
 // Only a question can be answered by a message in the task's thread; an
@@ -169,6 +172,7 @@ export class Hub {
     presenceEventRetentionMs = 14 * 24 * 60 * 60 * 1000,
     shutdownGraceMs = 2000,
     mailRingIntervalMs = 15 * 60 * 1000,
+    workspace = {},
   }) {
     this.mailRingIntervalMs = mailRingIntervalMs;
     this.host = host;
@@ -219,6 +223,7 @@ export class Hub {
       alert: (payload) => this.receiveTrigger(null, payload),
       logger: this.logger,
     });
+    this.workspaces = new WorkspaceHub({ hub: this, store: this.store, dataDir: this.dataDir, logger: this.logger, ...workspace });
     this.server = createServer((request, response) => {
       this.handleRequest(request, response).catch((error) => {
         this.logger.error?.(error);
@@ -315,6 +320,7 @@ export class Hub {
 
   async closeResources() {
     this.closing = true;
+    this.workspaces.close();
     clearInterval(this.heartbeat);
     clearInterval(this.inactivityWatchdog);
     for (const waiters of this.workerMessageWaiters.values()) {
@@ -964,6 +970,7 @@ export class Hub {
       return;
     }
     this.requireAdmin(request);
+    if (pathname.startsWith('/api/v1/workspace') && await this.workspaces.handleAdmin(request, response, url)) return;
     // A bridge registers how the Hub verifies the platform's pushes for its app …
     const webhookRoute = /^\/api\/v1\/channel-webhooks\/feishu\/(cli_[A-Za-z0-9]+)$/.exec(pathname);
     if (request.method === 'PUT' && webhookRoute) {
@@ -1448,6 +1455,7 @@ export class Hub {
           this.emit('connector.online', { type: 'connector', id: connectorId }, { connector_id: connectorId });
           this.send(socket, 'connector.ready', { connector: this.store.getConnector(connectorId), hub: this.build, features: ['command_reconcile_v1'] });
           this.replay(connectorId);
+          this.workspaces.onConnectorOnline(connectorId);
           this.coordinator.resume().catch((error) => this.logger.error?.(error));
         }
         return;
@@ -1470,6 +1478,7 @@ export class Hub {
         this.connectors.delete(connectorId);
         this.connectorFeatures.delete(connectorId);
         this.store.setConnectorOnline(connectorId, false);
+        this.workspaces.onConnectorOffline(connectorId);
         this.emit('connector.offline', { type: 'connector', id: connectorId }, { connector_id: connectorId });
       }
     });
@@ -1623,6 +1632,10 @@ export class Hub {
   }
 
   async handleConnectorMessage(socket, connectorId, message) {
+    if (typeof message.type === 'string' && message.type.startsWith('workspace.')) {
+      await this.workspaces.handleConnectorMessage(socket, connectorId, message);
+      return;
+    }
     const payload = message.payload ?? {};
     if (message.type === 'mail.send') {
       const sender = this.workerSession(connectorId, payload);

@@ -10,6 +10,7 @@ import { connectorServiceStatus, installConnectorService, uninstallConnectorServ
 import { ChannelServer } from './channel.js';
 import { FeishuBridge, loadConfig } from './bridge-feishu.js';
 import { CodexQueueChannel, bridgeLock, checkNativeQueue, commandRecord, currentDesktopPid, startQueueBridge } from './codex-queue-channel.js';
+import { workspaceCommand } from './workspace-cli.js';
 
 const HELP = `Agent Hub
 
@@ -63,6 +64,7 @@ Usage:
   agent-hub coordinator enable|disable|status [--worker-id ID] [--max-steps N]
   agent-hub history clear --yes
   agent-hub list workers|connectors|tasks|commands|events
+  agent-hub ws …                                 Workspaces: a team of agents on one job (agent-hub ws help)
 
 Environment:
   AGENT_HUB_URL                 Admin API URL (default http://127.0.0.1:8787)
@@ -745,6 +747,11 @@ async function historyCommand(positionals, flags) {
 }
 
 export async function run(argv) {
+  // Workspaces parse their own arguments (repeatable --seat).
+  if (argv[0] === 'ws' || argv[0] === 'workspace') {
+    await workspaceCommand(argv.slice(1));
+    return;
+  }
   const { positionals, flags, passthrough } = parseArgs(argv);
   const command = positionals[0];
   if (!command || flags.help || command === 'help') {

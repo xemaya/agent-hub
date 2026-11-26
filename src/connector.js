@@ -6,6 +6,7 @@ import { ConnectorStore } from './connector-store.js';
 import { bearerToken, tokensEqual } from './auth.js';
 import { createId } from './ids.js';
 import { readJsonBody, sendJson } from './json.js';
+import { WorkspaceConnector } from './workspace-connector.js';
 import { readBuildInfo, shortCommit } from './build-info.js';
 import { commandPrompt } from './drivers/prompt.js';
 
@@ -117,6 +118,7 @@ export class Connector {
     this.channels = new Map();
     this.pendingChannels = new Set();
     this.channelKeepaliveMs = options.channelKeepaliveMs ?? 15000;
+    this.workspace = new WorkspaceConnector(this, options.workspace ?? {});
     this.localServer = createServer((request, response) => {
       this.handleLocalRequest(request, response).catch((error) => {
         sendJson(response, error.statusCode ?? 500, { error: error.message ?? 'Internal server error' });
@@ -213,7 +215,7 @@ export class Connector {
       this.send('connector.hello', {
         token: this.store.credentials.token,
         build: this.build,
-        features: ['worker_message_v1', 'mailbox_v1'],
+        features: ['worker_message_v1', 'mailbox_v1', 'workspace_v1'],
       });
     });
     socket.addEventListener('message', (event) => {
@@ -358,6 +360,10 @@ export class Connector {
       } else pending.resolve(message.payload);
       return;
     }
+    if (typeof message.type === 'string' && message.type.startsWith('workspace.')) {
+      await this.workspace.handleHubMessage(message);
+      return;
+    }
     if (message.type === 'connector.ready') {
       this.ready = true;
       this.reconnectAttempts = 0;
@@ -381,6 +387,7 @@ export class Connector {
       for (const worker of this.store.listWorkers()) {
         if (this.store.nextAcceptedCommand(worker.worker_id)) this.scheduleWorker(worker.worker_id);
       }
+      this.workspace.onReady().catch((error) => this.logger.error?.(error));
       return;
     }
     if (message.type === 'command.dispatch') {
@@ -896,6 +903,10 @@ export class Connector {
       return;
     }
     this.requireLocalAuth(request);
+    if (url.pathname.startsWith('/local/v1/workspaces')) {
+      await this.workspace.handleLocal(request, response, url);
+      return;
+    }
     if (url.pathname === '/local/v1/mail' && request.method === 'POST') {
       await this.whenReady();
       const body = await readJsonBody(request);
@@ -1111,6 +1122,7 @@ export class Connector {
     clearInterval(this.watchdogTimer);
     this.watchdogTimer = null;
     for (const channel of [...this.channels.values(), ...this.pendingChannels]) channel.response.end();
+    this.workspace.close();
     await this.store.failRunningCommands();
     if (this.ws) this.ws.close(1000, 'Connector shutting down');
     for (const { reject, timer } of this.pendingRequests.values()) {

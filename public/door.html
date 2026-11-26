@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Hub · 开门说明</title>
+  <link rel="stylesheet" href="/style.css?v=15">
+  <style>
+    .door-page { max-width: 860px; margin: 0 auto; padding: 36px 24px 80px; }
+    .door-page header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 26px; }
+    .door-page header a { font: 12px var(--mono); color: var(--muted); }
+    .door-ask { border: 1px solid var(--line); background: var(--paper-light); padding: 16px 18px; margin-bottom: 30px; }
+    .door-ask h2 { margin: 0 0 8px; font: 11px var(--mono); letter-spacing: .16em; color: var(--muted); }
+    .door-ask pre { margin: 0 0 10px; white-space: pre-wrap; font: 14px/1.8 var(--body); color: var(--ink); }
+    .door-ask .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .door-ask .hint { font-size: 12px; color: var(--muted); }
+    .door-page .markdown-body { font-size: 14px; }
+    .door-page .markdown-body h2 { font-size: 26px; }
+    .door-page .markdown-body pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main class="door-page">
+    <header>
+      <div class="brand">
+        <div class="brand-mark small" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <strong>AGENT HUB · 开门说明</strong>
+      </div>
+      <nav><a href="/workspaces">工作区 →</a></nav>
+    </header>
+    <section class="door-ask" aria-label="发给 agent 的话">
+      <h2>发给那台机器上的 AGENT</h2>
+      <pre id="door-ask">读 /door.md，按里面的步骤给这台机器开 Agent Hub 门房。要我动手的地方停下来告诉我。</pre>
+      <div class="row">
+        <button id="door-copy" class="button button-primary" type="button">复制这句话</button>
+        <span class="hint">给 agent 的原文：<a id="door-raw" href="/door.md">/door.md</a>（纯文本，curl 也能读）</span>
+      </div>
+    </section>
+    <article id="door-body"><p>正在读取 <a href="/door.md">/door.md</a>…</p></article>
+  </main>
+  <script type="module">
+    import { renderMarkdown } from '/markdown.js';
+    const raw = `${location.origin}/door.md`;
+    const ask = `读 ${raw} ，按里面的步骤给这台机器开 Agent Hub 门房。要我动手的地方停下来告诉我。`;
+    document.querySelector('#door-ask').textContent = ask;
+    document.querySelector('#door-raw').textContent = raw;
+    document.querySelector('#door-copy').addEventListener('click', async (event) => {
+      try {
+        await navigator.clipboard.writeText(ask);
+        event.target.textContent = '已复制';
+      } catch {
+        event.target.textContent = '复制不了，请手动选中';
+      }
+      setTimeout(() => { event.target.textContent = '复制这句话'; }, 2000);
+    });
+    const response = await fetch('/door.md', { cache: 'no-store' });
+    document.querySelector('#door-body').innerHTML = response.ok
+      ? renderMarkdown(await response.text())
+      : `<p>读不到 /door.md（HTTP ${response.status}）。</p>`;
+  </script>
+</body>
+</html>

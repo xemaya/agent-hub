@@ -18,6 +18,8 @@
 
 ## 2. 四台机器怎么接
 
+给 agent 读的分步说明在 Hub 网站的 `/door`（人看）和 `/door.md`（纯文本，给 agent），源文件是 `public/door.md`。业主把「读 <Hub>/door.md，按里面的步骤给这台机器开门房」发给那台机器上的 agent 即可。
+
 前提：每台机器已装 Agent Hub Connector（`~/.agent-hub/connector`），并且 Connector 跟 Hub 是同一个版本（Connector 会自动快进到 Hub 的提交）。然后每台机器各做一次：
 
 ```bash

@@ -24,6 +24,8 @@ const STATIC_FILES = new Map([
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/workspaces', ['workspaces.html', 'text/html; charset=utf-8']],
   ['/workspaces.js', ['workspaces.js', 'text/javascript; charset=utf-8']],
+  ['/door', ['door.html', 'text/html; charset=utf-8']],
+  ['/door.md', ['door.md', 'text/plain; charset=utf-8']],
 ]);
 const ATTENTION_OUTCOMES = new Set(['needs_input', 'blocked', 'needs_approval']);
 // Only a question can be answered by a message in the task's thread; an

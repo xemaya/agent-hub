@@ -48,6 +48,8 @@ description: 用 Agent Hub 工作区组队干一件事：业主说「开工，�
 
 ## 三、开门房（每台机器一次，业主让你开时才做）
 
+完整步骤（接 Hub、装 skill、按类型开门房、登记项目、回报）在 Hub 网站的 `/door.md`，按那一页做。下面是要点：
+
 - **Claude（终端版）**：在这台机器上 claude 确认过信任的目录里运行
   `agent-hub ws door enable claude`。它记下 claude 命令的位置和默认参数（跳过确认），以后队长要人时 Connector 用 `claude --bg` 起后台会话。门房只能在信任过的目录里起会话：项目登记的目录优先，没有就用开门房时所在的目录。
 - **Codex（桌面版）**：在一个常驻的 Codex 桌面对话里运行 `agent-hub ws door start --runtime codex`。之后这个对话会收到「开一个新对话，第一句话是……」的请求，照做：开一个独立的新对话（不是子 agent），把原文作为第一句话发出。开不了就按请求里最后一行回报。

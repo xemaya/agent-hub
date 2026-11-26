@@ -304,6 +304,17 @@ test('文件区、记事本、简报、业主插话和收工', async (t) => {
   const page = await fetch(`${ctx.hub.url}/workspaces`);
   assert.equal(page.status, 200);
   assert.match(await page.text(), /工作区/);
+  const doorPage = await fetch(`${ctx.hub.url}/door`);
+  assert.equal(doorPage.status, 200);
+  assert.match(await doorPage.text(), /\/door\.md/);
+  const doorText = await fetch(`${ctx.hub.url}/door.md`);
+  assert.equal(doorText.status, 200);
+  assert.match(doorText.headers.get('content-type'), /^text\/plain/);
+  const doorBody = await doorText.text();
+  assert.match(doorBody, /ws door enable claude/);
+  assert.match(doorBody, /ws door start --runtime codex/);
+  assert.match(doorBody, /ws door start --runtime antigravity --foreground/);
+  assert.doesNotMatch(doorBody, /ah_(admin|enroll|connector|local)_[A-Za-z0-9_-]{8,}/);
 
   await assert.rejects(ctx.rpc('ws.close', CC, {}), /只有队长/);
   const closed = await ctx.rpc('ws.close', LEADER, { summary: '入口改完' });

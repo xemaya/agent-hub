@@ -72,6 +72,11 @@ agent-hub ws install-skill
   claude --version && claude --help | grep -q -- '--bg' && echo 能起后台会话
   ```
    没打出「能起后台会话」，请业主先升级 Claude Code（运行 `claude update`）。
+   再查这台机器有没有手动确认过跳过确认。门房起会话时带 `--dangerously-skip-permissions`，没确认过的机器，`--bg` 会直接拒绝：
+  ```bash
+  python3 -c 'import json,os; p=os.path.expanduser("~/.claude/settings.json"); print("跳过确认：已确认过" if os.path.exists(p) and json.load(open(p)).get("skipDangerousModePermissionPrompt") else "跳过确认：还没确认过")'
+  ```
+   显示「还没确认过」时，请业主在这台机器的终端里运行一次 `claude --dangerously-skip-permissions`，在提示里点同意，然后退出。
 2. **选一个默认目录**：门房起的会话如果没有指定项目，就在这个目录里打开，一般用 `~/Workspace`。
    这个目录必须是 claude 确认过信任的。没确认过信任的目录，`claude --bg` 会直接拒绝，上一级目录信任过也不算。用下面这条命令查：
   ```bash
@@ -183,6 +188,7 @@ agent-hub ws door status
 | 看到什么 | 原因和办法 |
 |---|---|
 | `Workspace not trusted` | 目录没被 claude 确认过信任，按第 3A 步第 2 条处理 |
+| `bypassPermissions requires accepting the disclaimer` | 这台机器没手动确认过跳过确认，按第 3A 步第 1 条处理 |
 | 这台机器没装 Agent Hub Connector | 回到第 1 步 |
 | `Local authentication required` | 命令读错了本机令牌的位置。在命令后面加 `--data-dir ~/.agent-hub/connector` 再跑 |
 | `Current process is not running inside the Codex desktop App` | 命令要在 Codex 桌面版的对话里运行，不能在终端里跑 |

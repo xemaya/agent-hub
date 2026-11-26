@@ -571,7 +571,9 @@ export async function workspaceCommand(argv) {
       '座位：',
       ...result.members.map(memberLine),
       '',
-      '下一步：用 agent-hub ws brief "…" 写简报（目标、约束、谁做什么、怎么验收）；队员报到后会在工作区里说，用 agent-hub ws status 看进度。',
+      result.workspace.brief
+        ? '简报已发出，队员报到时就能看到。队员报到后会在工作区里说，用 agent-hub ws status 看进度。'
+        : '下一步：用 agent-hub ws brief "…" 写简报（目标、约束、谁做什么、怎么验收）；队员报到后会在工作区里说，用 agent-hub ws status 看进度。',
       result.wake.text,
     ].join('\n')));
     await afterJoin(flags, identity, result);

@@ -18,16 +18,17 @@ export const WORKSPACE_HELP = `agent-hub ws — 工作区：一组 agent 一起�
   agent-hub ws project set KEY [--remote URL] [--branch main] [--path DIR] [--title T] [--antigravity-project ID]
   agent-hub ws projects
   agent-hub ws start NAME --title 标题 --goal 目标 [--project KEY] [--brief 文字|--brief-file F]
-                  [--gather-minutes 3] --seat SEAT=RUNTIME[/MODEL][@机器][:分工] [--seat …]
-        例：--seat cc-1=claude@MacBook:写代码 --seat codex-1=codex@mac-mini:测试 --seat ag-1=antigravity/pro:review
-  agent-hub ws add --seat SPEC [--seat …]             加人
-  agent-hub ws relaunch SEAT                           重新拉起没报到或失败的座位
+                  [--gather-minutes 3] [--invite] --seat SEAT=RUNTIME[/MODEL][@机器][:分工] [--seat …]
+        例：--invite --seat cc-1=claude:写代码 --seat codex-1=codex:测试 --seat ag-1=antigravity:review
+        --invite：座位等业主开好会话来加入（默认做法）；不带它就由门房拉起新会话
+  agent-hub ws add [--invite] --seat SPEC [--seat …]  加人
+  agent-hub ws relaunch SEAT                           重新拉起没报到或失败的座位；等加入的座位改由门房拉起
   agent-hub ws brief "新简报" | --file F               改简报（不带参数是看）
   agent-hub ws close [--summary 总结]                  收工
 
 所有成员：
   agent-hub ws join TICKET                             报到（第一句话里给的报到单）
-  agent-hub ws join NAME [--seat 座位] [--job 分工]     业主让已有会话加入工作区 NAME（不用报到单，座位名默认按类型自动取）
+  agent-hub ws join NAME [--seat 座位] [--job 分工]     业主让已有会话加入工作区 NAME（不用报到单；先坐同类型的预留座位，没有就按类型新开一个）
   agent-hub ws status                                  队伍状态
   agent-hub ws say "话" [--to SEAT,SEAT]               群聊（--to 是私下说；话里 @座位 会优先叫醒对方）
   agent-hub ws handoff --to SEAT "交棒说明"            交棒给下一棒
@@ -51,7 +52,7 @@ export const WORKSPACE_HELP = `agent-hub ws — 工作区：一组 agent 一起�
 通用：--json 输出原始数据；--data-dir 指定 Connector 数据目录（默认 ~/.agent-hub/connector）
 `;
 
-const BOOLEAN = new Set(['json', 'peek', 'foreground', 'help', 'remove']);
+const BOOLEAN = new Set(['json', 'peek', 'foreground', 'help', 'remove', 'invite']);
 const REPEATABLE = new Set(['seat']);
 // These always take the next word, even when it starts with -- (claude flags).
 const TAKES_VALUE = new Set(['args']);
@@ -166,7 +167,7 @@ async function rpc(flags, op, args = {}, { identity = workspaceIdentity() } = {}
 
 // ---- formatting ----------------------------------------------------------------
 
-const STATE_TEXT = { requested: '等门房', launching: '拉起中', launched: '已拉起，等报到', joined: '已报到', failed: '失败', left: '已离开' };
+const STATE_TEXT = { invited: '等加入', requested: '等门房', launching: '拉起中', launched: '已拉起，等报到', joined: '已报到', failed: '失败', left: '已离开' };
 const WAKE_TEXT = { delivered: '已送到', resumed: '已叫醒', door: '交给门房', unreachable: '叫不醒', failed: '投递失败', sending: '投递中' };
 const time = (iso) => (iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '');
 const clip = (value, max) => {
@@ -246,6 +247,14 @@ function out(flags, value, printer) {
 async function readText(flags, key = 'file') {
   if (flags[key] && flags[key] !== true) return readFile(path.resolve(flags[key]), 'utf8');
   return null;
+}
+
+// What the owner says in each session they open, one line per seat still waiting.
+function inviteLines(workspace, members) {
+  const waiting = (members ?? []).filter((member) => member.state === 'invited');
+  if (!waiting.length) return [];
+  return ['', '这些座位等业主开好会话来加入。把下面的话转告业主，请业主在对应类型的会话里各说一句：',
+    ...waiting.map((member) => `  - ${member.seat}（${member.runtime}）：加入 Agent Hub 工作区 ${workspace.name}，座位 ${member.seat}`)];
 }
 
 function warningLines(warnings) {
@@ -664,6 +673,7 @@ export async function workspaceCommand(argv) {
       project: flags.project && flags.project !== true ? String(flags.project) : undefined,
       leader_seat: flags['leader-seat'] && flags['leader-seat'] !== true ? String(flags['leader-seat']) : undefined,
       ...(flags['gather-minutes'] !== undefined ? { gather_ms: Math.round(Number(flags['gather-minutes']) * 60000) } : {}),
+      ...(flags.invite ? { invite: true } : {}),
       seats,
     }, { identity });
     out(flags, result, () => console.log([
@@ -676,6 +686,7 @@ export async function workspaceCommand(argv) {
         ? '简报已发出，队员报到时就能看到。队员报到后会在工作区里说，用 agent-hub ws status 看进度。'
         : '下一步：用 agent-hub ws brief "…" 写简报（目标、约束、谁做什么、怎么验收）；队员报到后会在工作区里说，用 agent-hub ws status 看进度。',
       result.wake.text,
+      ...inviteLines(result.workspace, result.members),
       ...warningLines(result.warnings),
     ].join('\n')));
     await afterJoin(flags, identity, result);
@@ -683,8 +694,9 @@ export async function workspaceCommand(argv) {
   }
   if (command === 'add') {
     const seats = flags['seats-json'] ? JSON.parse(flags['seats-json']) : (flags.seat ?? []).map(parseSeatSpec);
-    const result = await rpc(flags, 'ws.add', { seats });
-    out(flags, result, () => console.log(['已加座位：', ...result.members.map(memberLine), ...warningLines(result.warnings)].join('\n')));
+    const result = await rpc(flags, 'ws.add', { seats, ...(flags.invite ? { invite: true } : {}) });
+    const workspace = flags.invite ? (await rpc(flags, 'ws.status')).workspace : null;
+    out(flags, result, () => console.log(['已加座位：', ...result.members.map(memberLine), ...(workspace ? inviteLines(workspace, result.members) : []), ...warningLines(result.warnings)].join('\n')));
     return;
   }
   if (command === 'relaunch') {

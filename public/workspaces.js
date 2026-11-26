@@ -6,7 +6,7 @@ const TOKEN_KEY = 'agent-hub-admin-token';
 const $ = (selector) => document.querySelector(selector);
 const state = { token: sessionStorage.getItem(TOKEN_KEY), selected: decodeURIComponent(location.hash.slice(1)) || null, socket: null, detail: null, list: [], doors: [], timer: null, pending: null };
 
-const STATE_TEXT = { requested: '等门房', launching: '拉起中', launched: '已拉起，等报到', joined: '已报到', failed: '失败', left: '已离开' };
+const STATE_TEXT = { invited: '等加入', requested: '等门房', launching: '拉起中', launched: '已拉起，等报到', joined: '已报到', failed: '失败', left: '已离开' };
 const WAKE_TEXT = { delivered: '门铃已送到', resumed: '已叫醒（重启后台会话）', door: '交给门房', unreachable: '叫不醒', failed: '投递失败', sending: '投递中' };
 const KIND_TEXT = { handoff: '交棒', owner: '业主', system: '系统', chat: '群聊' };
 const RUNTIME_TEXT = { claude: 'Claude', codex: 'Codex', antigravity: '反重力', kimi: 'Kimi', other: '其他' };
@@ -83,7 +83,7 @@ function renderList() {
   },
   el('strong', {}, workspace.title),
   el('small', {}, `${workspace.name} · ${workspace.status === 'active' ? '进行中' : '已收工'} · 队长 ${workspace.leader ?? '?'}`),
-  el('small', {}, `${workspace.joined}/${workspace.members} 已报到${workspace.launching ? ` · ${workspace.launching} 拉起中` : ''}${workspace.failed ? ` · ${workspace.failed} 失败` : ''} · ${ago(workspace.updated_at)}`))));
+  el('small', {}, `${workspace.joined}/${workspace.members} 已报到${workspace.invited ? ` · ${workspace.invited} 等加入` : ''}${workspace.launching ? ` · ${workspace.launching} 拉起中` : ''}${workspace.failed ? ` · ${workspace.failed} 失败` : ''} · ${ago(workspace.updated_at)}`))));
 }
 
 function renderDoors() {

@@ -150,7 +150,7 @@ agent-hub ws install-skill
 4. **Sidecar 弄不成时的临时办法**：在一个反重力对话的终端里运行 `agent-hub ws door start --runtime antigravity`，不带 `--foreground`，它会自己转到后台。反重力每次重启后都要再运行一次。用了临时办法，回报时要告诉业主。
 5. **门房平时做两件事**：
    - 队长要人时，开一个顶层对话。这个对话出现在侧栏，第一句话会自动发出去。
-   - 队员有新消息时，用 `agentapi send-message` 把消息送进他的对话。
+   - 队员有新消息时，用 `agentapi send-message` 把消息送进队员的对话。
 
    门房日志在 `~/.agent-hub/connector/workspace-bridges/`。
 

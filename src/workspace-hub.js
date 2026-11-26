@@ -330,13 +330,14 @@ export class WorkspaceHub {
 
   // ---- create / seats / launch ----------------------------------------------
 
-  parseSeat(workspace, spec) {
+  // An invited seat waits for a session the owner opens and sends in, so it needs no door.
+  parseSeat(workspace, spec, { invite = false } = {}) {
     if (!spec || typeof spec !== 'object') throw wsError('Each seat must be an object');
     const seat = text(spec.seat, 'seat', { max: 32 });
     if (!SEAT_PATTERN.test(seat)) throw wsError(`座位名 ${seat} 只能用字母、数字、横线和下划线`);
     const runtime = text(spec.runtime, 'runtime', { max: 40 }).toLowerCase();
     if (!RUNTIMES.has(runtime)) throw wsError(`不认识的 agent 类型 ${runtime}；可选 claude、codex、antigravity`);
-    const connectorId = this.resolveConnector(spec.machine ? String(spec.machine) : 'auto', runtime);
+    const connectorId = invite ? null : this.resolveConnector(spec.machine ? String(spec.machine) : 'auto', runtime);
     return {
       seat,
       runtime,
@@ -363,7 +364,8 @@ export class WorkspaceHub {
     const leaderSeat = args.leader_seat ? text(args.leader_seat, 'leader_seat', { max: 32 }) : 'leader';
     if (!SEAT_PATTERN.test(leaderSeat)) throw wsError(`座位名 ${leaderSeat} 只能用字母、数字、横线和下划线`);
     const draft = { name };
-    const parsed = seats.map((spec) => this.parseSeat(draft, spec));
+    const invite = args.invite === true;
+    const parsed = seats.map((spec) => this.parseSeat(draft, spec, { invite }));
     const seatNames = new Set([leaderSeat]);
     for (const seat of parsed) {
       if (seatNames.has(seat.seat)) throw wsError(`座位名 ${seat.seat} 重复了`);
@@ -390,7 +392,7 @@ export class WorkspaceHub {
         state: 'joined',
       });
       this.store.setLeader(workspace.workspace_id, leader.member_id);
-      const members = parsed.map((seat) => this.newSeat(workspace, seat));
+      const members = parsed.map((seat) => this.newSeat(workspace, seat, { invite }));
       return { workspace: this.store.getWorkspace(workspace.workspace_id), leader, members };
     });
     this.system(workspace, `队长 ${leader.seat}（${identity.runtime}@${this.connectorName(connectorId)}）开工：${workspace.title}`);
@@ -414,12 +416,12 @@ export class WorkspaceHub {
   directoryWarnings(workspace, members) {
     const project = workspace.project_key ? this.store.getProject(workspace.project_key) : null;
     if (!project) return [];
-    return members.filter((member) => !project.paths?.[member.connector_id]).map((member) =>
+    return members.filter((member) => member.connector_id && !project.paths?.[member.connector_id]).map((member) =>
       `${member.seat}（${member.runtime}@${this.connectorName(member.connector_id)}）：这台机器没登记项目 ${project.project_key} 的目录，`
       + `这次会先在门房默认的地方起来，报到后自己找到或 clone 仓库再登记；以后要一开始就在项目里，请那台机器上的 agent 在项目目录里运行一次 agent-hub ws project set ${project.project_key}。`);
   }
 
-  newSeat(workspace, seat) {
+  newSeat(workspace, seat, { invite = false } = {}) {
     return this.store.createMember({
       workspaceId: workspace.workspace_id,
       seat: seat.seat,
@@ -427,8 +429,9 @@ export class WorkspaceHub {
       runtime: seat.runtime,
       connectorId: seat.connectorId,
       model: seat.model,
-      state: 'requested',
-      launch: { requested_at: nowIso(), attempts: 0 },
+      state: invite ? 'invited' : 'requested',
+      stateDetail: invite ? '等业主开好会话来加入' : null,
+      launch: invite ? { door: 'self', invited_at: nowIso() } : { requested_at: nowIso(), attempts: 0 },
     });
   }
 
@@ -437,8 +440,9 @@ export class WorkspaceHub {
     const workspace = this.store.getWorkspace(member.workspace_id);
     const seats = Array.isArray(args.seats) ? args.seats : [];
     if (!seats.length) throw wsError('要加的座位是空的');
-    const parsed = seats.map((spec) => this.parseSeat(workspace, spec));
-    const created = this.store.transaction(() => parsed.map((seat) => this.newSeat(workspace, seat)));
+    const invite = args.invite === true;
+    const parsed = seats.map((spec) => this.parseSeat(workspace, spec, { invite }));
+    const created = this.store.transaction(() => parsed.map((seat) => this.newSeat(workspace, seat, { invite })));
     for (const item of created) this.launch(item.member_id);
     this.changed(workspace.workspace_id);
     return { members: created.map((item) => this.presentMember(this.store.getMember(item.member_id))), warnings: this.directoryWarnings(workspace, created) };
@@ -451,6 +455,8 @@ export class WorkspaceHub {
     if (!target) throw wsError(`没有座位 ${seat}`, 404);
     if (target.role === 'leader') throw wsError('队长不能被重新拉起');
     if (target.state === 'joined') throw wsError(`${seat} 已经报到了；要换人先让它 agent-hub ws leave`, 409);
+    // An invited seat nobody came for can still be handed to a door.
+    if (target.state === 'invited') this.store.updateMember(target.member_id, { connector_id: this.resolveConnector('auto', target.runtime) });
     this.store.updateMember(target.member_id, { state: 'requested', state_detail: null, session_id: null,
       launch: { ...target.launch, requested_at: nowIso() } });
     this.launch(target.member_id);
@@ -608,15 +614,28 @@ export class WorkspaceHub {
       const other = this.store.getWorkspace(current.workspace_id);
       throw wsError(`当前会话已经在工作区「${other.title}」里；一个会话同时只能在一个工作区`, 409, 'already_member');
     }
-    const seat = args.seat ? text(args.seat, 'seat', { max: 32 }) : this.nextSeat(workspace, identity.runtime);
-    if (!SEAT_PATTERN.test(seat)) throw wsError(`座位名 ${seat} 只能用字母、数字、横线和下划线`);
-    if (this.store.getMemberBySeat(workspace.workspace_id, seat)) throw wsError(`座位 ${seat} 已经有人了，换一个：--seat <名字>`, 409, 'seat_exists');
+    // A named seat, or else the first seat of this runtime still waiting for someone, is
+    // taken; otherwise a new seat is made.
+    const wanted = args.seat ? text(args.seat, 'seat', { max: 32 }) : null;
+    if (wanted && !SEAT_PATTERN.test(wanted)) throw wsError(`座位名 ${wanted} 只能用字母、数字、横线和下划线`);
+    const waiting = this.store.listMembers(workspace.workspace_id).filter((item) => item.state === 'invited');
+    const open = wanted ? waiting.find((item) => item.seat === wanted) : waiting.find((item) => item.runtime === identity.runtime);
+    if (wanted && !open && this.store.getMemberBySeat(workspace.workspace_id, wanted)) throw wsError(`座位 ${wanted} 已经有人了，换一个：--seat <名字>`, 409, 'seat_exists');
     const job = text(args.job, 'job', { max: 500, required: false });
-    const member = this.store.createMember({
-      workspaceId: workspace.workspace_id, seat, job, runtime: identity.runtime, connectorId,
-      sessionId: identity.session_id, state: 'joined', launch: { door: 'self' },
-    });
-    this.system(workspace, `${seat}（${identity.runtime}@${this.connectorName(connectorId)}）自己加入了，是业主让一个已有会话进来的，分工：${job || '听队长安排'}`,
+    let member;
+    if (open) {
+      member = this.store.updateMember(open.member_id, {
+        state: 'joined', state_detail: open.runtime === identity.runtime ? null : `原定 ${open.runtime}，来的是 ${identity.runtime}`,
+        runtime: identity.runtime, connector_id: connectorId, session_id: identity.session_id,
+        joined_at: nowIso(), last_active_at: nowIso(), ...(job ? { job } : {}),
+      });
+    } else {
+      member = this.store.createMember({
+        workspaceId: workspace.workspace_id, seat: wanted ?? this.nextSeat(workspace, identity.runtime), job, runtime: identity.runtime, connectorId,
+        sessionId: identity.session_id, state: 'joined', launch: { door: 'self' },
+      });
+    }
+    this.system(workspace, `${member.seat}（${identity.runtime}@${this.connectorName(connectorId)}）${open ? '加入了，坐进预留的座位' : '自己加入了，是业主让一个已有会话进来的'}，分工：${member.job || '听队长安排'}`,
       { urgentFor: [workspace.leader_member_id], actor: member });
     const latest = this.store.latestSeq(workspace.workspace_id);
     this.store.updateMember(member.member_id, { read_seq: latest, notified_seq: latest, wake_due_at: null });
@@ -1093,6 +1112,7 @@ export class WorkspaceHub {
       members: members.length,
       joined: count('joined'),
       launching: count('requested') + count('launching') + count('launched'),
+      invited: count('invited'),
       failed: count('failed'),
       latest_seq: this.store.latestSeq(workspace.workspace_id),
     };

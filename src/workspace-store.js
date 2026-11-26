@@ -457,7 +457,7 @@ export class WorkspaceStore {
       state: 'state', state_detail: 'state_detail', connector_id: 'connector_id', session_id: 'session_id',
       ticket_hash: 'ticket_hash', read_seq: 'read_seq', notes_read_seq: 'notes_read_seq', notified_seq: 'notified_seq',
       notified_at: 'notified_at', wake_due_at: 'wake_due_at', wake_status: 'wake_status', wake_detail: 'wake_detail',
-      listening: 'listening', last_active_at: 'last_active_at', joined_at: 'joined_at', job: 'job', model: 'model',
+      listening: 'listening', last_active_at: 'last_active_at', joined_at: 'joined_at', job: 'job', model: 'model', runtime: 'runtime',
     };
     const sets = [];
     const values = [];

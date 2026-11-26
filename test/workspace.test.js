@@ -555,3 +555,38 @@ test('业主删工作区：进行中的不能删，收工后连消息、记事�
   // The same sessions can start over.
   assert.ok((await ctx.rpc('ws.create', LEADER, { name: 'search-v2', seats: [] })).workspace);
 });
+
+test('预留座位（--invite）：不叫门房，业主开好的会话来了按类型坐进去；没人来的可以改由门房拉起', async (t) => {
+  const ctx = await context(t);
+  await ctx.enableClaudeDoor();
+  const created = await ctx.rpc('ws.create', LEADER, {
+    name: 'by-owner', invite: true, brief: '先读需求',
+    seats: [
+      { seat: 'cc-1', runtime: 'claude', job: '写代码' },
+      { seat: 'codex-1', runtime: 'codex', job: '测试' },
+      { seat: 'cc-2', runtime: 'claude', job: '备用' },
+    ],
+  });
+  const workspaceId = created.workspace.workspace_id;
+  assert.deepEqual(created.members.filter((member) => member.role !== 'leader').map((member) => member.state), ['invited', 'invited', 'invited']);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(ctx.claude.calls.filter((call) => call.args[0] === '--bg').length, 0, 'no door is asked for an invited seat');
+  assert.equal((await ctx.admin('/api/v1/workspaces')).payload.workspaces[0].invited, 3);
+
+  // The owner's Codex session says 「加入工作区 by-owner」: it takes the Codex seat and its job.
+  const CX = { runtime: 'codex', session_id: 'owner-opened-codex' };
+  const codex = await ctx.rpc('ws.join', CX, { workspace: 'by-owner' });
+  assert.equal(codex.me.seat, 'codex-1');
+  assert.equal(codex.me.job, '测试');
+  assert.match(codex.workspace.brief, /先读需求/);
+  // A named seat is taken as asked.
+  assert.equal((await ctx.rpc('ws.join', CC, { workspace: 'by-owner', seat: 'cc-2' })).me.seat, 'cc-2');
+  const history = await ctx.rpc('ws.history', LEADER);
+  assert.ok(history.messages.some((message) => /codex-1（codex@test-mac）加入了，坐进预留的座位/.test(message.body)));
+
+  // Nobody came for cc-1: the leader hands it to the door after all.
+  await ctx.rpc('ws.relaunch', LEADER, { seat: 'cc-1' });
+  await waitFor(() => ctx.claude.calls.find((call) => call.args[0] === '--bg' && call.args.includes('by-owner-cc-1')));
+  const seat = ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'cc-1');
+  assert.ok(['launching', 'launched'].includes(seat.state));
+});

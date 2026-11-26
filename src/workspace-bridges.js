@@ -160,10 +160,13 @@ export async function runCodexMemberBridge({ connectorUrl, token, sessionId, cwd
   }
 }
 
-export function codexDoorInstruction(event) {
+// The seat's project directory on this machine wins; otherwise the door's own directory,
+// so a new conversation never lands wherever the model happens to pick.
+export function codexDoorInstruction(event, { defaultCwd = null } = {}) {
+  const cwd = event.cwd || defaultCwd;
   return [
     'Agent Hub 门房请求：工作区要一个新的 Codex 队员。',
-    `请新开一个独立的 Codex 对话（出现在侧栏的新对话，不是子 agent，也不是当前这个对话），${event.cwd ? `工作目录 ${event.cwd}，` : ''}把下面分隔线之间的原文一字不改地作为新对话的第一句话发出去。`,
+    `请新开一个独立的 Codex 对话（出现在侧栏的新对话，不是子 agent，也不是当前这个对话），${cwd ? `工作目录 ${cwd}，` : ''}把下面分隔线之间的原文一字不改地作为新对话的第一句话发出去。`,
     '开好就行，不用等它，也不用回复这条消息。开不了的话，用 agent-hub ws door report 说明原因（见最后一行）。',
     '-----',
     event.prompt,
@@ -178,14 +181,14 @@ export async function runCodexDoor({ connectorUrl, token, sessionId, cwd, deskto
   const loop = new StreamLoop({ connectorUrl, token, logger, desktopPid });
   process.once('SIGTERM', () => loop.stop('signal'));
   process.once('SIGINT', () => loop.stop('signal'));
-  const query = new URLSearchParams({ runtime: 'codex', session_id: sessionId, pid: String(process.pid), detail: JSON.stringify({ door_thread: sessionId }) });
+  const query = new URLSearchParams({ runtime: 'codex', session_id: sessionId, pid: String(process.pid), detail: JSON.stringify({ door_thread: sessionId, default_cwd: cwd ?? null }) });
   logger.error?.(`codex door on thread ${sessionId} started`);
   try {
     await loop.run(`/local/v1/workspaces/door?${query}`, async (event) => {
       if (event.type !== 'launch') return;
-      const queued = await codexQueue({ executable, threadId: sessionId, message: codexDoorInstruction(event), cwd, run });
+      const queued = await codexQueue({ executable, threadId: sessionId, message: codexDoorInstruction(event, { defaultCwd: cwd }), cwd, run });
       await loop.result({ kind: 'launch', member_id: event.member_id, status: queued.ok ? 'queued' : 'failed',
-        error: queued.ok ? undefined : `门房对话没收到请求：${queued.detail}`, detail: { door_thread: sessionId } });
+        error: queued.ok ? undefined : `门房对话没收到请求：${queued.detail}`, detail: { door_thread: sessionId, cwd: event.cwd || cwd || null } });
     });
   } finally {
     await lock.release();
@@ -262,7 +265,8 @@ export async function runAntigravityDoor({ connectorUrl, token, lockFile, agenta
         const created = await antigravityCreate({ prompt: event.prompt, model: event.model, projectId: event.antigravity_project,
           title: `${event.workspace_name}/${event.seat}`, env, agentapi: executable, run });
         await loop.result({ kind: 'launch', member_id: event.member_id, status: created.ok ? 'launched' : 'failed',
-          error: created.ok ? undefined : created.detail, detail: created.ok ? { conversation_id: created.conversation_id, via: created.via } : {} });
+          error: created.ok ? undefined : created.detail,
+          detail: created.ok ? { conversation_id: created.conversation_id, via: created.via, project_id: event.antigravity_project ?? env.ANTIGRAVITY_PROJECT_ID ?? null } : {} });
       } else if (event.type === 'wake') {
         const sent = await antigravitySend({ conversationId: event.conversation_id, text: event.text, env, agentapi: executable, run });
         await loop.result({ kind: 'wake', wake_id: event.wake_id, member_id: event.member_id,

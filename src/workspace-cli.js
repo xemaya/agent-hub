@@ -1,4 +1,5 @@
-import { access, lstat, mkdir, readFile, readlink, stat, symlink, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { constants, createReadStream } from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -41,14 +42,15 @@ export const WORKSPACE_HELP = `agent-hub ws — 工作区：一组 agent 一起�
   agent-hub ws install-skill                            把工作区用法（skill）装给 Claude、Codex、反重力
   agent-hub ws door enable claude [--cwd 信任过的目录] [--executable PATH] [--args "--dangerously-skip-permissions"]
   agent-hub ws door disable claude
-  agent-hub ws door start --runtime codex             在常驻的 Codex 桌面对话里运行
+  agent-hub ws door start --runtime codex [--cwd DIR]   在常驻的 Codex 桌面对话里运行；没登记项目时新对话开在 DIR（默认当前目录）
   agent-hub ws door start --runtime antigravity [--foreground]   在反重力 Sidecar 或对话里运行
   agent-hub ws door status
+  agent-hub ws codex-allow [--remove]                  让 Codex 跑 agent-hub ws 命令不再每次请业主批准（写 ~/.codex/rules/agent-hub.rules）
 
 通用：--json 输出原始数据；--data-dir 指定 Connector 数据目录（默认 ~/.agent-hub/connector）
 `;
 
-const BOOLEAN = new Set(['json', 'peek', 'foreground', 'help']);
+const BOOLEAN = new Set(['json', 'peek', 'foreground', 'help', 'remove']);
 const REPEATABLE = new Set(['seat']);
 // These always take the next word, even when it starts with -- (claude flags).
 const TAKES_VALUE = new Set(['args']);
@@ -245,6 +247,103 @@ async function readText(flags, key = 'file') {
   return null;
 }
 
+function warningLines(warnings) {
+  return warnings?.length ? ['', '注意：', ...warnings.map((warning) => `  - ${warning}`)] : [];
+}
+
+// Where a seat lands when its project has no directory registered on that machine.
+function doorPlace(door) {
+  const detail = door.detail ?? {};
+  if (detail.default_cwd) return `，没登记项目时在 ${detail.default_cwd}`;
+  if (detail.project_id) return `，没登记项目时在反重力项目 ${detail.project_id}`;
+  return '';
+}
+
+// ---- Codex allow rule -------------------------------------------------------------
+
+export const CODEX_RULES_FILE = 'agent-hub.rules';
+
+// One prefix rule per spelling of the command. `decision = "allow"` makes Codex run a
+// matching command outside its sandbox without asking: only `agent-hub ws …`, nothing else.
+export function codexAllowRules({ absolute = null } = {}) {
+  const heads = ['agent-hub', ...(absolute && absolute !== 'agent-hub' ? [absolute] : [])];
+  return [
+    '# Agent Hub workspace: let Codex run `agent-hub ws ...` without an approval prompt.',
+    '# Written by `agent-hub ws codex-allow`; remove with `agent-hub ws codex-allow --remove`.',
+    ...heads.map((head) => [
+      'prefix_rule(',
+      `    pattern = [${JSON.stringify(head)}, "ws"],`,
+      '    decision = "allow",',
+      '    justification = "Agent Hub workspace commands talk to the local Connector (127.0.0.1:8788) and start inbox bridges; the owner approved them once for all.",',
+      ')',
+    ].join('\n')),
+    '',
+  ].join('\n');
+}
+
+function findDecision(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.decision === 'string') return value.decision;
+  for (const item of Array.isArray(value) ? value : Object.values(value)) {
+    const found = findDecision(item);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function codexAllowCommand(flags) {
+  const home = process.env.HOME ?? '.';
+  const directory = path.join(home, '.codex', 'rules');
+  const file = path.join(directory, CODEX_RULES_FILE);
+  if (flags.remove) {
+    await rm(file, { force: true });
+    out(flags, { removed: file }, () => console.log(`已删掉 ${file}。重启 Codex 后生效。`));
+    return;
+  }
+  const absolute = await whichExecutable('agent-hub');
+  await mkdir(directory, { recursive: true });
+  await writeFile(file, codexAllowRules({ absolute }), { mode: 0o644 });
+  const codex = flags.executable && flags.executable !== true ? String(flags.executable) : 'codex';
+  const probes = [
+    { argv: ['agent-hub', 'ws', 'inbox'], want: 'allow' },
+    ...(absolute && absolute !== 'agent-hub' ? [{ argv: [absolute, 'ws', 'inbox'], want: 'allow' }] : []),
+    { argv: ['agent-hub', 'worker', 'list'], want: null },
+  ];
+  const checked = [];
+  for (const probe of probes) {
+    const result = await runCommand(codex, ['execpolicy', 'check', '--rules', file, '--', ...probe.argv]);
+    if (result.missing) {
+      out(flags, { file, verified: false }, () => console.log([
+        `已写好 ${file}，但这里找不到 codex 命令，没法核对规则。`,
+        '重启 Codex 后，新对话跑 agent-hub ws 命令时如果还要批准，告诉业主。',
+      ].join('\n')));
+      return;
+    }
+    let decision = null;
+    try { decision = findDecision(JSON.parse(result.stdout)); } catch {}
+    if (result.code !== 0 || (probe.want && decision !== probe.want) || (!probe.want && decision === 'allow')) {
+      await rm(file, { force: true });
+      throw new Error(`规则核对没通过，已删掉 ${file}，没有改动 Codex：${probe.argv.join(' ')} → ${decision ?? '无匹配'}（退出码 ${result.code}）${(result.stderr || result.stdout).trim().slice(0, 400)}`);
+    }
+    checked.push(`${probe.argv.join(' ')} → ${decision ?? '不放行（照常批准）'}`);
+  }
+  out(flags, { file, verified: true, checked }, () => console.log([
+    `已写好 ${file}，核对通过：`,
+    ...checked.map((line) => `  - ${line}`),
+    '要重启 Codex 才生效（请业主退出 Codex 再打开）。重启后门房要在门房对话里再运行一次 agent-hub ws door start --runtime codex。',
+    '以后 Codex 里的 agent-hub ws 命令要单独一条跑：不接管道、重定向、&&，不加环境变量前缀，否则规则对不上，还会弹批准。',
+  ].join('\n')));
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 20000 }, (error, stdout, stderr) => {
+      if (error?.code === 'ENOENT') return resolve({ missing: true });
+      resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stdout: `${stdout}`, stderr: `${stderr}` });
+    });
+  });
+}
+
 // ---- Codex bridges ---------------------------------------------------------------
 
 async function startCodexBridge(flags, identity, { cwd = process.cwd() } = {}) {
@@ -303,7 +402,7 @@ async function doorCommand(positionals, flags) {
       const desktopPid = await currentDesktopPid();
       await checkNativeQueue(flags.executable ?? 'codex');
       const started = await spawnDetached({ dataDir: options.dataDir, name: `codex-door-${identity.session_id}`,
-        args: ['_door', '--runtime', 'codex', '--session-id', identity.session_id, '--cwd', process.cwd(), '--desktop-pid', String(desktopPid),
+        args: ['_door', '--runtime', 'codex', '--session-id', identity.session_id, '--cwd', path.resolve(flags.cwd && flags.cwd !== true ? String(flags.cwd) : process.cwd()), '--desktop-pid', String(desktopPid),
           ...(flags.executable ? ['--executable', flags.executable] : [])] });
       out(flags, started, () => console.log(`Codex 门房${started.status === 'already_running' ? '已在运行' : '已启动'}（PID ${started.pid}）。这个对话以后会收到「开新对话」的请求，按请求开新对话即可。日志：${started.log}`));
       return;
@@ -515,6 +614,7 @@ export async function workspaceCommand(argv) {
   }
   if (command.startsWith('_')) return internalCommand(command, flags);
   if (command === 'door') return doorCommand(rest, flags);
+  if (command === 'codex-allow') return codexAllowCommand(flags);
   if (command === 'install-skill') {
     const result = await installWorkspaceSkill();
     out(flags, result, () => console.log(result.links.map((link) => `${link.status === 'created' ? '已装' : link.status === 'unchanged' ? '已有' : '有同名文件，没覆盖'}：${link.path}`).join('\n')));
@@ -525,7 +625,7 @@ export async function workspaceCommand(argv) {
   if (command === 'doors') {
     const result = await rpc(flags, 'doors.list');
     out(flags, result, () => console.log(result.doors.length
-      ? ['能拉人的机器：', ...result.doors.map((door) => `  - ${door.machine}：${door.runtime}（${door.kind === 'connector' ? '命令起后台会话' : '门房桥'}）${door.online ? '在线' : '离线'}`)].join('\n')
+      ? ['能拉人的机器：', ...result.doors.map((door) => `  - ${door.machine}：${door.runtime}（${door.kind === 'connector' ? '命令起后台会话' : '门房桥'}）${door.online ? '在线' : '离线'}${doorPlace(door)}`)].join('\n')
       : '还没有任何机器开门房。'));
     return;
   }
@@ -575,6 +675,7 @@ export async function workspaceCommand(argv) {
         ? '简报已发出，队员报到时就能看到。队员报到后会在工作区里说，用 agent-hub ws status 看进度。'
         : '下一步：用 agent-hub ws brief "…" 写简报（目标、约束、谁做什么、怎么验收）；队员报到后会在工作区里说，用 agent-hub ws status 看进度。',
       result.wake.text,
+      ...warningLines(result.warnings),
     ].join('\n')));
     await afterJoin(flags, identity, result);
     return;
@@ -582,12 +683,12 @@ export async function workspaceCommand(argv) {
   if (command === 'add') {
     const seats = flags['seats-json'] ? JSON.parse(flags['seats-json']) : (flags.seat ?? []).map(parseSeatSpec);
     const result = await rpc(flags, 'ws.add', { seats });
-    out(flags, result, () => console.log(['已加座位：', ...result.members.map(memberLine)].join('\n')));
+    out(flags, result, () => console.log(['已加座位：', ...result.members.map(memberLine), ...warningLines(result.warnings)].join('\n')));
     return;
   }
   if (command === 'relaunch') {
     const result = await rpc(flags, 'ws.relaunch', { seat: rest[0] });
-    out(flags, result, () => console.log(`已重新拉起：\n${memberLine(result.member)}`));
+    out(flags, result, () => console.log([`已重新拉起：`, memberLine(result.member), ...warningLines(result.warnings)].join('\n')));
     return;
   }
   if (command === 'join') {

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { writeFile, readFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createTestContext, waitFor } from './helpers.js';
 import { readServerSentEvents } from '../src/channel.js';
 import { saveDoorConfig } from '../src/workspace-connector.js';
-import { parseSeatSpec, parseWorkspaceArgs, workspaceIdentity } from '../src/workspace-cli.js';
+import { codexAllowRules, parseSeatSpec, parseWorkspaceArgs, workspaceCommand, workspaceIdentity } from '../src/workspace-cli.js';
 import { antigravityCreate, codexDoorInstruction, codexQueued } from '../src/workspace-bridges.js';
 
 const LEADER = { runtime: 'claude', session_id: 'leader-session' };
@@ -270,6 +271,8 @@ test('文件区、记事本、简报、业主插话和收工', async (t) => {
   assert.equal(upload.status, 201);
   const { file } = await upload.json();
   assert.equal(file.size, content.length);
+  // Your own upload is not news to you.
+  assert.ok(!(await ctx.rpc('ws.inbox', CC)).messages.some((message) => /上传了文件/.test(message.body)));
   const download = await fetch(`${ctx.connector.localUrl}/local/v1/workspaces/files/${file.file_id}?${new URLSearchParams({ runtime: LEADER.runtime, session_id: LEADER.session_id })}`, {
     headers: { authorization: `Bearer ${ctx.connector.store.credentials.localToken}` },
   });
@@ -286,6 +289,7 @@ test('文件区、记事本、简报、业主插话和收工', async (t) => {
   const inbox = await ctx.rpc('ws.inbox', LEADER);
   assert.ok(inbox.notes.some((note) => note.body === '入口改两段式'));
   assert.ok(inbox.messages.some((message) => /上传了文件 design.png/.test(message.body)));
+  assert.ok(!inbox.messages.some((message) => /队长更新了简报/.test(message.body)), 'the leader is not told about its own brief');
 
   // The owner speaks from the dashboard; the leader is rung at once.
   const leaderWait = await ctx.listen(LEADER);
@@ -363,6 +367,9 @@ test('Codex 门房请求原文和反重力开对话', async () => {
   const instruction = codexDoorInstruction({ member_id: 'wsm_1', cwd: '/repo', prompt: 'agent-hub ws join wst_x' });
   assert.match(instruction, /独立的 Codex 对话/);
   assert.match(instruction, /-----\nagent-hub ws join wst_x\n-----/);
+  assert.match(instruction, /工作目录 \/repo/);
+  assert.match(codexDoorInstruction({ member_id: 'wsm_1', cwd: null, prompt: 'p' }, { defaultCwd: '/door-dir' }), /工作目录 \/door-dir/);
+  assert.doesNotMatch(codexDoorInstruction({ member_id: 'wsm_1', cwd: null, prompt: 'p' }), /工作目录/);
 
   const requests = [];
   const created = await antigravityCreate({
@@ -439,4 +446,56 @@ test('Connector 查到重新拉起后的新会话编号就直接告诉 Hub', asy
   await ctx.rpc('ws.say', LEADER, { kind: 'handoff', to: ['cc-1'], text: '新编号' });
   await waitFor(() => ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'cc-1').session_id === 'abcd1234-new');
   assert.equal(ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'cc-1').wake_status, 'resumed');
+});
+
+test('要改代码的工作区：座位所在机器没登记项目目录，开工就提醒队长，报到说明教队员自己找到并登记', async (t) => {
+  const ctx = await context(t);
+  await ctx.enableClaudeDoor();
+  await ctx.rpc('project.set', null, { key: 'youxian', git_remote: 'https://github.com/keman-ai/youxian.git', default_branch: 'master' });
+  const created = await ctx.rpc('ws.create', LEADER, {
+    name: 'fix-1', project: 'youxian', seats: [{ seat: 'cc-1', runtime: 'claude', machine: 'test-mac', job: '写代码' }],
+  });
+  assert.equal(created.warnings.length, 1);
+  assert.match(created.warnings[0], /cc-1.*没登记项目 youxian 的目录.*agent-hub ws project set youxian/);
+  const launch = await waitFor(() => ctx.claude.calls.find((call) => call.args[0] === '--bg' && call.args.includes('fix-1-cc-1')));
+  const ticket = /agent-hub ws join (wst_\S+)/.exec(launch.args.at(-1))[1];
+  const briefing = await ctx.rpc('ws.join', CC, { ticket });
+  assert.match(briefing.rules, /这台机器还没登记项目目录.*git clone 到 ~\/Workspace\/youxian.*agent-hub ws project set youxian/);
+
+  // Registered on that machine: no warning, and the member is told where it is.
+  await ctx.rpc('project.set', null, { key: 'youxian', path: ctx.root });
+  const closed = await ctx.rpc('ws.close', LEADER, {});
+  assert.ok(closed.workspace);
+  const again = await ctx.rpc('ws.create', LEADER, {
+    name: 'fix-2', project: 'youxian', seats: [{ seat: 'cc-2', runtime: 'claude', machine: 'test-mac' }],
+  });
+  assert.deepEqual(again.warnings, []);
+  const second = await waitFor(() => ctx.claude.calls.find((call) => call.args[0] === '--bg' && call.args.includes('fix-2-cc-2')));
+  assert.equal(second.options.cwd, ctx.root);
+});
+
+test('codex-allow 只放行 agent-hub ws，用 codex execpolicy 核对，核对不过就删掉规则文件', async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'ah-codex-'));
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(async () => { process.env.HOME = savedHome; await rm(home, { recursive: true, force: true }); });
+  const fake = async (allowWs) => {
+    const file = path.join(home, `codex-${allowWs ? 'ok' : 'bad'}`);
+    await writeFile(file, `#!/bin/sh\ncase "$*" in\n  *"agent-hub ws "*) echo '{"decision":"${allowWs ? 'allow' : 'prompt'}","matchedRules":[]}' ;;\n  *) echo '{"matchedRules":[]}' ;;\nesac\n`);
+    await chmod(file, 0o755);
+    return file;
+  };
+  const rules = codexAllowRules({ absolute: '/opt/x/agent-hub' });
+  assert.match(rules, /pattern = \["agent-hub", "ws"\],\n    decision = "allow"/);
+  assert.match(rules, /pattern = \["\/opt\/x\/agent-hub", "ws"\]/);
+  assert.doesNotMatch(rules, /pattern = \["agent-hub"\]/, 'never the whole agent-hub command');
+
+  const target = path.join(home, '.codex', 'rules', 'agent-hub.rules');
+  await workspaceCommand(['codex-allow', '--executable', await fake(true)]);
+  assert.match(await readFile(target, 'utf8'), /prefix_rule\(/);
+  await assert.rejects(workspaceCommand(['codex-allow', '--executable', await fake(false)]), /核对没通过，已删掉/);
+  await assert.rejects(stat(target), { code: 'ENOENT' });
+  await workspaceCommand(['codex-allow', '--executable', await fake(true)]);
+  await workspaceCommand(['codex-allow', '--remove']);
+  await assert.rejects(stat(target), { code: 'ENOENT' });
 });

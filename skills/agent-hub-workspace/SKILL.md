@@ -12,7 +12,10 @@ description: Agent Hub 工作区。三种情况用它：① 业主让你开一�
 **命令和身份**
 - 所有命令都是本机的 `agent-hub ws …`，经本机 Connector 连到 Hub。`agent-hub ws help` 里有全部用法。
 - 会话身份会自动读取，不要自己编会话编号。
-- 在 Codex 里，每条 agent-hub 命令都要连本机 Connector，用 Codex 自带的单次提升权限执行，不要 sudo。
+- **在 Codex 里**：agent-hub 命令要连本机 Connector，在沙箱外跑。
+  - 这台机器运行过 `agent-hub ws codex-allow`，`agent-hub ws` 开头的命令就不用再批准。
+  - 前提是单独一条跑：不接管道、不加重定向、不用 `&&` 连别的命令、不加环境变量前缀，路径写绝对路径、不用 `~`。
+  - 还要批准的话，用 Codex 自带的单次提升权限，不要 sudo。
 
 **命令跑不通时**
 - 找不到命令：换成 `~/.local/bin/agent-hub`。
@@ -35,7 +38,10 @@ agent-hub ws projects   # 要改代码的项目登记了没有
 ```
 
 - **这台机器没接 Hub**：输出「这台机器没装 Agent Hub Connector」，或者连不上 `127.0.0.1:8788`。告诉业主先按开门说明（`http://100.127.219.38:8787/door`）给这台机器接上 Hub。
-- **要改代码的项目没登记**：在本机项目目录里运行 `agent-hub ws project set <名字> --remote <git 地址> --branch <主干>`。别的机器上的目录，由那台机器上的 agent 各自登记。
+- **要改代码**：开工一定带 `--project <名字>`。
+  - 项目没登记过：在本机项目目录里运行 `agent-hub ws project set <名字> --remote <git 地址> --branch <主干>`。
+  - 别的机器上的目录，由那台机器上的 agent 各自登记。
+  - 开工输出的「注意」里如果说某个座位的机器没登记目录，这个座位这次会先在门房的默认目录起来，报到后自己找仓库再登记。转告业主：请那台机器上的 agent 在项目目录里登记一次，以后开工就直接在项目里。
 
 ### 2. 定队伍
 

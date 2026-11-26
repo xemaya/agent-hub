@@ -404,7 +404,19 @@ export class WorkspaceHub {
       me: this.presentMember(this.store.getMember(leader.member_id)),
       members: this.store.listMembers(workspace.workspace_id).map((member) => this.presentMember(member)),
       wake: this.wakeAdvice(leader),
+      warnings: this.directoryWarnings(workspace, members),
     };
+  }
+
+  // A code workspace needs the project checked out on every seat's machine. Without a
+  // registered directory a seat still launches (in its door's default place) and its
+  // briefing says how to find and register the checkout, but the leader hears it now.
+  directoryWarnings(workspace, members) {
+    const project = workspace.project_key ? this.store.getProject(workspace.project_key) : null;
+    if (!project) return [];
+    return members.filter((member) => !project.paths?.[member.connector_id]).map((member) =>
+      `${member.seat}（${member.runtime}@${this.connectorName(member.connector_id)}）：这台机器没登记项目 ${project.project_key} 的目录，`
+      + `这次会先在门房默认的地方起来，报到后自己找到或 clone 仓库再登记；以后要一开始就在项目里，请那台机器上的 agent 在项目目录里运行一次 agent-hub ws project set ${project.project_key}。`);
   }
 
   newSeat(workspace, seat) {
@@ -429,7 +441,7 @@ export class WorkspaceHub {
     const created = this.store.transaction(() => parsed.map((seat) => this.newSeat(workspace, seat)));
     for (const item of created) this.launch(item.member_id);
     this.changed(workspace.workspace_id);
-    return { members: created.map((item) => this.presentMember(this.store.getMember(item.member_id))) };
+    return { members: created.map((item) => this.presentMember(this.store.getMember(item.member_id))), warnings: this.directoryWarnings(workspace, created) };
   }
 
   relaunch(member, args) {
@@ -442,7 +454,8 @@ export class WorkspaceHub {
     this.store.updateMember(target.member_id, { state: 'requested', state_detail: null, session_id: null,
       launch: { ...target.launch, requested_at: nowIso() } });
     this.launch(target.member_id);
-    return { member: this.presentMember(this.store.getMember(target.member_id)) };
+    return { member: this.presentMember(this.store.getMember(target.member_id)),
+      warnings: this.directoryWarnings(this.store.getWorkspace(member.workspace_id), [target]) };
   }
 
   prompt(workspace, member, ticket) {
@@ -558,7 +571,7 @@ export class WorkspaceHub {
     if (member.state === 'joined') {
       // Same seat, new native session (a resumed background session): rebind, keep read position.
       const reattached = this.store.updateMember(member.member_id, { session_id: identity.session_id, connector_id: connectorId, ticket_hash: null, last_active_at: nowIso() });
-      if (reattached.session_id !== member.session_id) this.system(workspace, `${member.seat} 的会话重启了，已重新接上`);
+      if (reattached.session_id !== member.session_id) this.system(workspace, `${member.seat} 的会话重启了，已重新接上`, { actor: reattached });
       this.changed(workspace.workspace_id);
       return this.briefing(this.store.getMember(member.member_id), { rejoined: true });
     }
@@ -607,6 +620,9 @@ export class WorkspaceHub {
     ];
     if (project) {
       lines.push(`代码：项目 ${project.project_key}${project.git_remote ? `（${project.git_remote}）` : ''}，工作区分支 ${workspace.branch}。`);
+      const here = project.paths?.[member.connector_id];
+      if (here) lines.push(`  - 这台机器上的项目目录：${here}。`);
+      else lines.push(`  - 这台机器还没登记项目目录。先在 ~/Workspace 等常用目录里找 ${project.git_remote ?? project.project_key} 的检出；没有就 git clone 到 ~/Workspace/${project.project_key}。找到或 clone 好以后，在那个目录里运行 agent-hub ws project set ${project.project_key} 登记，再开 worktree。`);
       lines.push(`  - 在项目目录旁边开自己的 worktree（游离 HEAD，不起分支名），例如 git -C <项目目录> worktree add --detach ../.wt/${workspace.name}-${member.seat} origin/${project.default_branch ?? 'main'}。`);
       lines.push(`  - 写代码的人把提交推到 ${workspace.branch}：git push origin HEAD:refs/heads/${workspace.branch}；被拒就 fetch + rebase 再推，不加 --force。`);
       lines.push(`  - 测试、review 的人：git fetch origin ${workspace.branch}，在自己的 worktree 里检出同一个提交。`);
@@ -685,8 +701,10 @@ export class WorkspaceHub {
     return message;
   }
 
-  system(workspace, body, { urgentFor = [] } = {}) {
-    return this.post(workspace, { senderLabel: '系统', kind: 'system', body: clip(body, 2000), urgentFor });
+  // `actor` is the member whose own action caused the notice (an upload, a brief, a
+  // rejoin): it is recorded as the sender, so it never rings that member's doorbell.
+  system(workspace, body, { urgentFor = [], actor = null } = {}) {
+    return this.post(workspace, { sender: actor, senderLabel: '系统', kind: 'system', body: clip(body, 2000), urgentFor });
   }
 
   say(member, args) {
@@ -766,7 +784,7 @@ export class WorkspaceHub {
     if (args.text === undefined) return { brief: workspace.brief, brief_version: workspace.brief_version, goal: workspace.goal };
     this.requireLeader(member);
     const updated = this.store.setBrief(workspace.workspace_id, text(args.text, 'text'));
-    this.system(updated, `队长更新了简报（第 ${updated.brief_version} 版），用 agent-hub ws brief 看全文：\n${clip(updated.brief, 600)}`);
+    this.system(updated, `队长更新了简报（第 ${updated.brief_version} 版），用 agent-hub ws brief 看全文：\n${clip(updated.brief, 600)}`, { actor: member });
     return { brief: updated.brief, brief_version: updated.brief_version };
   }
 
@@ -796,7 +814,7 @@ export class WorkspaceHub {
     const workspace = this.store.getWorkspace(member.workspace_id);
     if (member.role === 'leader') throw wsError('队长不能离开；收工用 agent-hub ws close', 409);
     this.store.updateMember(member.member_id, { state: 'left', state_detail: '自己离开了', listening: false, wake_due_at: null });
-    this.system(workspace, `${member.seat} 离开了工作区`, { urgentFor: [workspace.leader_member_id] });
+    this.system(workspace, `${member.seat} 离开了工作区`, { urgentFor: [workspace.leader_member_id], actor: member });
     return { left: true };
   }
 
@@ -989,7 +1007,7 @@ export class WorkspaceHub {
     const file = this.store.completeFile(fileId, { size: upload.size, sha256: upload.hash.digest('hex') });
     const member = this.store.getMember(upload.memberId);
     const workspace = this.store.getWorkspace(file.workspace_id);
-    this.system(workspace, `${this.label(member)} 上传了文件 ${file.name}（${file.size} 字节，编号 ${file.file_id}）${file.note ? `：${clip(file.note, 300)}` : ''}`);
+    this.system(workspace, `${this.label(member)} 上传了文件 ${file.name}（${file.size} 字节，编号 ${file.file_id}）${file.note ? `：${clip(file.note, 300)}` : ''}`, { actor: member });
     return { file };
   }
 

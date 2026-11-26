@@ -115,7 +115,7 @@ function memberCard(member) {
       el('strong', {}, member.seat, member.role === 'leader' ? '（队长）' : ''),
       el('span', { class: `ws-chip ${member.state}` }, STATE_TEXT[member.state] ?? member.state)),
     el('div', { class: 'ws-runtime' }, `${RUNTIME_TEXT[member.runtime] ?? member.runtime}${member.model ? ` / ${member.model}` : ''}`),
-    el('div', { class: 'ws-machine' }, el('i', { class: `ws-dot${member.machine_online ? ' on' : ''}` }), member.machine ?? '未知机器'),
+    el('div', { class: 'ws-machine' }, el('i', { class: `ws-dot${member.machine_online ? ' on' : ''}` }), member.machine ?? (member.state === 'invited' ? '哪台机器都行' : '未知机器')),
     member.job ? el('div', { class: 'ws-job' }, member.job) : null,
     facts.length ? el('div', { class: 'ws-detail' }, facts.join(' · ')) : null,
     problems.length ? el('div', { class: 'ws-detail bad' }, problems.join('；')) : null);

@@ -883,6 +883,7 @@ export class WorkspaceHub {
       members: this.store.listMembers(workspace.workspace_id).map((item) => this.presentMember(item)),
       files: this.store.listFiles(workspace.workspace_id).length,
       notes: this.store.listNotes(workspace.workspace_id).length,
+      messages: this.store.countMessages(workspace.workspace_id),
       latest_seq: this.store.latestSeq(workspace.workspace_id),
     };
   }

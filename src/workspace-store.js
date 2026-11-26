@@ -395,6 +395,10 @@ export class WorkspaceStore {
     });
   }
 
+  countMessages(workspaceId) {
+    return this.db.prepare('SELECT COUNT(*) AS n FROM ws_messages WHERE workspace_id = ?').get(workspaceId).n;
+  }
+
   touchWorkspace(workspaceId) {
     this.db.prepare('UPDATE ws_workspaces SET updated_at = ? WHERE workspace_id = ?').run(now(), workspaceId);
   }

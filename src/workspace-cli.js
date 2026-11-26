@@ -176,7 +176,7 @@ const clip = (value, max) => {
 };
 
 function memberLine(member) {
-  const where = `${member.runtime}${member.model ? `/${member.model}` : ''}@${member.machine ?? '?'}`;
+  const where = `${member.runtime}${member.model ? `/${member.model}` : ''}${member.machine ? `@${member.machine}` : member.state === 'invited' ? '（哪台机器都行）' : '@?'}`;
   const bits = [STATE_TEXT[member.state] ?? member.state];
   if (member.state_detail) bits.push(member.state_detail);
   if (member.state === 'joined') {
@@ -222,7 +222,7 @@ function printStatus(result) {
     workspace.goal ? `目标：${workspace.goal}` : null,
     `队伍（${members.length} 个座位）：`,
     ...members.map(memberLine),
-    `记事本 ${result.notes} 条，文件 ${result.files} 个，消息 ${result.latest_seq} 条`,
+    `记事本 ${result.notes} 条，文件 ${result.files} 个，消息 ${result.messages ?? result.latest_seq} 条`,
   ].filter(Boolean).join('\n'));
 }
 

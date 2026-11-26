@@ -841,7 +841,12 @@ export class WorkspaceHub {
     if (args.text === undefined) return { brief: workspace.brief, brief_version: workspace.brief_version, goal: workspace.goal };
     this.requireLeader(member);
     const updated = this.store.setBrief(workspace.workspace_id, text(args.text, 'text'));
-    this.system(updated, `队长更新了简报（第 ${updated.brief_version} 版），用 agent-hub ws brief 看全文：\n${clip(updated.brief, 600)}`, { actor: member });
+    // The leader opens first and writes the brief while people join, so whoever is
+    // already in hears it now rather than after the gather window.
+    const joined = this.store.listMembers(workspace.workspace_id)
+      .filter((item) => item.state === 'joined' && item.member_id !== member.member_id)
+      .map((item) => item.member_id);
+    this.system(updated, `队长更新了简报（第 ${updated.brief_version} 版），用 agent-hub ws brief 看全文：\n${clip(updated.brief, 600)}`, { actor: member, urgentFor: joined });
     return { brief: updated.brief, brief_version: updated.brief_version };
   }
 

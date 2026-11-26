@@ -249,12 +249,19 @@ async function readText(flags, key = 'file') {
   return null;
 }
 
-// What the owner says in each session they open, one line per seat still waiting.
-function inviteLines(workspace, members) {
-  const waiting = (members ?? []).filter((member) => member.state === 'invited');
-  if (!waiting.length) return [];
-  return ['', '这些座位等业主开好会话来加入。把下面的话转告业主，请业主在对应类型的会话里各说一句：',
-    ...waiting.map((member) => `  - ${member.seat}（${member.runtime}）：加入 Agent Hub 工作区 ${workspace.name}，座位 ${member.seat}`)];
+// What the owner says in each session they open: one line per seat still waiting, and
+// the plain line any session can use (a seat is made for it by type).
+export function inviteLines(workspace, members) {
+  const seats = (members ?? []).filter((member) => member.role !== 'leader');
+  const waiting = seats.filter((member) => member.state === 'invited');
+  const plain = `加入 Agent Hub 工作区 ${workspace.name}`;
+  if (waiting.length) {
+    return ['', '这些座位等业主开好会话来加入。把下面的话转告业主，请业主在对应类型的会话里各说一句：',
+      ...waiting.map((member) => `  - ${member.seat}（${member.runtime}）：${plain}，座位 ${member.seat}`),
+      `别的会话想加入，说「${plain}」就行，按类型自动分座位。`];
+  }
+  if (seats.length) return [];
+  return ['', `没留座位，谁来由业主定。把这句话转告业主：在要加入的会话里说「${plain}」（cc、codex、反重力都行，座位按类型自动分）。`];
 }
 
 function warningLines(warnings) {
@@ -684,7 +691,7 @@ export async function workspaceCommand(argv) {
       '',
       result.workspace.brief
         ? '简报已发出，队员报到时就能看到。队员报到后会在工作区里说，用 agent-hub ws status 看进度。'
-        : '下一步：用 agent-hub ws brief "…" 写简报（目标、约束、谁做什么、怎么验收）；队员报到后会在工作区里说，用 agent-hub ws status 看进度。',
+        : '下一步：先把下面加入的话告诉业主，再用 agent-hub ws brief --file 简报.md 写简报（目标、约束、谁做什么、怎么验收），已经加入的人会马上收到。用 agent-hub ws status 看进度。',
       result.wake.text,
       ...inviteLines(result.workspace, result.members),
       ...warningLines(result.warnings),
@@ -755,7 +762,7 @@ export async function workspaceCommand(argv) {
     const result = await rpc(flags, 'ws.brief', body === undefined ? {} : { text: body });
     out(flags, result, () => console.log(body === undefined
       ? `${result.goal ? `目标：${result.goal}\n` : ''}简报（第 ${result.brief_version} 版）：\n${result.brief || '（还没写）'}`
-      : `简报已更新到第 ${result.brief_version} 版，队员下次收信时会看到。`));
+      : `简报已更新到第 ${result.brief_version} 版，已加入的队员马上会收到，之后加入的报到时就能看到。`));
     return;
   }
   if (command === 'close') {

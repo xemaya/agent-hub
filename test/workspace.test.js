@@ -6,7 +6,7 @@ import test from 'node:test';
 import { createTestContext, waitFor } from './helpers.js';
 import { readServerSentEvents } from '../src/channel.js';
 import { saveDoorConfig } from '../src/workspace-connector.js';
-import { codexAllowRules, parseSeatSpec, parseWorkspaceArgs, workspaceCommand, workspaceIdentity } from '../src/workspace-cli.js';
+import { codexAllowRules, inviteLines, parseSeatSpec, parseWorkspaceArgs, workspaceCommand, workspaceIdentity } from '../src/workspace-cli.js';
 import { antigravityCreate, codexDoorInstruction, codexQueued } from '../src/workspace-bridges.js';
 
 const LEADER = { runtime: 'claude', session_id: 'leader-session' };
@@ -589,4 +589,34 @@ test('预留座位（--invite）：不叫门房，业主开好的会话来了按
   await waitFor(() => ctx.claude.calls.find((call) => call.args[0] === '--bg' && call.args.includes('by-owner-cc-1')));
   const seat = ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'cc-1');
   assert.ok(['launching', 'launched'].includes(seat.state));
+});
+
+test('先开工后补简报：业主没说要谁就不留座位，给一句通用的加入话；后补的简报马上叫醒已加入的人', async (t) => {
+  const ctx = await context(t, { hub: { gatherMs: 5000 } });
+  const created = await ctx.rpc('ws.create', LEADER, { name: 'quick', title: '先开再说', invite: true, seats: [] });
+  const workspaceId = created.workspace.workspace_id;
+  const lines = inviteLines(created.workspace, created.members).join('\n');
+  assert.match(lines, /没留座位/);
+  assert.match(lines, /加入 Agent Hub 工作区 quick」/);
+
+  // Whoever the owner brings takes a seat by type, with no job until the leader hands one over.
+  const joined = await ctx.rpc('ws.join', CC, { workspace: 'quick' });
+  assert.equal(joined.me.seat, 'cc-1');
+  assert.ok(!joined.me.job);
+
+  const ccWait = await ctx.listen(CC);
+  await waitFor(() => ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'cc-1').listening);
+  const briefedAt = Date.now();
+  await ctx.rpc('ws.brief', LEADER, { text: '目标：先把入口改了；分工按加入的人再分' });
+  const ring = await ccWait.next('wake');
+  assert.ok(Date.now() - briefedAt < 2000, 'a brief written after people joined does not wait for the gather window');
+  assert.match(ring.text, /队长更新了简报（第 1 版）/);
+
+  // With seats reserved, each gets its own line and the plain line is still offered.
+  const added = await ctx.rpc('ws.add', LEADER, { invite: true, seats: [{ seat: 'codex-1', runtime: 'codex', job: '测试' }] });
+  const reserved = inviteLines(created.workspace, added.members).join('\n');
+  assert.match(reserved, /codex-1（codex）：加入 Agent Hub 工作区 quick，座位 codex-1/);
+  assert.match(reserved, /别的会话想加入，说「加入 Agent Hub 工作区 quick」/);
+  // Seats the door launches need no line for the owner.
+  assert.deepEqual(inviteLines(created.workspace, [{ seat: 'cc-2', role: 'member', state: 'launching' }]), []);
 });

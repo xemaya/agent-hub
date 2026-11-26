@@ -119,9 +119,13 @@ function requireIdentity() {
 async function dataDirOf(flags) {
   const chosen = flags['data-dir'] ?? process.env.AGENT_HUB_CONNECTOR_DATA_DIR;
   if (chosen) return path.resolve(chosen);
+  // A checkout-local Connector only counts inside an agent-hub checkout. Elsewhere a stray
+  // .runtime/connector (an old `agent-hub connector` run without --data-dir) must not win
+  // over the installed Connector, or every command fails local authentication.
   const checkout = path.resolve('.runtime/connector');
   try {
     await access(path.join(checkout, 'connector.json'));
+    await access(path.resolve('bin/agent-hub.js'));
     return checkout;
   } catch {
     return path.join(process.env.HOME ?? '.', '.agent-hub/connector');

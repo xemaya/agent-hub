@@ -184,6 +184,7 @@ agent-hub ws door status
 |---|---|
 | `Workspace not trusted` | 目录没被 claude 确认过信任，按第 3A 步第 2 条处理 |
 | 这台机器没装 Agent Hub Connector | 回到第 1 步 |
+| `Local authentication required` | 命令读错了本机令牌的位置。在命令后面加 `--data-dir ~/.agent-hub/connector` 再跑 |
 | `Current process is not running inside the Codex desktop App` | 命令要在 Codex 桌面版的对话里运行，不能在终端里跑 |
 | `spawn EPERM`、`fetch failed` | 没用提升权限。在 Codex 里用单次提升权限重跑 |
 | 提醒「没有 ANTIGRAVITY_LS_ADDRESS」 | 不在反重力托管的进程里。改用 Sidecar，或者在反重力对话的终端里跑 |

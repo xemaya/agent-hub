@@ -544,6 +544,7 @@ export class WorkspaceHub {
   // ---- join ------------------------------------------------------------------
 
   join(connectorId, identity, args) {
+    if (args.workspace) return this.joinByName(connectorId, identity, args);
     let member;
     if (args.ticket) {
       const ticket = text(args.ticket, 'ticket', { max: 200 });
@@ -591,6 +592,43 @@ export class WorkspaceHub {
     this.store.updateMember(member.member_id, { read_seq: latest, notified_seq: latest, wake_due_at: null });
     this.changed(workspace.workspace_id);
     return this.briefing(this.store.getMember(joined.member_id), { rejoined: false });
+  }
+
+  // An existing session (with its own context) joins because the owner told it to: no door,
+  // no ticket, just the workspace name. Its seat is named after its runtime unless it picks
+  // one, and the leader is rung at once so it can bring the newcomer up to speed.
+  joinByName(connectorId, identity, args) {
+    const name = text(args.workspace, 'workspace', { max: 40 }).toLowerCase();
+    const workspace = this.store.getActiveWorkspaceByName(name);
+    if (!workspace) throw wsError(`没有叫 ${name} 的进行中工作区；请业主或队长核对名字`, 404, 'unknown_workspace');
+    if (!['claude', 'codex', 'antigravity'].includes(identity.runtime)) throw wsError(`${identity.runtime} 会话还不能加入工作区：只有 claude、codex、antigravity 收得到门铃`, 400);
+    const current = this.store.findActiveMemberBySession(connectorId, identity.runtime, identity.session_id);
+    if (current) {
+      if (current.workspace_id === workspace.workspace_id) return this.briefing(current, { rejoined: true });
+      const other = this.store.getWorkspace(current.workspace_id);
+      throw wsError(`当前会话已经在工作区「${other.title}」里；一个会话同时只能在一个工作区`, 409, 'already_member');
+    }
+    const seat = args.seat ? text(args.seat, 'seat', { max: 32 }) : this.nextSeat(workspace, identity.runtime);
+    if (!SEAT_PATTERN.test(seat)) throw wsError(`座位名 ${seat} 只能用字母、数字、横线和下划线`);
+    if (this.store.getMemberBySeat(workspace.workspace_id, seat)) throw wsError(`座位 ${seat} 已经有人了，换一个：--seat <名字>`, 409, 'seat_exists');
+    const job = text(args.job, 'job', { max: 500, required: false });
+    const member = this.store.createMember({
+      workspaceId: workspace.workspace_id, seat, job, runtime: identity.runtime, connectorId,
+      sessionId: identity.session_id, state: 'joined', launch: { door: 'self' },
+    });
+    this.system(workspace, `${seat}（${identity.runtime}@${this.connectorName(connectorId)}）自己加入了，是业主让一个已有会话进来的，分工：${job || '听队长安排'}`,
+      { urgentFor: [workspace.leader_member_id], actor: member });
+    const latest = this.store.latestSeq(workspace.workspace_id);
+    this.store.updateMember(member.member_id, { read_seq: latest, notified_seq: latest, wake_due_at: null });
+    this.changed(workspace.workspace_id);
+    return this.briefing(this.store.getMember(member.member_id), { rejoined: false });
+  }
+
+  nextSeat(workspace, runtime) {
+    const prefix = { claude: 'cc', codex: 'codex', antigravity: 'ag' }[runtime] ?? runtime;
+    for (let number = 1; ; number += 1) {
+      if (!this.store.getMemberBySeat(workspace.workspace_id, `${prefix}-${number}`)) return `${prefix}-${number}`;
+    }
   }
 
   wakeAdvice(member) {

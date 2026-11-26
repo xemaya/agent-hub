@@ -499,3 +499,33 @@ test('codex-allow 只放行 agent-hub ws，用 codex execpolicy 核对，核对�
   await workspaceCommand(['codex-allow', '--remove']);
   await assert.rejects(stat(target), { code: 'ENOENT' });
 });
+
+test('已有会话凭工作区名字加入：不用报到单，座位按类型自动取名，队长马上知道', async (t) => {
+  const ctx = await context(t);
+  const created = await ctx.rpc('ws.create', LEADER, { name: 'talk', title: '临时讨论', seats: [] });
+  const workspaceId = created.workspace.workspace_id;
+  const leaderWait = await ctx.listen(LEADER);
+  await waitFor(() => ctx.hub.workspaces.store.getMemberBySeat(workspaceId, 'leader').listening);
+
+  const CX = { runtime: 'codex', session_id: 'existing-codex-thread' };
+  const briefing = await ctx.rpc('ws.join', CX, { workspace: 'talk', job: '讲讲之前查到的' });
+  assert.equal(briefing.rejoined, false);
+  assert.equal(briefing.me.seat, 'codex-1');
+  assert.equal(briefing.me.unread, 0, 'its own arrival is not news to it');
+  const ring = await leaderWait.next('wake');
+  assert.match(ring.text, /codex-1（codex@test-mac）自己加入了.*讲讲之前查到的/);
+
+  // Asking again is a rejoin, not a second seat.
+  assert.equal((await ctx.rpc('ws.join', CX, { workspace: 'talk' })).rejoined, true);
+  const AG = { runtime: 'antigravity', session_id: 'existing-ag-conversation' };
+  await assert.rejects(ctx.rpc('ws.join', AG, { workspace: 'talk', seat: 'codex-1' }), /座位 codex-1 已经有人了/);
+  assert.equal((await ctx.rpc('ws.join', AG, { workspace: 'talk' })).me.seat, 'ag-1');
+  await assert.rejects(ctx.rpc('ws.join', CC, { workspace: 'nope' }), /没有叫 nope 的进行中工作区/);
+  await assert.rejects(ctx.rpc('ws.join', { runtime: 'kimi', session_id: 'k' }, { workspace: 'talk' }), /只有 claude、codex、antigravity/);
+  await assert.rejects(ctx.rpc('ws.create', CX, { name: 'other', seats: [] }), /已经在工作区/);
+
+  // Members talk to it like any other seat.
+  await ctx.rpc('ws.say', LEADER, { kind: 'handoff', to: ['codex-1'], text: '把你上午查的结论贴一下' });
+  const inbox = await ctx.rpc('ws.inbox', CX);
+  assert.ok(inbox.messages.some((message) => /上午查的结论/.test(message.body)));
+});

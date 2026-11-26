@@ -27,6 +27,7 @@ export const WORKSPACE_HELP = `agent-hub ws — 工作区：一组 agent 一起�
 
 所有成员：
   agent-hub ws join TICKET                             报到（第一句话里给的报到单）
+  agent-hub ws join NAME [--seat 座位] [--job 分工]     业主让已有会话加入工作区 NAME（不用报到单，座位名默认按类型自动取）
   agent-hub ws status                                  队伍状态
   agent-hub ws say "话" [--to SEAT,SEAT]               群聊（--to 是私下说；话里 @座位 会优先叫醒对方）
   agent-hub ws handoff --to SEAT "交棒说明"            交棒给下一棒
@@ -693,7 +694,15 @@ export async function workspaceCommand(argv) {
   }
   if (command === 'join') {
     const identity = requireIdentity();
-    const result = await rpc(flags, 'ws.join', rest[0] ? { ticket: rest[0] } : {}, { identity });
+    // A door-launched seat brings a ticket (wst_…); an existing session the owner sends in
+    // names the workspace instead.
+    const target = rest[0];
+    const args = !target ? {} : target.startsWith('wst_') ? { ticket: target } : {
+      workspace: target,
+      ...([flags.seat].flat()[0] && [flags.seat].flat()[0] !== true ? { seat: String([flags.seat].flat()[0]) } : {}),
+      ...(flags.job && flags.job !== true ? { job: String(flags.job) } : {}),
+    };
+    const result = await rpc(flags, 'ws.join', args, { identity });
     out(flags, result, printBriefing);
     await afterJoin(flags, identity, result);
     return;

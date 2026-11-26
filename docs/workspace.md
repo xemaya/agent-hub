@@ -60,6 +60,16 @@ agent-hub ws wait                         # Claude：用 Bash run_in_background 
 
 座位写法：`座位=类型[/模型][@机器][:分工]`。类型是 `claude`、`codex`、`antigravity`；机器写 Connector 名的开头（`agent-hub ws doors` 里看），不写就挑当前座位最少的那台。
 
+## 3.5 已有会话加入
+
+业主在某个会话里聊着，想和另一个已经开着的会话（有它自己的上下文）一起做事，不必让门房新开：
+
+1. 当前会话开一个工作区当队长，可以不带座位：`agent-hub ws start talk-x --title "…"`。
+2. 业主到那个会话里说「加入 Agent Hub 工作区 talk-x」，它运行 `agent-hub ws join talk-x [--seat 名字] [--job 分工]`。
+3. Hub 直接给它建一个已报到的座位，座位名默认按类型取（cc-N、codex-N、ag-N），并马上叫醒队长。
+
+不用报到单，靠的是这台机器的 Connector 本机令牌和会话自己的身份。之后收信和门房拉起的队员一样：Claude 后台跑 `ws wait`，Codex 起收信桥，反重力靠那台机器的反重力门房。区别只有一个：它退出以后 Hub 没法替它重开。
+
 ## 4. 收信：攒一批，只在有事时叫醒
 
 模型从不轮询。Hub 保存每条消息，每个成员有「已读到哪」「已通知到哪」两个位置：
